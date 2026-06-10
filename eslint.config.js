@@ -24,6 +24,8 @@ export default tseslint.config(
       "@typescript-eslint/consistent-type-definitions": ["error", "type"],
       // numbers in log/error template strings are intentional and safe.
       "@typescript-eslint/restrict-template-expressions": ["error", { allowNumber: true }],
+      // mirror tsconfig's noUnusedParameters: a leading underscore marks an intentionally-unused arg.
+      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
     },
   },
   prettier,

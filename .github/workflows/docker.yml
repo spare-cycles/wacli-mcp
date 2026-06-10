@@ -1,0 +1,56 @@
+name: build-image
+
+# Build and push the wacli-mcp container image to GHCR.
+# Tags: a semver tag push (v1.2.3) -> :1.2.3 + :latest; any main push -> :main + :sha-<short>.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      wacli_ref:
+        description: "wacli git ref (tag/branch) to build the binary from"
+        default: main
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=ref,event=branch
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # WACLI_REF: a manual run can override; otherwise pin to a wacli release tag here
+          # (default `main` is for convenience — bump it deliberately for reproducible images).
+          build-args: |
+            WACLI_REF=${{ github.event.inputs.wacli_ref || 'main' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

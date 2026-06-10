@@ -1,6 +1,8 @@
 node_modules/
 dist/
 *.log
+.env
+.env.*
 
 # Track shared editor settings even though the global gitignore excludes .vscode/
 !.vscode/

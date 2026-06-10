@@ -47,6 +47,36 @@ Production (compiled):
 pnpm build && node dist/server.js
 ```
 
+## Transports: stdio (default) or Streamable HTTP
+
+By default the server speaks **stdio** (one client per process) — ideal for a local Claude Code / Desktop config. Set `WACLI_MCP_HTTP=1` (or any `PORT`) to serve **Streamable HTTP** instead, for a long-lived remote server:
+
+```bash
+WACLI_MCP_HTTP=1 PORT=8080 node dist/server.js
+# → POST/GET/DELETE http://0.0.0.0:8080/mcp   ·   GET /health → {"ok":true}
+```
+
+The HTTP transport keeps one MCP session per `Mcp-Session-Id` (created on `initialize`, swept after 30 min idle), isolates each request (a bad request returns a JSON-RPC 500 and never brings the server down for other clients), and leaves DNS-rebinding protection off so it can sit behind a reverse proxy that rewrites `Host`. `WACLI_MCP_STATELESS=1` switches to a stateless, session-less mode (JSON responses, fresh server per request).
+
+## Docker
+
+The image bundles a self-built Linux `wacli` (CGO + `sqlite_fts5`) and `ffmpeg`, and runs in HTTP mode by default.
+
+```bash
+# Build (pin a wacli release tag for reproducibility):
+docker build --build-arg WACLI_REF=v0.5.0 -t ghcr.io/spare-cycles/wacli-mcp:0.1.0 .
+
+# Authenticate once (interactive QR) into a persistent store volume:
+docker run --rm -it -v wacli-store:/data/wacli \
+  ghcr.io/spare-cycles/wacli-mcp:0.1.0 wacli --store /data/wacli auth
+
+# Serve (HTTP on :8080, reading the authenticated store):
+docker run --rm -p 8080:8080 -v wacli-store:/data/wacli \
+  ghcr.io/spare-cycles/wacli-mcp:0.1.0
+```
+
+The container runs as a non-root user (UID 1000); when the store is a bind mount, `chown` it to `1000:1000` first (an init sidecar handles this in the Portainer deployment). CI builds and pushes `ghcr.io/<owner>/wacli-mcp` on pushes to `main` and tags (`.github/workflows/docker.yml`).
+
 ## Quality gate
 
 Strict TypeScript + ESLint (typescript-eslint `strictTypeChecked` + `stylisticTypeChecked`, type-aware) + Prettier.
@@ -97,7 +127,7 @@ claude mcp add wacli -e WACLI_BIN=/Users/loup/code/perso/wacli-latest/dist/wacli
 | `WACLI_MCP_MAX_RESULT_CHARS` | `200000` | Cap on the text returned to the model (truncated with a note) so a large result can't flood context. |
 | `WACLI_MCP_LOCK_WAIT` | – | Go duration (e.g. `10s`) to wait for the store write-lock before failing, so a write queues behind a transient lock (a concurrent `sync`/`auth`) instead of erroring immediately. Reads ignore it; invalid values are warned and ignored. |
 
-**Hardening notes:** every call runs the binary via `spawn` (argv array — no shell, so no shell injection), with UTF-8-safe streaming, a proportional timeout head-start (wacli's own `--timeout` is set to 90% of the hard deadline so its structured error wins), and an output cap. Children are spawned detached and killed by **process group** (so wacli's own `ffmpeg`/`ffprobe` helpers don't orphan), and reaped on `SIGINT`/`SIGTERM`/`exit`. An `EPIPE` from a disconnecting client, plus any `uncaughtException`/`unhandledRejection`, shut the server down cleanly instead of crashing mid-write. `wacli_run` is sandboxed: it cannot override the server-owned globals (`--store`/`--account`/`--read-only`/`--timeout`/`--json`/`--events`) and cannot run `auth`, `sync`, or follow mode. The typed tools build their own argv and are not subject to that policy, so search/message content that happens to look like a flag (e.g. `--store`) works.
+**Hardening notes:** every call runs the binary via `spawn` (argv array — no shell, so no shell injection), with UTF-8-safe streaming, a proportional timeout head-start (wacli's own `--timeout` is set to 90% of the hard deadline so its structured error wins), and an output cap. Children are spawned detached and killed by **process group** (so wacli's own `ffmpeg`/`ffprobe` helpers don't orphan), and reaped on `SIGINT`/`SIGTERM`/`exit`. An `EPIPE` from a disconnecting client shuts the server down cleanly instead of crashing mid-write; in **stdio** mode an `uncaughtException`/`unhandledRejection` also exits cleanly, but in **HTTP** mode they are logged and the server keeps serving other clients (a per-request error returns a JSON-RPC 500). `wacli_run` is sandboxed: it cannot override the server-owned globals (`--store`/`--account`/`--read-only`/`--timeout`/`--json`/`--events`) and cannot run `auth`, `sync`, or follow mode. The typed tools build their own argv and are not subject to that policy, so search/message content that happens to look like a flag (e.g. `--store`) works.
 
 ## Test
 

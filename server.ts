@@ -20,8 +20,14 @@
  *                               failing; lets writes queue behind a transient lock. Default: fail fast.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import type { Server as HttpServer } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import express, { type Request, type Response } from "express";
 import { z } from "zod";
 
 /** Parse a positive-integer env var; fall back on invalid/≤0, then clamp into [min, max]. */
@@ -68,6 +74,9 @@ const MAX_RESULT_CHARS = envInt(process.env["WACLI_MCP_MAX_RESULT_CHARS"], 200_0
 // behind a transient lock (a concurrent sync/auth) instead of erroring immediately. Reads ignore it.
 const LOCK_WAIT = envDuration(process.env["WACLI_MCP_LOCK_WAIT"]);
 
+// Serve over HTTP (Streamable HTTP) when explicitly enabled or a PORT is provided; otherwise stdio.
+const HTTP_MODE = envTruthy(process.env["WACLI_MCP_HTTP"]) || process.env["PORT"] !== undefined;
+
 // Give wacli's own --timeout a proportional head start (90% of the hard deadline) so it emits its
 // structured JSON error before the hard SIGKILL — correct for both large and small timeouts.
 const WACLI_TIMEOUT = `${Math.floor(TIMEOUT_MS * 0.9)}ms`;
@@ -92,6 +101,9 @@ const VALUE_GLOBAL_FLAGS = new Set(["--store", "--account", "--timeout", "--lock
 
 // In-flight children, reaped on shutdown so we never orphan a wacli process tree.
 const activeChildren = new Set<ChildProcess>();
+
+// The HTTP server instance (HTTP mode only), closed on shutdown.
+let activeHttpServer: HttpServer | undefined;
 
 type ParseResult = { ok: true; value: unknown } | { ok: false; error: string };
 
@@ -294,179 +306,190 @@ async function asResult(p: Promise<unknown>) {
 // model's context, so we cap (and document) it here.
 const limitSchema = z.number().int().positive().max(1000).optional().describe("max results (default 50, max 1000)");
 
-const server = new McpServer({ name: "wacli-mcp", version: "0.1.0" });
+/** Construct a fresh MCP server with all tools registered — one per stdio process, one per HTTP session. */
+function buildServer(): McpServer {
+  const server = new McpServer({ name: "wacli-mcp", version: "0.1.0" });
+  registerTools(server);
+  return server;
+}
 
-// ── Read tools ────────────────────────────────────────────────────────────
+/** Register every tool on a server instance. Split out so each HTTP session gets an isolated server. */
+function registerTools(server: McpServer): void {
+  // ── Read tools ────────────────────────────────────────────────────────────
 
-server.registerTool(
-  "wacli_doctor",
-  {
-    description:
-      "Diagnostics: store path, auth status, sync stats, FTS availability. Good first call to confirm wacli is set up.",
-    inputSchema: {},
-  },
-  () => asResult(runWacli(["doctor"])),
-);
-
-server.registerTool(
-  "wacli_chats_list",
-  {
-    description: "List chats from the local synced DB (most recent first).",
-    inputSchema: {
-      query: z.string().optional().describe("filter chats by name/jid substring"),
-      limit: limitSchema,
-    },
-  },
-  ({ query, limit }) => asResult(runWacli(["chats", "list", ...flags({ query, limit })])),
-);
-
-server.registerTool(
-  "wacli_messages_search",
-  {
-    description: "Full-text search over synced messages (FTS5 if available, else LIKE).",
-    inputSchema: {
-      query: z.string().min(1).describe("search text"),
-      chat: z.string().optional().describe("restrict to a chat JID"),
-      from: z.string().optional().describe("restrict to a sender JID"),
-      type: z.enum(["text", "image", "video", "audio", "document"]).optional(),
-      has_media: z.boolean().optional().describe("only messages with media (cannot combine with type=text)"),
-      after: z.string().optional().describe("RFC3339 or YYYY-MM-DD lower bound"),
-      before: z.string().optional().describe("RFC3339 or YYYY-MM-DD upper bound"),
-      limit: limitSchema,
-    },
-  },
-  ({ query, chat, from, type, has_media, after, before, limit }) => {
-    // wacli rejects this combination; catch it here with a clearer message than wacli's.
-    if (type === "text" && has_media) {
-      return asResult(
-        Promise.reject(new Error("`has_media` cannot be combined with type=text (text messages have no media).")),
-      );
-    }
-    // `--` terminates flag parsing so a query starting with "-" isn't treated as a flag.
-    return asResult(
-      runWacli([
-        "messages",
-        "search",
-        ...flags({ chat, from, type, "has-media": has_media, after, before, limit }),
-        "--",
-        query,
-      ]),
-    );
-  },
-);
-
-server.registerTool(
-  "wacli_messages_list",
-  {
-    description: "List messages from the local DB, with filters. Newest first unless asc=true.",
-    inputSchema: {
-      chat: z.string().optional().describe("filter by chat JID"),
-      sender: z.string().optional().describe("filter by sender JID"),
-      from_me: z.boolean().optional().describe("only messages sent by me"),
-      after: z.string().optional(),
-      before: z.string().optional(),
-      asc: z.boolean().optional().describe("oldest first"),
-      limit: limitSchema,
-    },
-  },
-  ({ chat, sender, from_me, after, before, asc, limit }) =>
-    asResult(runWacli(["messages", "list", ...flags({ chat, sender, "from-me": from_me, after, before, asc, limit })])),
-);
-
-server.registerTool(
-  "wacli_contacts_search",
-  {
-    description: "Search synced contacts by name/number.",
-    inputSchema: {
-      query: z.string().min(1).describe("contact name or number"),
-      limit: limitSchema,
-    },
-  },
-  // `--` terminates flag parsing so a query starting with "-" isn't treated as a flag.
-  ({ query, limit }) => asResult(runWacli(["contacts", "search", ...flags({ limit }), "--", query])),
-);
-
-server.registerTool(
-  "wacli_groups_list",
-  {
-    description: "List WhatsApp groups from the local DB.",
-    inputSchema: {},
-  },
-  () => asResult(runWacli(["groups", "list"])),
-);
-
-// ── Send tools (suppressed in read-only mode; wacli would reject them there anyway) ──
-
-if (!READONLY) {
   server.registerTool(
-    "wacli_send_text",
+    "wacli_doctor",
     {
       description:
-        "Send a WhatsApp text message. `to` accepts a JID, a phone number, or a contact/group/chat name (use `pick` to disambiguate a name).",
+        "Diagnostics: store path, auth status, sync stats, FTS availability. Good first call to confirm wacli is set up.",
+      inputSchema: {},
+    },
+    () => asResult(runWacli(["doctor"])),
+  );
+
+  server.registerTool(
+    "wacli_chats_list",
+    {
+      description: "List chats from the local synced DB (most recent first).",
       inputSchema: {
-        to: z.string().min(1).describe("recipient: JID, phone number, or contact/group/chat name"),
-        message: z.string().min(1).describe("message text"),
-        pick: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe("if `to` is an ambiguous name, pick the Nth match (1-indexed)"),
-        reply_to: z.string().optional().describe("message ID to quote/reply to"),
-        no_preview: z.boolean().optional().describe("disable link preview"),
-        mention: z.array(z.string()).optional().describe("phone numbers or user JIDs to @mention"),
+        query: z.string().optional().describe("filter chats by name/jid substring"),
+        limit: limitSchema,
       },
     },
-    ({ to, message, pick, reply_to, no_preview, mention }) =>
-      asResult(
+    ({ query, limit }) => asResult(runWacli(["chats", "list", ...flags({ query, limit })])),
+  );
+
+  server.registerTool(
+    "wacli_messages_search",
+    {
+      description: "Full-text search over synced messages (FTS5 if available, else LIKE).",
+      inputSchema: {
+        query: z.string().min(1).describe("search text"),
+        chat: z.string().optional().describe("restrict to a chat JID"),
+        from: z.string().optional().describe("restrict to a sender JID"),
+        type: z.enum(["text", "image", "video", "audio", "document"]).optional(),
+        has_media: z.boolean().optional().describe("only messages with media (cannot combine with type=text)"),
+        after: z.string().optional().describe("RFC3339 or YYYY-MM-DD lower bound"),
+        before: z.string().optional().describe("RFC3339 or YYYY-MM-DD upper bound"),
+        limit: limitSchema,
+      },
+    },
+    ({ query, chat, from, type, has_media, after, before, limit }) => {
+      // wacli rejects this combination; catch it here with a clearer message than wacli's.
+      if (type === "text" && has_media) {
+        return asResult(
+          Promise.reject(new Error("`has_media` cannot be combined with type=text (text messages have no media).")),
+        );
+      }
+      // `--` terminates flag parsing so a query starting with "-" isn't treated as a flag.
+      return asResult(
         runWacli([
-          "send",
-          "text",
-          ...flags({ to, message, pick, "reply-to": reply_to, "no-preview": no_preview, mention }),
+          "messages",
+          "search",
+          ...flags({ chat, from, type, "has-media": has_media, after, before, limit }),
+          "--",
+          query,
         ]),
+      );
+    },
+  );
+
+  server.registerTool(
+    "wacli_messages_list",
+    {
+      description: "List messages from the local DB, with filters. Newest first unless asc=true.",
+      inputSchema: {
+        chat: z.string().optional().describe("filter by chat JID"),
+        sender: z.string().optional().describe("filter by sender JID"),
+        from_me: z.boolean().optional().describe("only messages sent by me"),
+        after: z.string().optional(),
+        before: z.string().optional(),
+        asc: z.boolean().optional().describe("oldest first"),
+        limit: limitSchema,
+      },
+    },
+    ({ chat, sender, from_me, after, before, asc, limit }) =>
+      asResult(
+        runWacli(["messages", "list", ...flags({ chat, sender, "from-me": from_me, after, before, asc, limit })]),
       ),
   );
 
   server.registerTool(
-    "wacli_send_file",
+    "wacli_contacts_search",
     {
-      description: "Send a file (image/video/audio/document) from a local path. `to` resolves like wacli_send_text.",
+      description: "Search synced contacts by name/number.",
       inputSchema: {
-        to: z.string().min(1).describe("recipient: JID, phone number, or contact/group/chat name"),
-        file: z.string().min(1).describe("absolute path to the file on this machine"),
-        caption: z.string().optional(),
-        filename: z.string().optional().describe("display name (defaults to basename)"),
-        pick: z.number().int().positive().optional(),
-        reply_to: z.string().optional(),
+        query: z.string().min(1).describe("contact name or number"),
+        limit: limitSchema,
       },
     },
-    ({ to, file, caption, filename, pick, reply_to }) =>
-      asResult(runWacli(["send", "file", ...flags({ to, file, caption, filename, pick, "reply-to": reply_to })])),
+    // `--` terminates flag parsing so a query starting with "-" isn't treated as a flag.
+    ({ query, limit }) => asResult(runWacli(["contacts", "search", ...flags({ limit }), "--", query])),
+  );
+
+  server.registerTool(
+    "wacli_groups_list",
+    {
+      description: "List WhatsApp groups from the local DB.",
+      inputSchema: {},
+    },
+    () => asResult(runWacli(["groups", "list"])),
+  );
+
+  // ── Send tools (suppressed in read-only mode; wacli would reject them there anyway) ──
+
+  if (!READONLY) {
+    server.registerTool(
+      "wacli_send_text",
+      {
+        description:
+          "Send a WhatsApp text message. `to` accepts a JID, a phone number, or a contact/group/chat name (use `pick` to disambiguate a name).",
+        inputSchema: {
+          to: z.string().min(1).describe("recipient: JID, phone number, or contact/group/chat name"),
+          message: z.string().min(1).describe("message text"),
+          pick: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("if `to` is an ambiguous name, pick the Nth match (1-indexed)"),
+          reply_to: z.string().optional().describe("message ID to quote/reply to"),
+          no_preview: z.boolean().optional().describe("disable link preview"),
+          mention: z.array(z.string()).optional().describe("phone numbers or user JIDs to @mention"),
+        },
+      },
+      ({ to, message, pick, reply_to, no_preview, mention }) =>
+        asResult(
+          runWacli([
+            "send",
+            "text",
+            ...flags({ to, message, pick, "reply-to": reply_to, "no-preview": no_preview, mention }),
+          ]),
+        ),
+    );
+
+    server.registerTool(
+      "wacli_send_file",
+      {
+        description: "Send a file (image/video/audio/document) from a local path. `to` resolves like wacli_send_text.",
+        inputSchema: {
+          to: z.string().min(1).describe("recipient: JID, phone number, or contact/group/chat name"),
+          file: z.string().min(1).describe("absolute path to the file on this machine"),
+          caption: z.string().optional(),
+          filename: z.string().optional().describe("display name (defaults to basename)"),
+          pick: z.number().int().positive().optional(),
+          reply_to: z.string().optional(),
+        },
+      },
+      ({ to, file, caption, filename, pick, reply_to }) =>
+        asResult(runWacli(["send", "file", ...flags({ to, file, caption, filename, pick, "reply-to": reply_to })])),
+    );
+  }
+
+  // ── Generic escape hatch ────────────────────────────────────────────────────
+
+  server.registerTool(
+    "wacli_run",
+    {
+      description:
+        'Run an arbitrary wacli subcommand for cases not covered by the typed tools (e.g. polls, presence, channels, profile, media download). Pass argv AFTER the binary name, e.g. ["presence","subscribe","--jid","123@s.whatsapp.net"]. `--json` and the timeout are added automatically; the server-owned globals (--store/--account/--read-only/--timeout/--json/--events) cannot be overridden. `auth`, `sync`, and follow mode are blocked. Long-running commands (e.g. history backfill) are bounded only by the hard timeout.',
+      inputSchema: {
+        args: z.array(z.string()).min(1).describe("argv tokens for wacli, excluding the binary name and --json"),
+      },
+    },
+    ({ args }) => {
+      const violation = enforcePolicy(args);
+      return asResult(violation ? Promise.reject(new Error(violation)) : runWacli(args));
+    },
   );
 }
-
-// ── Generic escape hatch ────────────────────────────────────────────────────
-
-server.registerTool(
-  "wacli_run",
-  {
-    description:
-      'Run an arbitrary wacli subcommand for cases not covered by the typed tools (e.g. polls, presence, channels, profile, media download). Pass argv AFTER the binary name, e.g. ["presence","subscribe","--jid","123@s.whatsapp.net"]. `--json` and the timeout are added automatically; the server-owned globals (--store/--account/--read-only/--timeout/--json/--events) cannot be overridden. `auth`, `sync`, and follow mode are blocked. Long-running commands (e.g. history backfill) are bounded only by the hard timeout.',
-    inputSchema: {
-      args: z.array(z.string()).min(1).describe("argv tokens for wacli, excluding the binary name and --json"),
-    },
-  },
-  ({ args }) => {
-    const violation = enforcePolicy(args);
-    return asResult(violation ? Promise.reject(new Error(violation)) : runWacli(args));
-  },
-);
 
 // ── Lifecycle: reap children and fail cleanly ────────────────────────────────
 
 function reapChildren(): void {
   for (const child of activeChildren) killTree(child);
   activeChildren.clear();
+  activeHttpServer?.close();
 }
 process.on("exit", reapChildren);
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -484,22 +507,175 @@ process.stdout.on("error", (err: NodeJS.ErrnoException) => {
 });
 process.on("uncaughtException", (err) => {
   console.error("wacli-mcp uncaught exception:", err);
+  // In HTTP mode a single bad request must not take the server down for every other client.
+  if (HTTP_MODE) return;
   reapChildren();
   process.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
   console.error("wacli-mcp unhandled rejection:", reason);
+  if (HTTP_MODE) return;
   reapChildren();
   process.exit(1);
 });
 
-const transport = new StdioServerTransport();
-try {
-  await server.connect(transport);
-} catch (err) {
-  console.error("wacli-mcp failed to start:", err);
-  reapChildren();
-  process.exit(1);
+// ── HTTP transport (Streamable HTTP) ─────────────────────────────────────────
+
+const HTTP_PORT = envInt(process.env["PORT"] ?? process.env["MCP_HTTP_PORT"], 8080, 1, 65535);
+const HTTP_PATH = process.env["MCP_HTTP_PATH"] || "/mcp";
+const STATELESS = envTruthy(process.env["WACLI_MCP_STATELESS"]);
+const SESSION_TTL_MS = 30 * 60_000; // evict sessions idle longer than this
+
+type HttpSession = { transport: StreamableHTTPServerTransport; lastSeen: number };
+
+/** A JSON-RPC error envelope for the cases we answer ourselves, around the transport. */
+function jsonRpcError(code: number, message: string) {
+  return { jsonrpc: "2.0" as const, error: { code, message }, id: null };
 }
-// stderr is safe for logs; stdout is reserved for the MCP protocol.
-console.error(`wacli-mcp ready (bin=${WACLI_BIN}${READONLY ? ", read-only" : ""}, timeout=${TIMEOUT_MS}ms)`);
+
+/** Last resort: a thrown request becomes a 500 and never reaches the process-global handlers. */
+function respondInternalError(res: Response, err: unknown): void {
+  console.error("wacli-mcp http request error:", err);
+  if (!res.headersSent) res.status(500).json(jsonRpcError(-32603, "Internal server error"));
+}
+
+/** Adapt an async handler to Express while keeping every rejection contained (lint + availability). */
+function wrap(fn: (req: Request, res: Response) => Promise<void>) {
+  return (req: Request, res: Response): void => {
+    void fn(req, res).catch((err: unknown) => {
+      respondInternalError(res, err);
+    });
+  };
+}
+
+function headerSessionId(req: Request): string | undefined {
+  const h = req.headers["mcp-session-id"];
+  return Array.isArray(h) ? h[0] : h;
+}
+
+/** Start the Streamable-HTTP server. Stateful sessions by default; WACLI_MCP_STATELESS = a fresh
+ *  server per request with JSON responses, for clients that don't track sessions. */
+async function startHttp(): Promise<void> {
+  const app = express();
+  app.use(express.json({ limit: "16mb" }));
+  app.get("/health", (_req, res) => {
+    res.json({ ok: true });
+  });
+
+  if (STATELESS) {
+    app.post(
+      HTTP_PATH,
+      wrap(async (req, res) => {
+        const body = req.body as unknown;
+        const server = buildServer();
+        // Omit sessionIdGenerator → stateless (no session id); explicit `undefined` is rejected
+        // under exactOptionalPropertyTypes.
+        const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
+        res.on("close", () => {
+          void transport.close();
+          void server.close();
+        });
+        // Cast: the transport is a Transport at runtime; its onclose typing trips
+        // exactOptionalPropertyTypes against the interface.
+        await server.connect(transport as Transport);
+        await transport.handleRequest(req, res, body);
+      }),
+    );
+    // With no sessions, the server→client SSE stream and explicit teardown are meaningless.
+    const notAllowed = (_req: Request, res: Response): void => {
+      res.status(405).json(jsonRpcError(-32000, "Method not allowed in stateless mode"));
+    };
+    app.get(HTTP_PATH, notAllowed);
+    app.delete(HTTP_PATH, notAllowed);
+  } else {
+    const sessions = new Map<string, HttpSession>();
+
+    // onclose fires only when a stream closes; a client that just stops polling would otherwise leak
+    // its session forever — so sweep idle ones.
+    const sweeper = setInterval(() => {
+      const now = Date.now();
+      for (const [id, s] of sessions) {
+        if (now - s.lastSeen > SESSION_TTL_MS) {
+          sessions.delete(id);
+          void s.transport.close();
+        }
+      }
+    }, 60_000);
+    sweeper.unref();
+
+    app.post(
+      HTTP_PATH,
+      wrap(async (req, res) => {
+        const body = req.body as unknown;
+        const sessionId = headerSessionId(req);
+        if (sessionId) {
+          const existing = sessions.get(sessionId);
+          if (!existing) {
+            res.status(404).json(jsonRpcError(-32001, "Unknown or expired session"));
+            return;
+          }
+          existing.lastSeen = Date.now();
+          await existing.transport.handleRequest(req, res, body);
+          return;
+        }
+        // No session yet: only an initialize request may open one.
+        if (!isInitializeRequest(body)) {
+          res.status(400).json(jsonRpcError(-32000, "No valid session; send an initialize request first"));
+          return;
+        }
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (id) => {
+            sessions.set(id, { transport, lastSeen: Date.now() });
+          },
+        });
+        transport.onclose = () => {
+          if (transport.sessionId) sessions.delete(transport.sessionId);
+        };
+        const server = buildServer();
+        await server.connect(transport as Transport);
+        await transport.handleRequest(req, res, body);
+      }),
+    );
+
+    // GET = server→client SSE stream; DELETE = explicit teardown. Both require a live session.
+    const handleSessionRequest = wrap(async (req, res) => {
+      const sessionId = headerSessionId(req);
+      const existing = sessionId ? sessions.get(sessionId) : undefined;
+      if (!existing) {
+        res.status(404).json(jsonRpcError(-32001, "Unknown or expired session"));
+        return;
+      }
+      existing.lastSeen = Date.now();
+      await existing.transport.handleRequest(req, res);
+    });
+    app.get(HTTP_PATH, handleSessionRequest);
+    app.delete(HTTP_PATH, handleSessionRequest);
+  }
+
+  await new Promise<void>((resolve) => {
+    activeHttpServer = app.listen(HTTP_PORT, "0.0.0.0", resolve);
+  });
+  console.error(
+    `wacli-mcp ready (http://0.0.0.0:${HTTP_PORT}${HTTP_PATH}, ${STATELESS ? "stateless" : "stateful"}` +
+      `, bin=${WACLI_BIN}${READONLY ? ", read-only" : ""}, timeout=${TIMEOUT_MS}ms)`,
+  );
+}
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+
+if (HTTP_MODE) {
+  await startHttp();
+} else {
+  const server = buildServer();
+  const transport = new StdioServerTransport();
+  try {
+    await server.connect(transport);
+  } catch (err) {
+    console.error("wacli-mcp failed to start:", err);
+    reapChildren();
+    process.exit(1);
+  }
+  // stderr is safe for logs; stdout is reserved for the MCP protocol.
+  console.error(`wacli-mcp ready (stdio, bin=${WACLI_BIN}${READONLY ? ", read-only" : ""}, timeout=${TIMEOUT_MS}ms)`);
+}
