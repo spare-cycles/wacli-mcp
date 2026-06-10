@@ -77,6 +77,28 @@ docker run --rm -p 8080:8080 -v wacli-store:/data/wacli \
 
 The container runs as a non-root user (UID 1000); when the store is a bind mount, `chown` it to `1000:1000` first (an init sidecar handles this in the Portainer deployment). CI builds and pushes `ghcr.io/<owner>/wacli-mcp` on pushes to `main` and tags (`.github/workflows/docker.yml`).
 
+## Continuous sync + alerting (`sync-supervisor.ts`)
+
+The MCP server reads from the local store on demand; it does **not** keep the store fresh on its own. The image also ships a **sync supervisor** ([sync-supervisor.ts](sync-supervisor.ts)) that runs as a *separate* container against the **same** store: it runs `wacli sync --follow --events`, which holds the one WhatsApp connection and exposes the send-delegate socket — so the MCP server's reads stay lockless and its sends delegate to this connection (set the server's `WACLI_MCP_LOCK_WAIT` empty so sends delegate immediately rather than waiting).
+
+It turns wacli's NDJSON lifecycle events into a **heartbeat file** (integer Unix seconds, refreshed only while connected) for the Docker healthcheck, and **ntfy alerts** (down after a grace, periodic re-alerts, recovery notice, plus a startup self-test and a child-exit alert). Run it by overriding the command:
+
+```bash
+docker run --rm -v wacli-store:/data/wacli \
+  -e NTFY_BASE_URL=https://ntfy.example.com -e NTFY_TOPIC=alerts -e NTFY_TOKEN=tk_… \
+  ghcr.io/spare-cycles/wacli-mcp:0.2.0 node dist/sync-supervisor.js
+```
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `SYNC_STALE_SEC` | `360` | Down/stale grace before alerting; also the healthcheck freshness threshold. |
+| `SYNC_REALERT_SEC` | `1800` | Re-alert cadence while still down. |
+| `SYNC_LOCK_WAIT` | `30s` | `--lock-wait` so the sync wins the store lock at startup/restart. |
+| `NTFY_BASE_URL` / `NTFY_TOPIC` / `NTFY_TOKEN` | – | ntfy publish (JSON to the root URL, `Bearer` auth). |
+| `SYNC_DOWNLOAD_MEDIA` / `SYNC_REFRESH_GROUPS` | – | Optional `wacli sync` flags. |
+
+**One connection per device:** run exactly one supervisor; while it holds the connection, `wacli_run` calls that need the lock and don't delegate (media download, history backfill, presence, channels, group admin, profile) return "store is locked". The typed read/send tools are unaffected.
+
 ## Quality gate
 
 Strict TypeScript + ESLint (typescript-eslint `strictTypeChecked` + `stylisticTypeChecked`, type-aware) + Prettier.

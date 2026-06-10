@@ -32,5 +32,5 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["server.ts"]
+  "include": ["server.ts", "sync-supervisor.ts"]
 }
