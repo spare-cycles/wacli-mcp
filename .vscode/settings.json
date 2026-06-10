@@ -1,0 +1,7 @@
+{
+  // Use the workspace's TypeScript (5.9.3) instead of VS Code's bundled version,
+  // so the editor reads tsconfig.json the same way `tsc`/`npm run build` does.
+  // (js/ts.* is the current unified prefix; the old typescript.* keys are deprecated.)
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "js/ts.tsdk.promptToUseWorkspaceVersion": true
+}
