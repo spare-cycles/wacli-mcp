@@ -21,6 +21,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { Server as HttpServer } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -73,6 +74,10 @@ const MAX_RESULT_CHARS = envInt(process.env["WACLI_MCP_MAX_RESULT_CHARS"], 200_0
 // Optional: wait this long for the store write-lock before failing, so a write briefly queues
 // behind a transient lock (a concurrent sync/auth) instead of erroring immediately. Reads ignore it.
 const LOCK_WAIT = envDuration(process.env["WACLI_MCP_LOCK_WAIT"]);
+// Threshold (seconds) for judging the shared wacli-sync heartbeat fresh in wacli_doctor output.
+// Mirror the sync supervisor's SYNC_STALE_SEC default so a "locked" doctor reading can be classified
+// HEALTHY (a sync sidecar owns the connection) vs FAULT (sync down, store going stale).
+const SYNC_STALE_SEC = envInt(process.env["WACLI_MCP_SYNC_STALE_SEC"], 360, 1, 86_400);
 
 // Serve over HTTP (Streamable HTTP) when explicitly enabled or a PORT is provided; otherwise stdio.
 const HTTP_MODE = envTruthy(process.env["WACLI_MCP_HTTP"]) || process.env["PORT"] !== undefined;
@@ -302,13 +307,55 @@ async function asResult(p: Promise<unknown>) {
   return { content: [{ type: "text" as const, text }] };
 }
 
+// ── wacli_doctor enrichment ──────────────────────────────────────────────────
+// `wacli doctor` reports THIS server's own store view: when a wacli-sync sidecar holds the live
+// WhatsApp connection, doctor shows connected:false / connection_state:"locked_by_other_process".
+// That is the HEALTHY steady state (this server is the read-only reader; sync owns the socket), but
+// it reads like a fault. Attach a verdict derived from the shared heartbeat so it can't be misread.
+function syncSupervisorHealth(): Record<string, unknown> {
+  const path = process.env["SYNC_HEARTBEAT_FILE"] || (STORE_DIR ? `${STORE_DIR}/.sync-heartbeat` : "");
+  if (!path) return { present: false, note: "no store dir configured; cannot locate .sync-heartbeat" };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return {
+      present: false,
+      healthy: false,
+      note: "no .sync-heartbeat — no wacli-sync sidecar running. This server may own the connection directly (see `connected`), or sync is down.",
+    };
+  }
+  const ts = Number(raw.trim());
+  if (!Number.isFinite(ts)) return { present: true, healthy: false, note: "unparseable heartbeat file" };
+  const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  const healthy = ageSec < SYNC_STALE_SEC;
+  return {
+    present: true,
+    healthy,
+    heartbeat_age_sec: ageSec,
+    stale_threshold_sec: SYNC_STALE_SEC,
+    note: healthy
+      ? `HEALTHY — a wacli-sync sidecar owns the WhatsApp connection (heartbeat ${ageSec}s old). This server's connected:false / locked_by_other_process is the normal read-only-reader state, NOT a fault.`
+      : `FAULT — heartbeat ${ageSec}s old (> ${SYNC_STALE_SEC}s): wacli-sync is down or stuck and the store is going stale.`,
+  };
+}
+
+/** Attach the sync-supervisor verdict to wacli's own doctor JSON (additive; never throws). */
+async function augmentDoctor(p: Promise<unknown>): Promise<unknown> {
+  const data = await p;
+  if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+    return { ...(data as Record<string, unknown>), sync_supervisor: syncSupervisorHealth() };
+  }
+  return data;
+}
+
 // Shared field schema: wacli imposes no hard upper bound, but a very large limit would flood the
 // model's context, so we cap (and document) it here.
 const limitSchema = z.number().int().positive().max(1000).optional().describe("max results (default 50, max 1000)");
 
 /** Construct a fresh MCP server with all tools registered — one per stdio process, one per HTTP session. */
 function buildServer(): McpServer {
-  const server = new McpServer({ name: "wacli-mcp", version: "0.1.0" });
+  const server = new McpServer({ name: "wacli-mcp", version: "0.2.1" });
   registerTools(server);
   return server;
 }
@@ -321,10 +368,10 @@ function registerTools(server: McpServer): void {
     "wacli_doctor",
     {
       description:
-        "Diagnostics: store path, auth status, sync stats, FTS availability. Good first call to confirm wacli is set up.",
+        "Diagnostics: store path, auth status, sync stats, FTS availability, plus a `sync_supervisor` verdict that classifies a `locked_by_other_process` reading as HEALTHY (a wacli-sync sidecar holds the live connection) vs FAULT (sync down, store stale). Good first call to confirm wacli is set up.",
       inputSchema: {},
     },
-    () => asResult(runWacli(["doctor"])),
+    () => asResult(augmentDoctor(runWacli(["doctor"]))),
   );
 
   server.registerTool(
