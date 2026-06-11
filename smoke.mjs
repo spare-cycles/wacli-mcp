@@ -13,7 +13,20 @@ const tools = await client.listTools();
 console.log("TOOLS:", tools.tools.map((t) => t.name).join(", "));
 
 const doctor = await client.callTool({ name: "wacli_doctor", arguments: {} });
-console.log("DOCTOR:", doctor.content[0].text.slice(0, 300));
+const doctorText = doctor.content[0].text;
+console.log("DOCTOR:", doctorText.slice(0, 400));
+// wacli_doctor must always carry the sync_supervisor verdict (it's attached even when `wacli doctor`
+// itself errors). Assert its shape so a regression in the enrichment is caught.
+try {
+  const ss = JSON.parse(doctorText).sync_supervisor;
+  if (!ss || !["healthy", "fault", "unknown"].includes(ss.status)) {
+    throw new Error(`sync_supervisor.status missing/invalid: ${JSON.stringify(ss)}`);
+  }
+  console.log("SYNC_SUPERVISOR:", JSON.stringify(ss));
+} catch (e) {
+  console.error("DOCTOR_ASSERT_FAILED:", e.message);
+  process.exitCode = 1;
+}
 
 const chats = await client.callTool({ name: "wacli_chats_list", arguments: { limit: 1 } });
 console.log("CHATS:", chats.content[0].text.slice(0, 200));
