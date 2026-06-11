@@ -11,12 +11,16 @@
  *
  * State machine: STARTING → UP ⇄ DOWN. Guarantee: alert within ~SYNC_STALE_SEC if the sync
  * connection is down or never establishes (connection-liveness, not per-message delivery latency).
+ * Self-heal: if DOWN persists past SYNC_HARD_RESTART_SEC, the supervisor exits so the container's
+ * restart policy brings up a FRESH connection — recovering a wedged-but-alive wacli child that the
+ * reconnect loop can't fix and that the Docker healthcheck would otherwise only flag, never restart.
  *
  * Env:
  *   WACLI_BIN, WACLI_STORE_DIR            wacli binary + store dir (shared with wacli-mcp)
  *   SYNC_HEARTBEAT_FILE                   default <store>/.sync-heartbeat
  *   SYNC_STALE_SEC      (default 360)     down/stale grace before alerting + healthcheck threshold
  *   SYNC_REALERT_SEC    (default 1800)    re-alert cadence while still down
+ *   SYNC_HARD_RESTART_SEC (default 900)   exit (→ container restart) after this long continuously DOWN; 0 disables
  *   SYNC_LOCK_WAIT      (default 30s)     --lock-wait so the sync wins the store lock at startup
  *   SYNC_DOWNLOAD_MEDIA, SYNC_REFRESH_GROUPS   optional wacli sync flags (truthy)
  *   NTFY_BASE_URL, NTFY_TOPIC, NTFY_TOKEN  ntfy publish (JSON to the root URL, Bearer auth)
@@ -44,6 +48,14 @@ const NTFY_TOKEN = process.env["NTFY_TOKEN"] || "";
 const LOCK_WAIT = process.env["SYNC_LOCK_WAIT"] || "30s";
 const STALE_SEC = numEnv("SYNC_STALE_SEC", 360);
 const REALERT_SEC = numEnv("SYNC_REALERT_SEC", 1800);
+// Hard-restart ceiling: exit (→ `restart: unless-stopped`) after being continuously DOWN this long,
+// so a wedged-but-alive wacli (process up, never re-emits `connected`) self-heals via a fresh start
+// instead of only tripping the healthcheck. 0 disables (alert-only). numEnv() can't express 0, so
+// parse it explicitly: any finite value ≥ 0 is honored, anything else falls back to the default.
+const HARD_RESTART_SEC = ((): number => {
+  const n = Number(process.env["SYNC_HARD_RESTART_SEC"]);
+  return Number.isFinite(n) && n >= 0 ? n : 900;
+})();
 // Refresh the heartbeat well within the stale window so a healthy connection never looks stale.
 const TICK_MS = Math.min(30, STALE_SEC / 4) * 1000;
 
@@ -59,6 +71,7 @@ let state: State = "STARTING";
 let downSince: number | null = null; // epoch seconds the current down-episode began
 let alerted = false; // a down-alert was sent for the current episode
 let lastAlertAt = 0; // epoch seconds of the last down-alert
+let restarting = false; // a hard-restart exit has been scheduled (fire once)
 const startTime = now();
 
 function writeHeartbeat(): void {
@@ -197,6 +210,22 @@ function tick(): void {
     downSince = startTime;
   }
   if (downSince === null || t - downSince < STALE_SEC) return; // not down long enough (or STARTING)
+  // Hard-restart valve: down past the ceiling → exit so the restart policy brings up a fresh
+  // connection. Reuses the same "exit → restart" recovery as a child crash, but for the nastier
+  // case where the child stays alive yet never reconnects. Fires once (guarded by `restarting`).
+  if (HARD_RESTART_SEC > 0 && !restarting && t - downSince >= HARD_RESTART_SEC) {
+    restarting = true;
+    const mins = Math.floor((t - downSince) / 60);
+    log(`down ~${mins} min ≥ hard-restart ceiling ${HARD_RESTART_SEC}s — exiting for a clean restart`);
+    void ntfy(
+      "🚨 wacli-sync self-restart",
+      `WhatsApp sync down ~${mins} min (≥ ${HARD_RESTART_SEC}s ceiling); exiting so the container restarts with a fresh connection.`,
+      5,
+      ["rotating_light"],
+    );
+    setTimeout(() => process.exit(1), 1500); // let the alert flush; restart policy restarts us
+    return;
+  }
   if (alerted && t - lastAlertAt < REALERT_SEC) return; // already alerted recently
   alerted = true;
   lastAlertAt = t;
