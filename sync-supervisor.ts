@@ -279,11 +279,13 @@ function tick(): void {
   const t = now();
   if (state === "UP") {
     writeHeartbeat();
-    // Sustained-healthy → clear the thrash counter so isolated, well-recovered drops don't accumulate.
-    if (priorRestarts > 0 && upSince !== null && t - upSince >= RAPID_WINDOW_SEC) {
+    // Sustained-healthy → clear the thrash counter AND re-arm the valve, so isolated, well-recovered
+    // drops don't accumulate toward a give-up and a recovered account regains self-heal.
+    if ((priorRestarts > 0 || valveDisabled) && upSince !== null && t - upSince >= RAPID_WINDOW_SEC) {
       priorRestarts = 0;
+      valveDisabled = false;
       saveRestartCount(0);
-      log("sync healthy for a sustained period — cleared the rapid-restart counter");
+      log("sync healthy for a sustained period — cleared the rapid-restart counter and re-armed self-heal");
     }
     return;
   }
