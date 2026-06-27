@@ -14,6 +14,7 @@ A thin [MCP](https://modelcontextprotocol.io) server that wraps the [`wacli`](ht
 | `wacli_groups_list` | List groups. |
 | `wacli_send_text` | Send a text message (hidden in read-only mode). |
 | `wacli_send_file_path` | Send a file from a path on the server's filesystem (hidden in read-only mode). Renamed from `wacli_send_file`. |
+| `wacli_send_file_bytes` | Send a file from client-supplied base64 content — no server-side path (hidden in read-only mode). |
 | `wacli_run` | Escape hatch: run any other wacli subcommand (polls, presence, channels, profile, media…). |
 
 `auth` (interactive QR) and `--follow` (never returns) are blocked. There's a hard subprocess timeout on every call.
@@ -148,6 +149,8 @@ claude mcp add wacli -e WACLI_BIN=/Users/loup/code/perso/wacli-latest/dist/wacli
 | `WACLI_MCP_MAX_OUTPUT_CHARS` | `5000000` | Cap on buffered child output; a command that exceeds it is aborted. Clamped to [10000, 50000000]. |
 | `WACLI_MCP_MAX_RESULT_CHARS` | `200000` | Cap on the text returned to the model (truncated with a note) so a large result can't flood context. |
 | `WACLI_MCP_LOCK_WAIT` | – | Go duration (e.g. `10s`) to wait for the store write-lock before failing, so a write queues behind a transient lock (a concurrent `sync`/`auth`) instead of erroring immediately. Reads ignore it; invalid values are warned and ignored. |
+| `WACLI_UPLOAD_DIR` | `os.tmpdir()` | Dir where `wacli_send_file_bytes` writes its short-lived temp files (removed after each send). |
+| `WACLI_MAX_UPLOAD_BYTES` | `67108864` (64 MiB) | Max **decoded** size accepted by `wacli_send_file_bytes`; clamped to [1, 268435456]. The HTTP body limit is derived from this (`ceil(× 4/3) + 1 MiB`) so a within-cap upload isn't rejected with a 413. |
 
 **Hardening notes:** every call runs the binary via `spawn` (argv array — no shell, so no shell injection), with UTF-8-safe streaming, a proportional timeout head-start (wacli's own `--timeout` is set to 90% of the hard deadline so its structured error wins), and an output cap. Children are spawned detached and killed by **process group** (so wacli's own `ffmpeg`/`ffprobe` helpers don't orphan), and reaped on `SIGINT`/`SIGTERM`/`exit`. An `EPIPE` from a disconnecting client shuts the server down cleanly instead of crashing mid-write; in **stdio** mode an `uncaughtException`/`unhandledRejection` also exits cleanly, but in **HTTP** mode they are logged and the server keeps serving other clients (a per-request error returns a JSON-RPC 500). `wacli_run` is sandboxed: it cannot override the server-owned globals (`--store`/`--account`/`--read-only`/`--timeout`/`--json`/`--events`) and cannot run `auth`, `sync`, or follow mode. The typed tools build their own argv and are not subject to that policy, so search/message content that happens to look like a flag (e.g. `--store`) works.
 
