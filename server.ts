@@ -387,7 +387,7 @@ const limitSchema = z.number().int().positive().max(1000).optional().describe("m
 
 /** Construct a fresh MCP server with all tools registered — one per stdio process, one per HTTP session. */
 function buildServer(): McpServer {
-  const server = new McpServer({ name: "wacli-mcp", version: "0.2.1" });
+  const server = new McpServer({ name: "wacli-mcp", version: "0.3.0" });
   registerTools(server);
   return server;
 }
