@@ -32,7 +32,7 @@ RUN corepack enable
 WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
-COPY tsconfig.json server.ts sync-supervisor.ts ./
+COPY tsconfig.json tsconfig.build.json server.ts sync-supervisor.ts send-file.ts ./
 RUN pnpm build && pnpm prune --prod
 
 # ── 3) Runtime ───────────────────────────────────────────────────────────────

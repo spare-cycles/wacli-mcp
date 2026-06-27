@@ -1,0 +1,7 @@
+{
+  // Production build (Dockerfile / `pnpm build`): same strict options as the gate, but emit only the
+  // runtime entrypoints — exclude *.test.ts so no test code ships in dist/ or the image. The full
+  // tsconfig.json still type-checks the tests (that's the `pnpm check` gate).
+  "extends": "./tsconfig.json",
+  "include": ["server.ts", "sync-supervisor.ts", "send-file.ts"]
+}
