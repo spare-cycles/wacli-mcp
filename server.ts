@@ -18,11 +18,14 @@
  *   WACLI_MCP_MAX_RESULT_CHARS  cap on the text returned to the model (default 200,000)
  *   WACLI_MCP_LOCK_WAIT         Go duration (e.g. "10s") to wait for the store write-lock before
  *                               failing; lets writes queue behind a transient lock. Default: fail fast.
+ *   WACLI_UPLOAD_DIR            dir for temp files written by wacli_send_file_bytes (default: os.tmpdir())
+ *   WACLI_MAX_UPLOAD_BYTES      max decoded size accepted by wacli_send_file_bytes (default 67108864 = 64 MiB)
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Server as HttpServer } from "node:http";
+import { tmpdir } from "node:os";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -30,6 +33,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express, { type Request, type Response } from "express";
 import { z } from "zod";
+import { prepareSendFileBytes, type PreparedSend } from "./send-file.js";
 
 /** Parse a positive-integer env var; fall back on invalid/≤0, then clamp into [min, max]. */
 function envInt(raw: string | undefined, fallback: number, min: number, max: number): number {
@@ -78,6 +82,14 @@ const LOCK_WAIT = envDuration(process.env["WACLI_MCP_LOCK_WAIT"]);
 // MUST match the wacli-sync container's SYNC_STALE_SEC, else the doctor verdict disagrees with the
 // authority that actually owns liveness — the compose sets both explicitly to keep them in lockstep.
 const SYNC_STALE_SEC = envInt(process.env["WACLI_MCP_SYNC_STALE_SEC"], 360, 1, 86_400);
+// Where wacli_send_file_bytes writes its short-lived temp files (removed after each send).
+const UPLOAD_DIR = process.env["WACLI_UPLOAD_DIR"] || tmpdir();
+// Max decoded upload size for wacli_send_file_bytes. Default 64 MiB; clamped to [1 B, 256 MiB].
+const MAX_UPLOAD_BYTES = envInt(process.env["WACLI_MAX_UPLOAD_BYTES"], 64 * 1024 * 1024, 1, 256 * 1024 * 1024);
+// Base64 inflates bytes by 4/3; allow that plus ~1 MiB of JSON-envelope overhead so a within-cap
+// upload isn't rejected with a 413 before reaching the handler. Derived from MAX_UPLOAD_BYTES so the
+// wire limit and the decoded cap can never silently disagree.
+const HTTP_BODY_LIMIT_BYTES = Math.ceil((MAX_UPLOAD_BYTES * 4) / 3) + 1024 * 1024;
 
 // Serve over HTTP (Streamable HTTP) when explicitly enabled or a PORT is provided; otherwise stdio.
 const HTTP_MODE = envTruthy(process.env["WACLI_MCP_HTTP"]) || process.env["PORT"] !== undefined;
@@ -516,9 +528,10 @@ function registerTools(server: McpServer): void {
     );
 
     server.registerTool(
-      "wacli_send_file",
+      "wacli_send_file_path",
       {
-        description: "Send a file (image/video/audio/document) from a local path. `to` resolves like wacli_send_text.",
+        description:
+          "Send a file (image/video/audio/document) from a path on THIS server's filesystem. For a remote client without server-side files, use wacli_send_file_bytes instead. `to` resolves like wacli_send_text.",
         inputSchema: {
           to: z.string().min(1).describe("recipient: JID, phone number, or contact/group/chat name"),
           file: z.string().min(1).describe("absolute path to the file on this machine"),
@@ -530,6 +543,48 @@ function registerTools(server: McpServer): void {
       },
       ({ to, file, caption, filename, pick, reply_to }) =>
         asResult(runWacli(["send", "file", ...flags({ to, file, caption, filename, pick, "reply-to": reply_to })])),
+    );
+
+    server.registerTool(
+      "wacli_send_file_bytes",
+      {
+        description:
+          "Send a file whose content the client supplies as base64 — no server-side path needed (use this from a remote client). The bytes are written to a temp file and removed after the send. `to` resolves like wacli_send_text.",
+        inputSchema: {
+          to: z.string().min(1).describe("recipient: JID, phone number, or contact/group/chat name"),
+          content_base64: z.string().min(1).describe("file content, base64-encoded"),
+          filename: z
+            .string()
+            .min(1)
+            .describe("display name incl. extension (only the basename is used; sets the WhatsApp MIME type)"),
+          caption: z.string().optional(),
+          pick: z.number().int().positive().optional(),
+          reply_to: z.string().optional().describe("message ID to quote/reply to"),
+        },
+      },
+      ({ to, content_base64, filename, caption, pick, reply_to }) => {
+        let prepared: PreparedSend;
+        try {
+          prepared = prepareSendFileBytes(
+            {
+              to,
+              content_base64,
+              filename,
+              ...(caption !== undefined && { caption }),
+              ...(pick !== undefined && { pick }),
+              ...(reply_to !== undefined && { reply_to }),
+            },
+            { uploadDir: UPLOAD_DIR, maxUploadBytes: MAX_UPLOAD_BYTES },
+          );
+        } catch (e) {
+          // Surface validation failures through asResult's rejection path as the normal
+          // {success:false,error} envelope (same pattern as the has_media guard above).
+          return asResult(Promise.reject(e instanceof Error ? e : new Error(String(e))));
+        }
+        const { argv, cleanup } = prepared;
+        // Remove the temp file whether the send succeeds or fails, while propagating the result.
+        return asResult(runWacli(argv).finally(cleanup));
+      },
     );
   }
 
@@ -624,7 +679,7 @@ function headerSessionId(req: Request): string | undefined {
  *  server per request with JSON responses, for clients that don't track sessions. */
 async function startHttp(): Promise<void> {
   const app = express();
-  app.use(express.json({ limit: "16mb" }));
+  app.use(express.json({ limit: HTTP_BODY_LIMIT_BYTES }));
   app.get("/health", (_req, res) => {
     res.json({ ok: true });
   });
