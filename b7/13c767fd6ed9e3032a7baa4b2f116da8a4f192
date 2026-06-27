@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "b713c767fd6ed9e3032a7baa4b2f116da8a4f192",
+  "prompts": {},
+  "humans": {
+    "h_0414589c06b985": {
+      "author": "Loup Peluso <loup.peluso@sherpas.com>"
+    }
+  }
+}
