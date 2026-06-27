@@ -133,6 +133,12 @@ separators (e.g. `"/"` → basename `""`).
 }
 ```
 
+> Note (implementation): under `exactOptionalPropertyTypes`, the destructured
+> optionals (`caption`/`pick`/`reply_to`, typed `T | undefined`) do **not**
+> assign to `SendFileBytesInput`'s `caption?: T` fields directly, so the handler
+> spreads them conditionally (`...(caption !== undefined && { caption })`) to omit
+> the key when absent. Behaviour-preserving (a `caption` of `""` is still passed).
+
 `.finally(cleanup)` removes the temp file on **success and failure** while
 propagating the original result/error. Validation failures surface through
 `asResult`'s rejection path as the normal `{success:false,error}` envelope — the

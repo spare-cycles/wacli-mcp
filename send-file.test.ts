@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -71,6 +71,22 @@ void test("rejects invalid base64", () => {
         ),
       /not valid base64/,
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test("accepts valid base64 without padding", () => {
+  const dir = freshDir();
+  try {
+    // "hello" is "aGVsbG8=" padded; clients that omit the trailing '=' send "aGVsbG8".
+    const { argv, cleanup } = prepareSendFileBytes(
+      { to: "t", content_base64: "aGVsbG8", filename: "h.txt" },
+      { uploadDir: dir, maxUploadBytes: 1024 },
+    );
+    const tmp = flagValue(argv, "--file");
+    assert.equal(readFileSync(tmp, "utf8"), "hello");
+    cleanup();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

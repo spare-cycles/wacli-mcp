@@ -24,8 +24,8 @@ export type PreparedSend = {
   cleanup: () => void;
 };
 
-// Canonical base64: the standard alphabet with 0–2 trailing '=' pad chars only.
-const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+// The standard base64 alphabet, padding stripped before this is applied.
+const BASE64_ALPHABET_RE = /^[A-Za-z0-9+/]*$/;
 
 export function prepareSendFileBytes(
   input: SendFileBytesInput,
@@ -38,13 +38,16 @@ export function prepareSendFileBytes(
     throw new Error(`invalid filename ${JSON.stringify(input.filename)}: must reduce to a basename`);
   }
 
-  // Tolerate wrapped base64 (clients may insert newlines), then validate strictly.
+  // Tolerate wrapped base64 (clients may insert newlines) and optional/absent padding
+  // (some clients omit the trailing '='). Reject only genuinely malformed input: chars
+  // outside the standard alphabet, or a length that can't be valid base64 (len % 4 === 1).
   const b64 = input.content_base64.replace(/\s/g, "");
-  if (b64.length % 4 !== 0 || !BASE64_RE.test(b64)) {
+  const core = b64.replace(/=+$/, "");
+  if (!BASE64_ALPHABET_RE.test(core) || core.length % 4 === 1) {
     throw new Error("content_base64 is not valid base64");
   }
 
-  const buf = Buffer.from(b64, "base64");
+  const buf = Buffer.from(core, "base64");
   if (buf.length === 0) {
     throw new Error("content_base64 decoded to 0 bytes");
   }

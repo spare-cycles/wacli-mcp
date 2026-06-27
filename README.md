@@ -13,7 +13,7 @@ A thin [MCP](https://modelcontextprotocol.io) server that wraps the [`wacli`](ht
 | `wacli_contacts_search` | Search synced contacts. |
 | `wacli_groups_list` | List groups. |
 | `wacli_send_text` | Send a text message (hidden in read-only mode). |
-| `wacli_send_file_path` | Send a file from a path on the server's filesystem (hidden in read-only mode). Renamed from `wacli_send_file`. |
+| `wacli_send_file_path` | Send a file from a path on the server's filesystem (hidden in read-only mode). **Breaking:** renamed from `wacli_send_file` (the old name is gone, not aliased — update any client that used it). |
 | `wacli_send_file_bytes` | Send a file from client-supplied base64 content — no server-side path (hidden in read-only mode). |
 | `wacli_run` | Escape hatch: run any other wacli subcommand (polls, presence, channels, profile, media…). |
 
