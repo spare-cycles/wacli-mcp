@@ -516,9 +516,10 @@ function registerTools(server: McpServer): void {
     );
 
     server.registerTool(
-      "wacli_send_file",
+      "wacli_send_file_path",
       {
-        description: "Send a file (image/video/audio/document) from a local path. `to` resolves like wacli_send_text.",
+        description:
+          "Send a file (image/video/audio/document) from a path on THIS server's filesystem. For a remote client without server-side files, use wacli_send_file_bytes instead. `to` resolves like wacli_send_text.",
         inputSchema: {
           to: z.string().min(1).describe("recipient: JID, phone number, or contact/group/chat name"),
           file: z.string().min(1).describe("absolute path to the file on this machine"),

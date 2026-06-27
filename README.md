@@ -13,7 +13,7 @@ A thin [MCP](https://modelcontextprotocol.io) server that wraps the [`wacli`](ht
 | `wacli_contacts_search` | Search synced contacts. |
 | `wacli_groups_list` | List groups. |
 | `wacli_send_text` | Send a text message (hidden in read-only mode). |
-| `wacli_send_file` | Send a file (hidden in read-only mode). |
+| `wacli_send_file_path` | Send a file from a path on the server's filesystem (hidden in read-only mode). Renamed from `wacli_send_file`. |
 | `wacli_run` | Escape hatch: run any other wacli subcommand (polls, presence, channels, profile, media…). |
 
 `auth` (interactive QR) and `--follow` (never returns) are blocked. There's a hard subprocess timeout on every call.
