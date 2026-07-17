@@ -13,7 +13,7 @@ on:
         default: main
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  IMAGE: git.loup-peluso.com/${{ github.repository }}
 
 jobs:
   build:
@@ -28,9 +28,9 @@ jobs:
 
       - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: git.loup-peluso.com
+          username: loup
+          password: ${{ secrets.REGISTRY_TOKEN }}
 
       - id: meta
         uses: docker/metadata-action@v5
@@ -52,5 +52,3 @@ jobs:
           # (default `main` is for convenience — bump it deliberately for reproducible images).
           build-args: |
             WACLI_REF=${{ github.event.inputs.wacli_ref || 'main' }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
