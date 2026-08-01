@@ -106,6 +106,11 @@ function toMessageRow(raw: MessageRowRaw): MessageRow {
   };
 }
 
+/** A snippet column that is NULL or empty: either way, that column carried no match. */
+function emptyToUndefined(snippet: string | null): string | undefined {
+  return snippet === null || snippet === "" ? undefined : snippet;
+}
+
 /** Wrap a raw user query as a single quoted FTS5 string so no operator character reaches the parser. */
 function quoteFtsQuery(query: string): string {
   return `"${query.replace(/"/g, '""')}"`;
@@ -265,11 +270,18 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
         ? (searchScopedStmt.all({ q, chatId: opts.chatId, limit, offset }) as SearchRowRaw[])
         : (searchStmt.all({ q, limit, offset }) as SearchRowRaw[]);
     return rows.map((row) => {
-      const matchedTranscript = row.snip_text === null && row.snip_transcript !== null;
+      // FTS5's `snippet()` answers NULL for a column that did not match — but for a column that is
+      // an empty *string* it answers with an empty string instead, and an empty snippet is just as
+      // much "this column did not match" as NULL is. Reading only for NULL makes a hit on the
+      // transcript of a message whose text is `''` report itself as a text hit, with a blank
+      // snippet. Storable today (an `extendedTextMessage` with an empty body lands as `''`, not
+      // NULL), so this is cheaper to rule out than to rediscover from a blank search result.
+      const snipText = emptyToUndefined(row.snip_text);
+      const snipTranscript = emptyToUndefined(row.snip_transcript);
       return {
         ...toMessageRow(row),
-        matchedTranscript,
-        snippet: row.snip_text ?? row.snip_transcript ?? "",
+        matchedTranscript: snipText === undefined && snipTranscript !== undefined,
+        snippet: snipText ?? snipTranscript ?? "",
       };
     });
   }

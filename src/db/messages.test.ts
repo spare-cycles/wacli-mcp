@@ -145,6 +145,17 @@ void test("search finds transcripts and flags them", () => {
   assert.equal(hits[0].id, "V1");
 });
 
+void test("a transcript hit on a message with an empty text is still a transcript hit", () => {
+  // FTS5 answers `snippet()` with "" (not NULL) for a column that is an empty string, so reading
+  // only for NULL would call this a text hit and return a blank snippet.
+  const r = repo();
+  r.upsert(msg({ id: "V1", kind: "audio", text: "" }));
+  r.setTranscript("c", "V1", "on se retrouve demain");
+  const hit = r.search("demain", {}, 10, 0)[0];
+  assert.equal(hit?.matchedTranscript, true);
+  assert.match(hit.snippet, /demain/);
+});
+
 void test("search can be scoped to one chat", () => {
   const r = repo();
   r.upsert(msg({ chatId: "c", id: "M1", text: "orange" }));

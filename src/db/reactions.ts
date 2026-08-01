@@ -6,6 +6,13 @@ export type ReactionsRepo = {
   /** An empty emoji removes the reaction. Same (chat, message, sender) replaces. */
   set: (r: ReactionRow) => void;
   forMessage: (chatId: string, messageId: string) => ReactionRow[];
+  /**
+   * How many reactions each of `messageIds` carries, in **one** grouped query.
+   *
+   * This exists so a list of fifty messages costs one query rather than fifty `forMessage` calls.
+   * Messages with no reactions are simply absent from the map.
+   */
+  countsFor: (chatId: string, messageIds: readonly string[]) => Map<string, number>;
   count: () => number;
 };
 
@@ -44,9 +51,26 @@ export function makeReactionsRepo(db: Db): ReactionsRepo {
     return rows.map(toReactionRow);
   }
 
+  function countsFor(chatId: string, messageIds: readonly string[]): Map<string, number> {
+    const counts = new Map<string, number>();
+    if (messageIds.length === 0) return counts;
+    // The placeholder count varies with the page size, so this one statement cannot be prepared
+    // ahead of time. The list is bounded by the tools' `limit` cap (200), so the SQL stays small.
+    const placeholders = messageIds.map(() => "?").join(", ");
+    const rows = db
+      .prepare(
+        `SELECT message_id, COUNT(*) AS c FROM reactions
+          WHERE chat_id = ? AND message_id IN (${placeholders})
+          GROUP BY message_id`,
+      )
+      .all(chatId, ...messageIds) as { message_id: string; c: number }[];
+    for (const row of rows) counts.set(row.message_id, row.c);
+    return counts;
+  }
+
   function count(): number {
     return (countStmt.get() as { n: number }).n;
   }
 
-  return { set, forMessage, count };
+  return { set, forMessage, countsFor, count };
 }

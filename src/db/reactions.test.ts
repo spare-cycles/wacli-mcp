@@ -36,6 +36,26 @@ void test("an empty emoji removes the reaction", () => {
   assert.equal(r.forMessage("c", "M1").length, 0);
 });
 
+void test("countsFor groups a whole page of message ids in one query", () => {
+  const r = repo();
+  r.set({ chatId: "c", messageId: "M1", senderId: "s1", emoji: "👍", ts: 1 });
+  r.set({ chatId: "c", messageId: "M1", senderId: "s2", emoji: "❤️", ts: 2 });
+  r.set({ chatId: "c", messageId: "M2", senderId: "s1", emoji: "👍", ts: 3 });
+  r.set({ chatId: "other", messageId: "M1", senderId: "s1", emoji: "👍", ts: 4 });
+
+  const counts = r.countsFor("c", ["M1", "M2", "M3"]);
+  assert.equal(counts.get("M1"), 2);
+  assert.equal(counts.get("M2"), 1);
+  assert.equal(counts.get("M3"), undefined, "a message with no reactions is absent, not zero");
+  assert.equal(counts.size, 2, "the other chat's identically-named message must not leak in");
+});
+
+void test("countsFor with no ids asks nothing", () => {
+  const r = repo();
+  r.set({ chatId: "c", messageId: "M1", senderId: "s1", emoji: "👍", ts: 1 });
+  assert.equal(r.countsFor("c", []).size, 0);
+});
+
 void test("count reflects the number of stored reactions", () => {
   const r = repo();
   assert.equal(r.count(), 0);

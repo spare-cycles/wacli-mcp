@@ -1,5 +1,6 @@
 {
   "extends": "./tsconfig.json",
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"]
+  "//": "harness.ts is test scaffolding, but not a *.test.ts file, so the glob below cannot catch it.",
+  "exclude": ["src/**/*.test.ts", "src/mcp/tools/harness.ts"]
 }
