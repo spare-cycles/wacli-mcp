@@ -4,6 +4,7 @@ import {
   canonicalId,
   isGroupJid,
   isLidJid,
+  isStatusBroadcastJid,
   isUserJid,
   jidKind,
   lidFromJid,
@@ -28,6 +29,15 @@ void test("predicates agree with jidKind", () => {
   assert.equal(isLidJid("123@lid"), true);
   assert.equal(isGroupJid("120363@g.us"), true);
   assert.equal(isGroupJid("33612345678@s.whatsapp.net"), false);
+});
+
+void test("isStatusBroadcastJid only matches the status feed", () => {
+  assert.equal(isStatusBroadcastJid("status@broadcast"), true);
+  assert.equal(isStatusBroadcastJid("STATUS@BROADCAST"), true);
+  assert.equal(isStatusBroadcastJid("1700000000@broadcast"), false, "a broadcast list is a real chat");
+  assert.equal(isStatusBroadcastJid("status@s.whatsapp.net"), false);
+  assert.equal(isStatusBroadcastJid("120363@g.us"), false);
+  assert.equal(isStatusBroadcastJid("junk"), false);
 });
 
 void test("normalize strips device and agent suffixes", () => {

@@ -70,6 +70,17 @@ export function isGroupJid(jid: string): boolean {
 }
 
 /**
+ * The status/stories feed. It arrives as an ordinary message event but is not a conversation, so
+ * ingest drops it rather than manufacturing a chat for it. Lives here, not in the caller, because
+ * recognizing it means reading a JID's local part and server — which only this module may do.
+ */
+export function isStatusBroadcastJid(jid: string): boolean {
+  const parts = splitJid(normalizeJid(jid));
+  if (parts === undefined) return false;
+  return SERVER_KIND[parts.server] === "broadcast" && parts.local.toLowerCase() === "status";
+}
+
+/**
  * Strip the device (`:12`) and agent (`_1`) suffixes from the local part, lowercase the
  * server. Never changes the server itself, and never throws: malformed input (no `@`) is
  * returned unchanged.
