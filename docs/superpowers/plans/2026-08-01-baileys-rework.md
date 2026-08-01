@@ -740,7 +740,7 @@ Expected: FAIL — `Cannot find module './jid.js'`.
 Implement against the test. Notes that matter:
 
 - Split on the **last** `@`, not the first — WhatsApp servers do not contain `@`, but splitting on the first is a habit that breaks on malformed input. Everything before it is the local part, everything after is the server.
-- The device suffix is `:<digits>` on the local part; the agent suffix is `_<digits>`. Strip the device first, then the agent, so `33612345678_1:5` reduces correctly.
+- The device suffix is `:<digits>` on the local part; the agent suffix is `_<digits>`. Strip the device first, then the agent, so `33612345678_1:5` reduces correctly. **Strip to a fixed point, not once.** A single pass is not idempotent for a local part carrying a repeated suffix-shaped substring — `123:5:6@s.whatsapp.net` reduces to `123:5@…` on the first call and `123@…` on the second, which breaks `canonicalId`'s defining property. Loop until the string stops changing; it terminates because every iteration either shortens the string or stops. Real WhatsApp JIDs do not chain suffixes, but this module is the chokepoint every other module trusts, and its contract is idempotency on *any* input. Found by review during Task 3.
 - Lowercase the **server only**. LID local parts are digits, but do not assume that when lowercasing.
 - Servers: `s.whatsapp.net` → `user`, `lid` → `lid`, `g.us` → `group`, `broadcast` → `broadcast`, `newsletter` → `newsletter`, anything else (including a string with no `@`) → `unknown`.
 - `canonicalId` normalizes first, then applies the policy. It must never throw on malformed input — return the normalized string unchanged.
