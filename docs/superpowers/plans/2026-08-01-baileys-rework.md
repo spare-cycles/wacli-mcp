@@ -2724,6 +2724,8 @@ test("path sending refuses traversal, symlink escape and sibling-prefix paths", 
 });
 ```
 
+**That second test as written is vacuous, and the implementer must replace it.** `/data/uploads` does not exist in the test environment, so realpathing the *root* fails and the code short-circuits to a refusal before the prefix comparison ever runs — every path is refused for the wrong reason. Weakening `isWithin` to a bare `startsWith` leaves it green, which is exactly the bug it is supposed to catch. Build a real directory tree in a temp dir instead: a real sibling `…-evil`, a real symlink pointing out, a traversal, an absent file, the root itself, **and a positive case that must succeed** — a fail-everything implementation has to fail this test too. (Found by Task 9's implementer, by mutation.)
+
 - [ ] **Step 4: Write the media tools**
 
 `wa_download_media(chat, message_id)`:
