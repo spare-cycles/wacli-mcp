@@ -10,8 +10,15 @@
  * **The model download is covered in full.** `fetchImpl` exists precisely so the network can be a
  * few bytes in memory, so every rule the download has to obey is a test below: a stale `.part` is
  * discarded rather than resumed, a non-2xx names the knob, a stall fails while a merely slow
- * transfer does not, a truncated body is caught by `Content-Length`, a write error keeps its errno,
- * a failure does not poison the next call, and concurrent callers download once.
+ * transfer does not, a body that dies mid-transfer says so and says how far it got, a truncated body
+ * is caught by `Content-Length` — which the request keeps armed by asking for `identity` — a write
+ * error keeps its errno, a failure does not poison the next call, and concurrent callers download
+ * once.
+ *
+ * One rule is implemented but not observable from here: the write loop that tolerates a short
+ * `write(2)`. A regular file cannot be made to accept less than it was given on demand, and the only
+ * way to force it would be to inject the file handle — a production seam that exists for no other
+ * reason. It is stated rather than silently missing.
  *
  * The single exception is ENOSPC *end to end*: a unit test cannot fill a volume. Its message is
  * asserted through `modelWriteError`, and an EACCES download proves that mapper is really wired into
@@ -92,14 +99,20 @@ function urlOf(input: Parameters<typeof fetch>[0]): string {
   return input.url;
 }
 
-/** A `fetch` that never touches the network, counting the calls it was asked to make. */
-function stubFetch(handler: (url: string) => Response): { impl: typeof fetch; urls: string[] } {
+/** A `fetch` that never touches the network, recording the calls it was asked to make. */
+function stubFetch(handler: (url: string) => Response): {
+  impl: typeof fetch;
+  urls: string[];
+  headers: Headers[];
+} {
   const urls: string[] = [];
-  const impl: typeof fetch = (input) => {
+  const headers: Headers[] = [];
+  const impl: typeof fetch = (input, init) => {
     urls.push(urlOf(input));
+    headers.push(new Headers(init?.headers));
     return Promise.resolve(handler(urlOf(input)));
   };
-  return { impl, urls };
+  return { impl, urls, headers };
 }
 
 /** A body that emits `chunks` one at a time, optionally pausing `gapMs` before each. */
@@ -114,6 +127,28 @@ function streamOf(chunks: readonly Uint8Array[], gapMs = 0): ReadableStream<Uint
       }
       next += 1;
       if (gapMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, gapMs));
+      controller.enqueue(chunk);
+    },
+  });
+}
+
+/**
+ * A body that delivers `chunks` and then dies, the way a dropped connection does mid-transfer.
+ *
+ * This is the failure a 574 MB download actually has, and until this helper existed no test could
+ * produce it: `streamOf` only ever ends cleanly, so an error escaping the read loop was invisible.
+ * With no chunks it errors on the very first read; with some, after they have been written.
+ */
+function streamThenError(chunks: readonly Uint8Array[], err: Error): ReadableStream<Uint8Array> {
+  let next = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const chunk = chunks[next];
+      if (chunk === undefined) {
+        controller.error(err);
+        return;
+      }
+      next += 1;
       controller.enqueue(chunk);
     },
   });
@@ -149,6 +184,17 @@ function tmpEntries(dataDir: string): string[] {
   const dir = join(dataDir, "tmp");
   return existsSync(dir) ? readdirSync(dir) : [];
 }
+
+/**
+ * The two tests below deny themselves write access with mode `0555`, which does not constrain uid 0:
+ * root writes into a read-only directory happily, so they would report a failure that says nothing
+ * about the code. Nothing here runs as root today, but a root container running `pnpm test` would.
+ * Skipped rather than deleted — the coverage is real under every uid that the permission bits apply
+ * to, which is every uid this deploys under.
+ */
+const rootSkip: { skip?: string } = {
+  ...(process.getuid?.() === 0 ? { skip: "mode 0555 does not deny writes to uid 0" } : {}),
+};
 
 /** The error `p` rejects with. Fails the test if it resolves instead. */
 async function rejectionOf(p: Promise<unknown>): Promise<Error> {
@@ -277,16 +323,58 @@ void test("a download that stalls fails on the stall budget and leaves no .part 
 void test("a slow but progressing download is not cut off: the budget is per chunk, not total", async () => {
   const dataDir = freshDataDir();
   const chunks = [MODEL_BYTES.subarray(0, 10), MODEL_BYTES.subarray(10, 25), MODEL_BYTES.subarray(25)];
-  const fetcher = stubFetch(() => okResponse(streamOf(chunks, 40)));
+  const fetcher = stubFetch(() => okResponse(streamOf(chunks, 200)));
   const t = makeTranscriber({
     config: configFor(dataDir),
     logger: captureLogger().logger,
     fetchImpl: fetcher.impl,
-    // Under the ~120 ms this transfer takes in total, so a total-duration cap would reject it.
-    stallTimeoutMs: 90,
+    // Under the ~600 ms this transfer takes in total, so a total-duration cap would reject it — and
+    // 2.25× the 200 ms gap, so the 250 ms of slack absorbs a scheduling hiccup on a suite that runs
+    // ffmpeg concurrently across files. The ratio, not the absolute numbers, is what discriminates.
+    stallTimeoutMs: 450,
   });
 
   assert.deepEqual(readFileSync(await t.ensureModel()), MODEL_BYTES);
+});
+
+void test("a connection dropped before the first byte is reported as an interrupted transfer", async () => {
+  const dataDir = freshDataDir();
+  // `TypeError: terminated` is verbatim what undici throws when the peer goes away mid-body. On its
+  // own it reaches the operator as one unintelligible word, and it is not a `TranscriptionError`.
+  const fetcher = stubFetch(() => okResponse(streamThenError([], new TypeError("terminated"))));
+  const t = makeTranscriber({ config: configFor(dataDir), logger: captureLogger().logger, fetchImpl: fetcher.impl });
+
+  const err = await rejectionOf(t.ensureModel());
+  assert.ok(err instanceof TranscriptionError, `expected TranscriptionError, got ${err.name}: ${err.message}`);
+  assert.match(err.message, /interrupted/i);
+  assert.ok(err.message.includes("terminated"), `the underlying cause must survive: ${err.message}`);
+  assert.ok(err.message.includes(MODEL_URL), `the URL must be named: ${err.message}`);
+  assert.equal(existsSync(`${modelPathIn(dataDir)}.part`), false);
+  assert.equal(existsSync(modelPathIn(dataDir)), false);
+});
+
+void test("a connection dropped mid-body names the bytes received, discards the .part, and retries clean", async () => {
+  const dataDir = freshDataDir();
+  const delivered = MODEL_BYTES.subarray(0, 17);
+  let attempt = 0;
+  const fetcher = stubFetch(() => {
+    attempt += 1;
+    return attempt === 1
+      ? okResponse(streamThenError([delivered], new Error("aborted")))
+      : okResponse(MODEL_BYTES, { "content-length": String(MODEL_BYTES.byteLength) });
+  });
+  const t = makeTranscriber({ config: configFor(dataDir), logger: captureLogger().logger, fetchImpl: fetcher.impl });
+
+  const err = await rejectionOf(t.ensureModel());
+  assert.ok(err instanceof TranscriptionError, `expected TranscriptionError, got ${err.name}: ${err.message}`);
+  assert.ok(err.message.includes(String(delivered.byteLength)), `how far it got must be named: ${err.message}`);
+  // The rule is never-resume, so the operator has to be told the next attempt starts over.
+  assert.match(err.message, /restart|from zero|from the beginning/i);
+  assert.equal(existsSync(`${modelPathIn(dataDir)}.part`), false, "the partial bytes must not survive the failure");
+
+  // And the retry is clean: a fresh download, not an append to what the dropped one left behind.
+  assert.deepEqual(readFileSync(await t.ensureModel()), MODEL_BYTES);
+  assert.equal(fetcher.urls.length, 2);
 });
 
 void test("a truncated body is caught by the Content-Length check instead of being installed", async () => {
@@ -299,6 +387,17 @@ void test("a truncated body is caught by the Content-Length check instead of bei
   assert.equal(existsSync(`${modelPathIn(dataDir)}.part`), false);
 });
 
+void test("the request asks for an identity encoding, so the length check is not surrendered", async () => {
+  const dataDir = freshDataDir();
+  const fetcher = stubFetch(() => okResponse(MODEL_BYTES, { "content-length": String(MODEL_BYTES.byteLength) }));
+  const t = makeTranscriber({ config: configFor(dataDir), logger: captureLogger().logger, fetchImpl: fetcher.impl });
+
+  await t.ensureModel();
+  // Undici defaults to `gzip, deflate`; any encoding at all disarms rule 4, and the skip below is
+  // meant to be the fallback for a proxy that ignores this header, not the normal case.
+  assert.equal(fetcher.headers[0]?.get("accept-encoding"), "identity");
+});
+
 void test("a compressed response is not judged against its Content-Length", async () => {
   const dataDir = freshDataDir();
   // Content-Length describes the *encoded* body, so comparing it to the decoded byte count would
@@ -309,7 +408,27 @@ void test("a compressed response is not judged against its Content-Length", asyn
   assert.deepEqual(readFileSync(await t.ensureModel()), MODEL_BYTES);
 });
 
-void test("a write failure keeps its errno rather than becoming a generic download failure", async () => {
+void test("a models directory that cannot be created says so, rather than blaming the download", rootSkip, async () => {
+  const dataDir = freshDataDir();
+  await chmod(dataDir, 0o555);
+  try {
+    const fetcher = stubFetch(() => okResponse(MODEL_BYTES));
+    const t = makeTranscriber({ config: configFor(dataDir), logger: captureLogger().logger, fetchImpl: fetcher.impl });
+
+    const err = await rejectionOf(t.ensureModel());
+    assert.ok(err instanceof TranscriptionError, `expected TranscriptionError, got ${err.name}`);
+    // "writing the whisper model to <dir> failed" would send the reader after a transfer that never
+    // started; the directory is the thing that failed.
+    assert.match(err.message, /could not create the whisper model directory/);
+    assert.ok(err.message.includes(join(dataDir, "models")), `the path must be named: ${err.message}`);
+    assert.ok(err.message.includes("EACCES"), `the errno must survive: ${err.message}`);
+    assert.deepEqual(fetcher.urls, [], "nothing is fetched when there is nowhere to put it");
+  } finally {
+    await chmod(dataDir, 0o755);
+  }
+});
+
+void test("a write failure keeps its errno rather than becoming a generic download failure", rootSkip, async () => {
   const dataDir = freshDataDir();
   const models = join(dataDir, "models");
   mkdirSync(models, { recursive: true });
@@ -388,7 +507,8 @@ void test("transcribeFile runs whisper with the expected argv and returns cleane
   const args = join(root, "argv-ok.txt");
   const bin = writeStub(
     "whisper-ok",
-    `printf '%s\\n' "$@" > ${args}\nprintf '[00:00:00.000 --> 00:00:02.000]   Bonjour le monde.\\n'`,
+    // The redirection target is quoted: a TMPDIR with a space in it must break no stub here.
+    `printf '%s\\n' "$@" > "${args}"\nprintf '[00:00:00.000 --> 00:00:02.000]   Bonjour le monde.\\n'`,
   );
   const config = configFor(dataDir, { WA_WHISPER_BIN: bin });
   const fetcher = stubFetch(() => okResponse(MODEL_BYTES));
@@ -453,13 +573,17 @@ void test("a missing whisper binary fails loudly instead of hanging", async () =
 
 // --- available ---------------------------------------------------------------------------------
 
-void test("available() is true when the binary answers --help", async () => {
-  const bin = writeStub("whisper-help", `exit 0`);
+void test("available() probes with --help and nothing else, and is true when that exits cleanly", async () => {
+  const args = join(root, "argv-help.txt");
+  const bin = writeStub("whisper-help", `printf '%s\\n' "$@" > "${args}"\nexit 0`);
   const t = makeTranscriber({
     config: configFor(freshDataDir(), { WA_WHISPER_BIN: bin }),
     logger: captureLogger().logger,
   });
   assert.equal(await t.available(), true);
+  // Asserted rather than assumed: an `exit 0` stub that ignores its argv passes just as happily
+  // against a probe that runs the binary with no arguments at all — or with `-h`, or a transcription.
+  assert.deepEqual(readFileSync(args, "utf8").trim().split("\n"), ["--help"]);
 });
 
 void test("available() is false — never a throw — when the binary is missing", async () => {

@@ -12,7 +12,10 @@
  *    model whose whisper error is unintelligible, a truncated body looks installed forever, and a
  *    cached rejected promise makes one bad minute of network permanent for the life of the process.
  *    The download therefore never resumes, verifies its own length, keeps its errno, and clears its
- *    in-flight promise on every outcome.
+ *    in-flight promise on every outcome. It also refuses a content encoding, so the length check is
+ *    never surrendered to a proxy, and it reports a connection that dies mid-transfer as exactly
+ *    that, naming how far it got — the alternative there is the operator reading the single word
+ *    `terminated` and having no idea whether the network, the disk or the model name was at fault.
  *
  * The stall budget is per read, not per transfer. A total-duration cap would be the wrong shape: a
  * slow link legitimately needs many minutes for this file, while a connection that has delivered
@@ -20,7 +23,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, open, rename, stat, unlink } from "node:fs/promises";
+import { mkdir, open, rename, stat, unlink, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import type { Config } from "../config.js";
@@ -35,6 +38,11 @@ export type Transcriber = {
    * Throws `TranscriptionError` for anything this module decides — too long, no speech, no model —
    * and lets `ConversionError` through unwrapped when ffmpeg or whisper itself is what failed, since
    * that error already names the binary and the reader needs to know which layer broke.
+   *
+   * The length limit only applies to a file whose container declares a duration: when `probeDuration`
+   * returns nothing, the gate is skipped and the recording is bounded solely by whisper's own budget
+   * (the 60 s floor, since ten times an unknown duration is nothing), so such a file dies on that
+   * timeout rather than running unbounded.
    */
   transcribeFile: (path: string) => Promise<string>;
   /** Whether the whisper binary can run at all. Never throws. */
@@ -113,6 +121,20 @@ export function modelWriteError(err: unknown, path: string): TranscriptionError 
   );
 }
 
+/**
+ * A directory that could not be created, said as that rather than as a write failure.
+ *
+ * Both directories this module creates go through here. Routing either into `modelWriteError` would
+ * report "writing the whisper model to <dir> failed" for a `mkdir`, sending the reader after a
+ * download problem that does not exist — and for the scratch directory, after a download entirely.
+ */
+function dirCreateError(err: unknown, path: string, what: string): TranscriptionError {
+  const code = errnoOf(err);
+  return new TranscriptionError(
+    `could not create the ${what} directory ${path}${code === undefined ? "" : ` (${code})`}: ${messageOf(err)}`,
+  );
+}
+
 /** Resolve `p`, or reject once `ms` pass with nothing having happened. */
 async function withStallTimeout<T>(p: Promise<T>, ms: number, url: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
@@ -131,11 +153,21 @@ async function withStallTimeout<T>(p: Promise<T>, ms: number, url: string): Prom
 }
 
 /**
+ * Sent so rule 4 stays armed. Undici's default is `gzip, deflate`, and any encoding at all makes the
+ * `Content-Length` comparison below meaningless — so the length check, which is the only thing
+ * standing between a truncated body and a model that looks installed forever, would be surrendered
+ * to whatever a proxy felt like doing. Asking for `identity` keeps it. The model is already
+ * compressed, so nothing is lost by refusing a second pass over it.
+ */
+const IDENTITY_ENCODING = { "accept-encoding": "identity" } as const;
+
+/**
  * The body length the server promised, when the comparison is meaningful.
  *
- * `Content-Length` describes the *encoded* body. Behind a proxy that gzips the response, fetch hands
- * us the decoded bytes and the two numbers legitimately differ, so comparing them there would reject
- * a perfectly good download every single time and the model would never install.
+ * `Content-Length` describes the *encoded* body. Behind a proxy that gzips the response anyway —
+ * ignoring the `identity` we asked for — fetch hands us the decoded bytes and the two numbers
+ * legitimately differ, so comparing them there would reject a perfectly good download every single
+ * time and the model would never install. This is the fallback, not the plan.
  */
 function declaredBytes(res: Response): number | undefined {
   if (res.headers.get("content-encoding") !== null) return undefined;
@@ -167,6 +199,53 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
     }
   }
 
+  /**
+   * Write every byte of `chunk`, looping over a short write, and report how many really landed.
+   *
+   * `write(2)` on a regular file is allowed to accept less than it was handed — classically when the
+   * volume fills mid-write. Adding the chunk's length instead of the returned count would over-count:
+   * with a `Content-Length` that fails safe, since the size check then calls the download truncated,
+   * but *without* one it silently installs a short model, which is the exact outcome rule 4 exists to
+   * prevent.
+   */
+  async function writeAll(handle: FileHandle, chunk: Uint8Array): Promise<number> {
+    let offset = 0;
+    while (offset < chunk.byteLength) {
+      const { bytesWritten } = await handle.write(chunk, offset, chunk.byteLength - offset);
+      // A write that accepts nothing has no progress to wait for, and retrying it forever would
+      // turn a full volume into a wedged tool call. Fail instead; `modelWriteError` labels it.
+      if (bytesWritten <= 0) {
+        throw new Error(`the volume accepted 0 of the ${chunk.byteLength - offset} bytes still to write`);
+      }
+      offset += bytesWritten;
+    }
+    return offset;
+  }
+
+  /**
+   * One read from the body, with a mid-transfer failure told as what it is.
+   *
+   * This is the likeliest real failure of a 574 MB download, and undici reports it as a bare
+   * `TypeError: terminated` or `Error: aborted` — a single word, to an operator who then has no idea
+   * whether the network, the disk or the model name was at fault. It is also not a
+   * `TranscriptionError`, which is what `ensureModel` documents that it throws. The stall budget
+   * already produces its own `TranscriptionError` and passes through untouched.
+   *
+   * Takes the read as a thunk rather than the reader itself so the chunk type comes from the call
+   * site: `getReader`'s overloads make any hand-written reader type resolve to the BYOB one.
+   */
+  async function readChunk<T>(read: () => Promise<T>, soFar: number): Promise<T> {
+    try {
+      return await withStallTimeout(read(), stallTimeoutMs, modelUrl);
+    } catch (err) {
+      if (err instanceof TranscriptionError) throw err;
+      throw new TranscriptionError(
+        `the whisper model transfer from ${modelUrl} was interrupted after ${soFar} bytes: ${messageOf(err)}. ` +
+          `Nothing is resumed: the partial file is discarded and the next attempt restarts from zero.`,
+      );
+    }
+  }
+
   /** Stream a response body into the `.part` file, returning the number of bytes written. */
   async function streamToPart(res: Response): Promise<number> {
     // Annotated rather than inferred: `Response.body` is typed `ReadableStream<any>`, and letting
@@ -183,11 +262,10 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
       const handle = await fsStep(partPath, () => open(partPath, "wx"));
       try {
         for (;;) {
-          const chunk = await withStallTimeout(reader.read(), stallTimeoutMs, modelUrl);
+          const chunk = await readChunk(() => reader.read(), written);
           if (chunk.done) break;
           // Streamed, never buffered: the whole point is not to hold 574 MB in memory on a NAS.
-          await fsStep(partPath, () => handle.write(chunk.value));
-          written += chunk.value.byteLength;
+          written += await fsStep(partPath, () => writeAll(handle, chunk.value));
         }
         await fsStep(partPath, () => handle.sync());
       } finally {
@@ -203,14 +281,18 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
   }
 
   async function downloadModel(): Promise<string> {
-    await fsStep(modelsDir, () => mkdir(modelsDir, { recursive: true }));
+    try {
+      await mkdir(modelsDir, { recursive: true });
+    } catch (err) {
+      throw dirCreateError(err, modelsDir, "whisper model");
+    }
     // Never resume. A `.part` here is the debris of a crash, and appending to it produces a model
     // that is corrupt in a way whisper reports unintelligibly.
     await unlink(partPath).catch(() => undefined);
 
     let res: Response;
     try {
-      res = await doFetch(modelUrl);
+      res = await doFetch(modelUrl, { headers: IDENTITY_ENCODING });
     } catch (err) {
       throw new TranscriptionError(`could not reach ${modelUrl} to download the whisper model: ${messageOf(err)}`);
     }
@@ -275,9 +357,7 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
     try {
       await mkdir(tmpDir, { recursive: true });
     } catch (err) {
-      // Not `modelWriteError`: this is the scratch directory, and blaming the model would send the
-      // reader looking for a download problem that does not exist.
-      throw new TranscriptionError(`could not create the transcription scratch directory ${tmpDir}: ${messageOf(err)}`);
+      throw dirCreateError(err, tmpDir, "transcription scratch");
     }
     const wav = join(tmpDir, `whisper-${randomUUID()}.wav`);
     const timeoutMs = Math.max(WHISPER_MIN_TIMEOUT_MS, Math.ceil((duration ?? 0) * WHISPER_TIMEOUT_FACTOR) * 1000);
