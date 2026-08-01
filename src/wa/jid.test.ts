@@ -39,7 +39,17 @@ void test("normalize strips device and agent suffixes", () => {
 });
 
 void test("normalize is idempotent", () => {
-  for (const j of ["33612345678:12@s.whatsapp.net", "1@lid", "120363@g.us", "status@broadcast", "junk"]) {
+  for (const j of [
+    "33612345678:12@s.whatsapp.net",
+    "1@lid",
+    "120363@g.us",
+    "status@broadcast",
+    "junk",
+    "123:5:6@s.whatsapp.net",
+    "123_1_2@lid",
+    "123:5_2@lid",
+    "123_1:5:6@s.whatsapp.net",
+  ]) {
     assert.equal(normalizeJid(normalizeJid(j)), normalizeJid(j), j);
   }
 });
@@ -77,4 +87,22 @@ void test("canonicalId is idempotent and normalizes on the way", () => {
   const once = canonicalId("999:4@lid", lookup);
   assert.equal(canonicalId(once, lookup), once);
   assert.equal(canonicalId("120363:2@g.us", lookup), "120363@g.us");
+});
+
+void test("canonicalId is idempotent on chained and repeated suffixes", () => {
+  const lookup = { pnForLid: () => undefined };
+  for (const j of [
+    "33612345678:12@s.whatsapp.net",
+    "1@lid",
+    "120363@g.us",
+    "status@broadcast",
+    "junk",
+    "123:5:6@s.whatsapp.net",
+    "123_1_2@lid",
+    "123:5_2@lid",
+    "123_1:5:6@s.whatsapp.net",
+  ]) {
+    const once = canonicalId(j, lookup);
+    assert.equal(canonicalId(once, lookup), once, j);
+  }
 });

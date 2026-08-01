@@ -33,6 +33,24 @@ function stripAgent(local: string): string {
   return local.replace(/_\d+$/, "");
 }
 
+/**
+ * Strip device/agent suffixes to a fixed point. A single pass only peels one layer, so a
+ * local part carrying a chained or repeated suffix-shaped substring (malformed input; real
+ * WhatsApp JIDs never chain) would otherwise keep changing on repeated application. Looping
+ * until the string stops changing makes the strip — and therefore `normalizeJid` and
+ * `canonicalId` — idempotent on any input. Terminates because each iteration either shortens
+ * the string or leaves it unchanged, which ends the loop.
+ */
+function stripSuffixes(local: string): string {
+  let prev: string;
+  let current = local;
+  do {
+    prev = current;
+    current = stripAgent(stripDevice(current));
+  } while (current !== prev);
+  return current;
+}
+
 export function jidKind(jid: string): JidKind {
   const parts = splitJid(jid);
   if (!parts) return "unknown";
@@ -59,7 +77,7 @@ export function isGroupJid(jid: string): boolean {
 export function normalizeJid(jid: string): string {
   const parts = splitJid(jid);
   if (!parts) return jid;
-  const local = stripAgent(stripDevice(parts.local));
+  const local = stripSuffixes(parts.local);
   return `${local}@${parts.server.toLowerCase()}`;
 }
 
