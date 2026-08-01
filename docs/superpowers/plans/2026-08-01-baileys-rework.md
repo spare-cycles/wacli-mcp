@@ -20,7 +20,7 @@ Every task's requirements implicitly include this section. Copied verbatim from 
 4. **ESLint `strictTypeChecked` + `stylisticTypeChecked` must pass with zero errors and zero warnings.** No `eslint-disable` without a comment naming the specific reason.
 5. **Prettier:** `printWidth: 120`, semicolons, double quotes, `trailingComma: "all"`.
 6. **`pnpm check` and `pnpm test` must both pass at the end of every task.** A task is not done with a red tree.
-7. **No native npm modules.** Storage is `node:sqlite` (built in). Image work is `jimp` (pure JS). `whatsapp-rust-bridge`, pulled in by baileys, is Rust→WebAssembly and is fine. Do not add `sharp`, `better-sqlite3`, or any package with a compile or prebuild step.
+7. **No native npm modules in the *runtime* dependency tree.** Storage is `node:sqlite` (built in). Image work is `jimp` (pure JS). `whatsapp-rust-bridge`, pulled in by baileys, is Rust→WebAssembly and is fine. Do not add `sharp`, `better-sqlite3`, or any runtime package with a compile or prebuild step. This constraint is scoped to `dependencies` deliberately: `devDependencies` already contain `tsx`, which ships prebuilt esbuild binaries, and that is fine — it never enters the image, which installs with `pnpm prune --prod`.
 8. **Baileys is pinned exactly:** `"baileys": "7.0.0-rc14"` — no caret, no tilde. It is a prerelease and rc→rc has broken APIs before.
 9. **Naming:** every MCP tool is `wa_*`; the package is `wa-mcp`.
 10. **No `WACLI_` anywhere.** Not an env var, not an identifier, not a string, not a comment, in any file that survives.
@@ -30,6 +30,10 @@ Every task's requirements implicitly include this section. Copied verbatim from 
 14. **Secrets are never logged.** `WA_MCP_TOKEN` and `NTFY_TOKEN` must not appear in any log line, error message, or `/health` response.
 15. **HTTP transport only.** No stdio transport, no `StdioServerTransport` import.
 16. **Tests are `node:test`,** run via `node --import tsx --test`. No test framework is added.
+17. **Every timestamp in the store is integer Unix *seconds*, UTC.** `ts`, `edited_ts`, `deleted_ts`, `muted_until`, `last_message_ts`, and `meta`'s timestamps. This matches Baileys' `messageTimestamp` and the retired supervisor's heartbeat, and it is the single most divergence-prone unspecified detail in the plan — half a codebase in milliseconds sorts and filters wrongly forever, and it is nearly invisible in tests that use small made-up numbers. Two consequences:
+    - Convert at the boundary with `Number(m.messageTimestamp)`; protobuf may hand back a `Long`, not a `number`, and `Long` fails silently in arithmetic comparisons.
+    - Anything derived from `Date.now()` divides by 1000 and floors. Durations exposed to callers (`last_event_age_sec`) are seconds too; the only milliseconds in the codebase are timer arguments and `sessionTtlMs`, both of which carry `Ms` in the name.
+18. **Repository rows map snake_case columns to camelCase fields, at the repository boundary and nowhere else.** Every repo exports row types in camelCase (`chatId`, `fromMe`, `lastMessageTs`); no layer above `src/db/` ever sees a snake_case key. SQLite integers `0`/`1` become real booleans in the same step. Four repositories doing this four different ways is how the tool layer ends up with `from_me` in one result shape and `fromMe` in another.
 
 ---
 
@@ -47,7 +51,17 @@ Established during Phase 1/2 grounding by running the commands, not from recall.
 7. The deployment target is **amd64** (confirmed with Loup), so the prebuilt-copy path is valid and no compile stage is needed.
 8. `ggerganov/whisper.cpp` on Hugging Face serves `ggml-large-v3-turbo-q5_0.bin` (574 MB) at
    `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin`.
-9. `@modelcontextprotocol/sdk@1.30.0` depends on `express@^5.2.1` and accepts `zod@^3.25 || ^4.0`. The current lockfile already resolves both `express@4.22.2` (ours) and `express@5.2.1` (the SDK's). Consolidating our own dependency on Express 5 removes the duplicate major.
+9. `@modelcontextprotocol/sdk@1.30.0` depends on `express@^5.2.1` and accepts `zod@^3.25 || ^4.0`. The current lockfile already resolves both `express@4.22.2` (ours) and `express@5.2.1` (the SDK's). Consolidating our own dependency on Express 5 removes the duplicate major. Its `exports` map is `[".", "./client", "./server", "./validation", "./validation/ajv", "./validation/cfworker", "./experimental", "./experimental/tasks", "./*"]` — the trailing wildcard is what lets `server/mcp.js` and `inMemory.js` resolve.
+10. Baileys v7 API points this plan relies on, each read from the shipped `.d.ts`:
+    `DisconnectReason.loggedOut = 401`, `restartRequired = 515` (`lib/Types/index.d.ts:31,33`);
+    `makeCacheableSignalKeyStore`, `initAuthCreds` (`lib/Utils/auth-utils.d.ts:9,23`);
+    `BufferJSON` (`lib/Utils/generics.d.ts:5`); `Browsers` (`lib/Utils/browser-utils.d.ts:2`);
+    `downloadMediaMessage(message, type, options, ctx?)` (`lib/Utils/messages.d.ts:87`);
+    `getContentType`, `normalizeMessageContent` (`lib/Utils/messages.d.ts:27,34`);
+    `sock.readMessages(keys)`, `sock.updateMediaMessage(msg)`, `sock.requestPairingCode(phone, custom?)` (`lib/Socket/business.d.ts:37,53,203`);
+    `getMessage` is typed `(key: WAMessageKey) => Promise<proto.IMessage | undefined>` (`lib/Types/Socket.d.ts:131`) — the **inner** message, not the `WebMessageInfo` envelope.
+11. `node:sqlite` behaviours verified by running them on Node 24.18.1: a `STRICT` table may declare `rowid INTEGER PRIMARY KEY` explicitly and serve as FTS5 external content; `run()` returns `{changes, lastInsertRowid}` and reports `changes: 1` for **both** branches of an `ON CONFLICT … DO UPDATE`; `BLOB` round-trips as `Uint8Array`; named `:params` work; `snippet(fts, <col>, …)` returns `NULL` for a column that did not match; `ORDER BY rank` and `NULLS LAST` both parse.
+12. `LIDMappingStore.getPNForLID(lid)` and `.getLIDForPN(pn)` are **async** (`lib/Signal/lid-mapping.d.ts:12,15`). This plan therefore does *not* read Baileys' mapping store on the ingest path — the synchronous `contacts.pnForLid` is the lookup, populated from the `lid-mapping.update` event.
 
 ---
 
@@ -355,7 +369,9 @@ git commit -m "feat(skeleton): move to src/, retire the wacli subprocess layer, 
 The store every later task writes to. FTS5 correctness lives here, in triggers, so no repository has to remember it (Risk 4).
 
 **Files:**
-- Create: `src/db/schema.ts`, `src/db/client.ts`, `src/db/client.test.ts`
+- Create: `src/db/schema.ts`, `src/db/client.ts`, `src/db/client.test.ts`, `src/db/meta.ts`
+
+`src/db/meta.ts` is a three-method repository over the `meta` table — `get(key): string | undefined`, `set(key, value): void`, `schemaVersion(): number` — exported as `makeMetaRepo(db: Db): MetaRepo`. It exists because Task 12's health report needs `schema_version` and nothing else gives the tool layer read access to `meta`. Add it to `ToolContext` in Task 12.
 
 **Interfaces:**
 - Consumes: nothing.
@@ -725,9 +741,12 @@ Expected: PASS, 9 JID tests.
 - [ ] **Step 5: Verify the chokepoint holds**
 
 ```bash
-grep -rln "@lid\|@s\.whatsapp\.net\|@g\.us" src/ | grep -v "src/wa/jid"
+grep -rln '@lid\|@s\.whatsapp\.net\|@g\.us' src/ --include='*.ts' \
+  | grep -v -e '\.test\.ts$' -e 'src/wa/jid\.ts$' -e 'src/wa/fixtures\.ts$'
 ```
-Expected: prints only `src/wa/jid.test.ts`. Any other file is a Constraint 11 violation.
+Expected: prints nothing.
+
+The exclusions are deliberate and not a loophole. Constraint 11 is about *interpreting* a JID — splitting it, matching its server, deciding what it means — and only `src/wa/jid.ts` may do that. Test files and `src/wa/fixtures.ts` contain JID **literals** as data, which is unavoidable: a test for identity folding has to name a LID. What the check would catch is production code parsing a JID behind `jid.ts`'s back.
 
 - [ ] **Step 6: Commit**
 
@@ -952,7 +971,38 @@ Expected: FAIL — modules not found.
 Implementation notes that the tests pin down:
 
 - **Merge semantics.** Every `upsert` is `INSERT … ON CONFLICT(id) DO UPDATE SET col = COALESCE(excluded.col, col)`. A field the caller omitted must never null out a field already stored — Baileys sends partial contact updates constantly.
-- **`linkIdentity(lidJid, phoneJid)`** runs in a transaction: copy any non-null `name`/`notify` from the LID row onto the phone row (again with `COALESCE`, phone row winning where both are set), set the phone row's `lid`, then delete the LID row. Idempotent because a second call finds no LID row and only re-sets `lid` to the same value.
+- **`linkIdentity(lidJid, phoneJid)`** runs in a transaction and must handle the case where *neither* row exists yet, which is the common one — `lid-mapping.update` routinely arrives before any message from that person. Steps: `ensure` the phone contact row exists (insert with just `id` and `phone_number` if absent); copy any non-null `name`/`notify` from the LID row onto it with `COALESCE`, phone row winning where both are set; set the phone row's `lid`; delete the LID row. Idempotent because a second call finds no LID row and only re-sets `lid` to the same value. Writing this as "copy from the LID row onto the phone row" without the `ensure` silently does nothing when both are missing, and `pnForLid` then never resolves.
+
+- **`linkIdentity` must also re-point the conversation, not just the contact.** This is the completion of Risk 1 and the one place the identity design can still fail quietly. If messages were already ingested under `888@lid` and a later `lid-mapping.update` reveals `888 → 33612345678`, folding only the *contact* leaves the old chat and its messages under the LID id while every subsequent message lands under the phone id — one human, two conversations, which is precisely the failure Risk 1 names. So `linkIdentity` also, inside the same transaction:
+
+  1. If a `chats` row exists under the LID id, merge it into the phone id: `ensure` the phone chat, take `MAX(last_message_ts)`, sum `unread_count`, keep the non-null `name`, then delete the LID chat row.
+  2. Re-point its messages: `UPDATE messages SET chat_id = :phone WHERE chat_id = :lid`, and the same for `reactions`. The FTS update trigger fires per row and keeps the index consistent for free.
+  3. Re-point senders too: `UPDATE messages SET sender_id = :phone WHERE sender_id = :lid` — group messages carry the participant, so the same person can appear as a LID sender in a group whose chat id was never a LID.
+  4. A `(chat_id, id)` collision is possible if the same message somehow landed under both ids: use `UPDATE OR IGNORE` and then delete whatever is left under the LID id, rather than letting the unique index abort the whole merge.
+
+  Order matters: re-point messages **before** deleting the LID chat row, or the foreign key drops them.
+
+  **This test belongs in Task 5, not Task 4.** It imports `makeMessagesRepo`, which Task 5 creates — a Task 4 implementer working from Task 4 alone cannot write it. So: Task 4 implements the re-pointing SQL inside `linkIdentity` (it is raw SQL against table names, so it compiles fine before `messages.ts` exists) and covers the contact-only half; Task 5 adds this cross-table test to `src/db/messages.test.ts` once both repositories exist. Verified working against SQLite 3.53.1, including the collision path and FTS consistency.
+
+  ```ts
+  test("linkIdentity re-points an existing LID conversation onto the phone identity", () => {
+    const db = openDb(join(dir, "merge.db"));
+    const contacts = makeContactsRepo(db), chats = makeChatsRepo(db), messages = makeMessagesRepo(db);
+    chats.ensure("888@lid", false);
+    chats.touch("888@lid", 500);
+    messages.upsert({ chatId: "888@lid", id: "M1", senderId: "888@lid", ts: 500, fromMe: false, kind: "text", text: "avant" });
+
+    contacts.linkIdentity("888@lid", "33612345678@s.whatsapp.net");
+
+    assert.equal(chats.get("888@lid"), undefined, "the LID chat must not survive the merge");
+    assert.equal(chats.get("33612345678@s.whatsapp.net")?.lastMessageTs, 500);
+    assert.equal(messages.get("33612345678@s.whatsapp.net", "M1")?.text, "avant");
+    assert.equal(messages.get("33612345678@s.whatsapp.net", "M1")?.senderId, "33612345678@s.whatsapp.net");
+    assert.equal(messages.search("avant", {}, 10, 0)[0]?.chatId, "33612345678@s.whatsapp.net");
+  });
+  ```
+
+  This makes `contacts.ts` depend on the `chats`/`messages`/`reactions` tables, which is a layering compromise. Take it deliberately: the merge must be atomic, and splitting it across repositories would either need a transaction spanning them or leave a window where the conversation is half-merged. Do it with direct SQL inside `contacts.ts`, and say so in a comment naming this decision.
 - **`pnForLid(lid)`** is `SELECT id FROM contacts WHERE lid = ? AND phone_number IS NOT NULL`.
 - **`search`** uses `LIKE` with an explicit `ESCAPE '\'` and escapes `%`, `_` and `\` in the query before interpolating. `LOWER()` both sides. Match against `name`, `notify` and `phone_number`.
 - Prepare every statement once at repo construction, not per call.
@@ -1223,18 +1273,31 @@ Expected: FAIL — modules not found.
 
 - [ ] **Step 3: Write `src/db/messages.ts`**
 
-- `upsert` is `INSERT … ON CONFLICT(chat_id, id) DO UPDATE SET` with `COALESCE(excluded.col, col)` for every optional column, same merge discipline as contacts. `raw` is written as a `Uint8Array` into the `BLOB` column and returned as one — do **not** round-trip it through a string.
+- `upsert` is `INSERT … ON CONFLICT(chat_id, id) DO UPDATE SET` with `COALESCE(excluded.col, col)` for every optional column, same merge discipline as contacts. `raw` is written as a `Uint8Array` into the `BLOB` column and returned as one — do **not** round-trip it through a string. (Verified: `node:sqlite` returns a `BLOB` as a `Uint8Array`.)
+- **`upsert` returns whether the row was newly inserted, and it must not derive that from `run()`.** Verified on Node 24: an `ON CONFLICT … DO UPDATE` reports `changes: 1` on *both* the insert and the update path, so `result.changes` cannot distinguish them. Use an existence probe inside the same statement pair:
+  ```ts
+  const existed = this.has.get(m.chatId, m.id) !== undefined;  // SELECT 1 FROM messages WHERE chat_id=? AND id=?
+  this.ins.run(/* … */);
+  return !existed;
+  ```
+  Both statements hit the `messages_chat_id_id` unique index, so the probe is cheap. Task 8's unread accounting depends on this being right — get it wrong and every redelivered message double-counts.
 - `markDeleted` sets `text = NULL, transcript = NULL, deleted_ts = ?`. The FTS update trigger handles index removal; the repository must not touch `messages_fts` directly.
 - `list` composes its `WHERE` from the filter, appends `AND deleted_ts IS NULL` unless `includeDeleted`, orders `ts DESC, rowid DESC`, and paginates.
-- **`search` must not let user input reach the FTS5 query parser as syntax.** Wrap the whole query as a single quoted FTS5 string: double every `"` in the input, then surround with `"`. That turns every operator character into a literal and makes the "operator characters" test pass. Query:
+- **`search` must not let user input reach the FTS5 query parser as syntax.** Wrap the whole query as a single quoted FTS5 string: double every `"` in the input, then surround the result with `"`. That turns every operator character into a literal. Verified on Node 24 that `"`, `(`, `*`, `NEAR`, `a OR` and `^x` all survive this treatment without throwing.
+- **Determining `matchedTranscript` uses two per-column snippets, not a column MATCH.** FTS5 does not allow `messages_fts.transcript MATCH …` — an fts5 table matches as a whole. What does work, verified: `snippet(messages_fts, 0, …)` returns the snippet for `text` and `snippet(messages_fts, 1, …)` for `transcript`, and **the one whose column did not match comes back `NULL`**. So:
   ```sql
-  SELECT m.*, snippet(messages_fts, -1, '[', ']', '…', 12) AS snippet,
-         messages_fts.transcript IS NOT NULL AND messages_fts.transcript MATCH :q AS ignored
-  FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
-  WHERE messages_fts MATCH :q AND m.deleted_ts IS NULL
-  ORDER BY rank LIMIT :limit OFFSET :offset
+  SELECT m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text, m.transcript,
+         m.quoted_id, m.status, m.edited_ts, m.deleted_ts, m.media_type, m.media_sha,
+         snippet(messages_fts, 0, '[', ']', '…', 12) AS snip_text,
+         snippet(messages_fts, 1, '[', ']', '…', 12) AS snip_transcript
+    FROM messages_fts
+    JOIN messages m ON m.rowid = messages_fts.rowid
+   WHERE messages_fts MATCH :q AND m.deleted_ts IS NULL
+   ORDER BY rank
+   LIMIT :limit OFFSET :offset
   ```
-  Determine `matchedTranscript` in TypeScript rather than SQL: a hit is a transcript hit when the row's `text` is null, or when the snippet came from the transcript column. Simplest correct rule, and the one the test asserts: `matchedTranscript = row.transcript !== null && (row.text === null || !snippetCameFromText)`. Implement by running `snippet()` on column 0 and column 1 separately and comparing which is non-empty.
+  Then in TypeScript: `matchedTranscript = row.snip_text === null && row.snip_transcript !== null`, and `snippet = row.snip_text ?? row.snip_transcript ?? ""`. A hit that matched both columns counts as a text hit, which is the useful default.
+  Do not `SELECT m.*` — the join would shadow `rowid` ambiguously; list the columns.
 - `setTranscript` writes the column; the update trigger re-indexes it. Nothing else needed for the "transcripts join the index" requirement.
 
 - [ ] **Step 4: Write `src/db/reactions.ts`**
@@ -1313,12 +1376,16 @@ test("signal keys round-trip as Buffers, not as JSON-mangled objects", async () 
 
 test("the v7 key types are storable", async () => {
   const store = makeAuthStore(openDb(join(dir, "c.db")));
+  // Shapes taken verbatim from baileys' SignalDataTypeMap (lib/Types/Auth.d.ts:68-85):
+  //   'lid-mapping': string        'device-list': string[]
+  //   tctoken: { token: Buffer; timestamp?: string; senderTimestamp?: number }
+  // Getting these wrong fails the strictTypeChecked gate rather than a runtime assertion.
   await store.state.keys.set({ "lid-mapping": { "999": "33612345678" } });
-  await store.state.keys.set({ "device-list": { d1: { some: "value" } } });
-  await store.state.keys.set({ tctoken: { t1: Buffer.from([9, 9]) } });
-  assert.deepEqual((await store.state.keys.get("lid-mapping", ["999"]))["999"], "33612345678");
-  assert.ok((await store.state.keys.get("device-list", ["d1"]))["d1"]);
-  assert.ok(Buffer.isBuffer((await store.state.keys.get("tctoken", ["t1"]))["t1"]));
+  await store.state.keys.set({ "device-list": { d1: ["33612345678:1", "33612345678:2"] } });
+  await store.state.keys.set({ tctoken: { t1: { token: Buffer.from([9, 9]), timestamp: "1700" } } });
+  assert.equal((await store.state.keys.get("lid-mapping", ["999"]))["999"], "33612345678");
+  assert.deepEqual((await store.state.keys.get("device-list", ["d1"]))["d1"], ["33612345678:1", "33612345678:2"]);
+  assert.ok(Buffer.isBuffer((await store.state.keys.get("tctoken", ["t1"]))["t1"]?.token));
 });
 
 test("setting a key to null deletes it", async () => {
@@ -1580,7 +1647,11 @@ const sock = makeSocket({
   generateHighQualityLinkPreview: false,
   getMessage: async (key) => {
     const bytes = await loadMessage(key);
-    return bytes ? proto.Message.decode(bytes) : undefined;
+    // We store the encoded WebMessageInfo (Task 8 step 6), but getMessage is typed
+    // `(key) => Promise<proto.IMessage | undefined>` — the INNER message, not the envelope.
+    // Decoding these bytes as proto.Message would silently produce garbage and break
+    // every message retry and poll-vote decrypt. Unwrap the envelope:
+    return bytes ? (proto.WebMessageInfo.decode(bytes).message ?? undefined) : undefined;
   },
 });
 ```
@@ -1594,8 +1665,10 @@ State machine rules, each pinned by a test above:
    - `DisconnectReason.loggedOut` (401) → `logged_out`, `auth.clear()`, **no** retry.
    - `DisconnectReason.restartRequired` (515) → recreate the socket immediately, staying at `connecting`, without incrementing `attempts`.
    - anything else → `disconnected`, increment `attempts`, schedule a retry after `backoffMs(attempts)`.
-5. `stop()` sets a `stopped` flag checked before every reconnect, clears the pending timer, and ends the socket.
+5. `stop()` sets a `stopped` flag checked before every reconnect, clears the pending timer, and ends the socket. It moves to `disconnected` **unless the state is already `logged_out`**, which is terminal and must survive shutdown — otherwise a stop during logout erases the one piece of information an operator needs.
 6. Every handled event updates `lastEventAt`.
+7. **`needsPairing` is `state === "pairing" || state === "logged_out"`** — those are exactly the two states a human must act on. Define it once, as a getter on the snapshot, so Task 12's health report and Task 12's test harness cannot drift from it.
+8. If `makeSocket` itself throws synchronously in `start()` (bad auth blob, unusable config), treat it as an ordinary failed attempt: log at error, go to `disconnected`, increment `attempts`, and schedule the backoff retry. It must not reject `start()` and take the process down — the read tools are still perfectly serviceable.
 
 `backoffMs(attempt, random = Math.random)` is `min(300_000, 1000 * 2 ** attempt)` multiplied by a jitter factor in `[0.5, 1.5)`, floored at 500 ms.
 
@@ -1821,6 +1894,14 @@ export function textMessage(o: { chat?: string; id?: string; text?: string; ts?:
 
 The `as WAMessage` cast is acceptable **in fixtures only** — these are deliberately partial. Do not cast in production code.
 
+**`classify` and `extractText` must build on Baileys' own helpers, not a hand-rolled switch.** Both `getContentType(content: proto.IMessage): keyof proto.IMessage | undefined` and `normalizeMessageContent(content): WAMessageContent | undefined` are exported (`lib/Utils/messages.d.ts:27,34`). `normalizeMessageContent` unwraps the `ephemeralMessage` / `viewOnceMessage` / `viewOnceMessageV2` / `documentWithCaptionMessage` envelopes that WhatsApp routinely wraps real content in; a switch over `m.message` directly sees the *wrapper* and classifies a view-once photo as `other`, storing no text and no media kind. So:
+
+```
+const content = normalizeMessageContent(m.message);
+const type = getContentType(content);         // "imageMessage" | "conversation" | …
+```
+and map `type` onto our `MessageKind`. `extractText` reads, in order: `content.conversation`, `content.extendedTextMessage?.text`, then the `caption` of whichever media wrapper `type` names.
+
 - [ ] **Step 4: Write `src/wa/ingest.ts`**
 
 `attach(sock)` registers:
@@ -1829,12 +1910,13 @@ The `as WAMessage` cast is acceptable **in fixtures only** — these are deliber
 | --- | --- |
 | `messages.upsert` | `ingestMessages(payload.messages)`. |
 | `messages.update` | For each: a `status` change → `setStatus`; a `protocolMessage` edit → `markEdited`; a revoke → `markDeleted`. |
+| `messages.delete` | **Also** a revoke path — the payload is either `{ keys: WAMessageKey[] }` or `{ jid, all: true }`. Handle the `keys` form with `markDeleted` per key; ignore the `all` form (we keep history deliberately). Verified present in `BaileysEventMap` (`lib/Types/Events.d.ts:58`); a revoke can arrive on either this event or `messages.update`, so both must tombstone or deletions are silently missed. |
 | `messages.reaction` | `reactions.set(...)` with the canonical sender; an empty `text` removes. |
 | `message-receipt.update` | `setStatus` only; never creates a row. |
 | `chats.upsert` / `chats.update` | `chats.ensure` + `chats.patch`. |
 | `chats.delete` | Ignored — we keep history deliberately (forward-only store). |
 | `contacts.upsert` / `contacts.update` | `contacts.upsertMany`. |
-| `messaging-history.set` | Batch: contacts, then chats, then `ingestMessages(messages)`, all inside one transaction (Risk 7). |
+| `messaging-history.set` | Batch: contacts, then chats, then messages — **in chunks of 500, one transaction per chunk**, not one transaction for the whole payload. A single history sync can carry thousands of messages; wrapping all of them in one transaction means a single malformed message rolls back the entire sync, and the event never comes again (Risk 7). Per-chunk transactions bound the loss, and `ingestMessage`'s own try/catch bounds it further to the one bad message. Log the chunk count and total at info — a large initial sync otherwise looks like a hang. |
 | `lid-mapping.update` | `contacts.linkIdentity` for each pair. |
 
 `ingestMessage(m)` steps, in order:
@@ -1844,7 +1926,7 @@ The `as WAMessage` cast is acceptable **in fixtures only** — these are deliber
 3. `isGroup = isGroupJid(chatId)`; `chats.ensure(chatId, isGroup)`.
 4. `senderId` = for a group, `canonicalId(key.participant)`; for a DM, `key.fromMe ? selfId() : chatId`.
 5. `kind = classify(m)`, `text = extractText(m)`, `quotedId` from `contextInfo.stanzaId`.
-6. `raw = proto.WebMessageInfo.encode(m).finish()`.
+6. `raw = proto.WebMessageInfo.encode(m).finish()`. Task 7's `getMessage` unwraps this envelope back to the inner `message` — keep the two in step.
 7. `messages.upsert({...})`.
 8. `chats.touch(chatId, ts)`; if `!fromMe` **and the message was newly inserted**, `chats.bumpUnread(chatId, 1)`; if `fromMe`, `chats.clearUnread(chatId)`.
 
@@ -2021,6 +2103,22 @@ Expected: FAIL — module not found.
 - `replyTo` resolution: `messages.get(jid, replyTo)`; missing → `NotFoundError`. Build the `quoted` option from the stored row's raw bytes decoded back to a `WAMessage`.
 - `sendFile`: decode base64 (or `readFile` the path), enforce `maxUploadBytes` on the **decoded** length before doing anything else, then choose the content key by mimetype prefix — `image/*` → `image`, `video/*` → `video`, `audio/*` → `audio` (with `ptt: true` when `asVoiceNote`), everything else → `document` (which requires `fileName`). Default the mimetype from the filename extension, and fall back to `application/octet-stream`.
 - `editMessage` / `deleteMessage`: load the row, reject with `NotOwnMessageError` unless `fromMe`. Edit is `sendMessage(jid, { text, edit: key })`; delete is `sendMessage(jid, { delete: key })`.
+- **`markRead` is "up to and including", and the contract has to say so.** Baileys' `readMessages(keys)` marks exactly the keys it is given (`lib/Socket/business.d.ts:37`) — there is no "mark everything older" primitive. The tool is described as marking a chat read up to a message, so the sender must expand it: select every non-`from_me` message in the chat with `ts <=` the target's `ts` and `deleted_ts IS NULL`, rebuild a `WAMessageKey` for each, and pass the batch to `readMessages`. Cap the expansion at 500 keys, newest first, so a chat with a decade of backlog does not build an unbounded array. Then `chats.clearUnread(jid)` locally.
+  Add to `MessagesRepo` (Task 5) the query this needs:
+  ```ts
+  /** Non-from_me, non-deleted messages at or before `ts`, newest first. Backs markRead's expansion. */
+  unreadKeysUpTo(chatId: string, ts: number, limit: number): { id: string; senderId: string }[];
+  ```
+  and a test in `send.test.ts`:
+  ```ts
+  test("markRead expands to every older unread message, not just the target", async () => {
+    const h = harness({ M1: { fromMe: false }, /* rows at ts 1,2,3 */ });
+    let keys: unknown[] = [];
+    h.sock.readMessages = async (k: unknown[]) => { keys = k; };
+    await h.sender.markRead("c@s.whatsapp.net", "M3");
+    assert.equal(keys.length, 3, "marking M3 read must also mark M1 and M2");
+  });
+  ```
 - Every mutating call re-ingests: `if (sent) deps.ingest.ingestMessage(sent)`. This is Invariant 2 and it is why sent messages never need their own mapping.
 
 - [ ] **Step 4: Run the test, see it pass**
@@ -2143,7 +2241,14 @@ Expected: FAIL — modules not found.
 - [ ] **Step 3: Write `src/media/convert.ts`**
 
 - A single `runTool(bin, args, timeoutMs)` helper wrapping `execFile` with a timeout, `maxBuffer`, and `ConversionError` on non-zero exit including the tail of stderr. Reuse the process-group kill idea from the retired `server.ts:131` — ffmpeg spawns no children here, so a plain `kill` suffices, but the timeout is mandatory.
-- `imageBlock` uses **jimp** (Constraint 7): read, and while the encoded JPEG exceeds `maxBytes`, halve the longest edge (minimum 320 px) and re-encode at quality 80, then 60. Return the first result under the cap, or the smallest attempt with a warning.
+- `imageBlock` uses **jimp** (Constraint 7). The v1 API — confirmed against jimp 1.6.1 and against baileys' own use of it in `lib/Utils/messages-media.js:116-123` — is:
+  ```ts
+  import { Jimp } from "jimp";
+  const img = await Jimp.read(path);            // img.width, img.height
+  img.resize({ w: targetWidth });               // object arg in v1, NOT resize(w, h)
+  const buf = await img.getBuffer("image/jpeg", { quality: 80 });
+  ```
+  Loop: while the encoded JPEG exceeds `maxBytes`, halve the longest edge (floor 320 px) and re-encode at quality 80, then 60. Return the first result under the cap, or the smallest attempt with a logged warning. Note jimp 1.x is ESM-first with a `"."` export only — import from `"jimp"`, never a deep path.
 - `videoKeyframes` calls `probeDuration`, picks `count` evenly spaced timestamps skipping the first and last 5 %, and extracts each with `ffmpeg -ss <t> -i <path> -frames:v 1 -q:v 4`. Run them sequentially — parallel ffmpeg on a NAS is a false economy.
 - `toWav16k` is `ffmpeg -i <in> -ar 16000 -ac 1 -c:a pcm_s16le <out>`.
 - `pdfText` shells out to `pdftotext` when present and returns a clear `ConversionError` naming the missing tool otherwise. **`poppler-utils` must be added to the runtime image in Task 15.**
@@ -2154,6 +2259,7 @@ Expected: FAIL — modules not found.
 - If `media_sha` is set and `pathFor(sha)` exists, return it without touching the network.
 - Otherwise decode `raw` back to a `WAMessage` and call Baileys' `downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage })`, hash the bytes with `node:crypto` `sha256`, write to `dir/<sha>` atomically (write to `<sha>.tmp`, then `rename`), and `messages.setMedia(chatId, id, sha, mimetype)`.
 - A download failure becomes `MediaUnavailableError` with a message that says WhatsApp media URLs expire and the message is likely too old — that is the common case and it deserves a comprehensible error.
+- **A cache hit must not touch the connection; a cache miss requires it.** `fetch` reads the row and returns the cached file *before* calling `conn.requireSocket()`, so previously-downloaded media stays readable while the socket is down. On a miss with no live socket, let `ConnectionUnavailableError` propagate — the tool layer turns it into an `errorResult` naming the state, which is the honest answer ("this was never downloaded and I cannot reach WhatsApp right now"). Do not swallow it into `MediaUnavailableError`; the two mean different things and the caller's next action differs (wait vs. give up).
 - The store never deletes anything. Cache eviction is out of scope for v1; note it in the README as a known growth area.
 
 - [ ] **Step 5: Run the tests, see them pass**
@@ -2235,6 +2341,17 @@ Expected: FAIL — module not found.
 
 - `ensureModel()` resolves `${config.dataDir}/models/ggml-${config.whisperModel}.bin`. If absent, download from
   `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${model}.bin` to a `.part` file, then rename. Log start and completion at info with the byte count — a silent 574 MB download looks like a hang. Serialize concurrent calls behind a single in-flight promise so two simultaneous transcribe requests do not both download.
+
+  A 574 MB fetch over an unreliable link is the most failure-prone step in the whole system, so spell the handling out rather than leaving it to the implementer:
+
+  1. **Always delete a stale `.part` before starting.** A previous crash leaves one behind; appending to it silently produces a corrupt model, and whisper's failure on a corrupt model is unintelligible. Never resume — restart.
+  2. **Non-2xx is a hard error** naming the status and the URL. A 404 means the model name is wrong; say so, and list that `WA_WHISPER_MODEL` is the knob.
+  3. **Stall timeout, not a total timeout.** Fail if no bytes arrive for 60 s; do not cap total duration, because a slow link legitimately takes many minutes.
+  4. **Verify the size before renaming.** Compare the written byte count against `Content-Length` when the server sent one, and reject a mismatch — a truncated model otherwise looks installed forever.
+  5. **`ENOSPC` is reported as itself**, not as a generic download failure. 574 MB into a full volume is a realistic first-run failure on a NAS.
+  6. On any failure, unlink the `.part` and clear the in-flight promise so the next call retries cleanly rather than awaiting a rejected promise forever.
+
+  These are the only network-fetch semantics in the codebase; do not reach for a retry library.
 - `transcribeFile(path)`:
   1. `probeDuration`; if it exceeds `config.whisperMaxSeconds`, throw `TranscriptionError` naming the limit and the actual duration. This is Risk 6.
   2. `toWav16k` into a temp file under `config.dataDir/tmp`.
@@ -2331,11 +2448,17 @@ test("textResult passes text through", () => {
 `src/mcp/tools/reads.test.ts` registers the tools on a real `McpServer`, then invokes handlers through an in-memory MCP client pair and asserts both the schemas and the results. **Write this harness first — Task 13 imports it**, so put it in `src/mcp/tools/harness.ts` (not a `.test.ts` file, so it is importable without running its tests):
 
 ```ts
-// src/mcp/tools/harness.ts — test-only helper, excluded from the build by tsconfig.build.json's
-// *.test.ts exclusion? No: it is NOT a .test.ts file, so add it to that exclude list explicitly.
+// src/mcp/tools/harness.ts — test-only helper. It is NOT a .test.ts file, so tsconfig.build.json's
+// "src/**/*.test.ts" exclusion does not cover it: add this path to that exclude array explicitly
+// (Task 12 step 3), or test scaffolding ships in dist/.
+//
+// Import paths verified against @modelcontextprotocol/sdk@1.30.0: its exports map is
+// [".", "./client", "./server", "./validation", "./validation/*", "./experimental", "./*"] —
+// the trailing "./*" wildcard is what makes the deep paths below resolve.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ConnectionUnavailableError } from "../../wa/connection.js";
+import { buildMcpServer } from "../server.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2441,9 +2564,29 @@ Expected: FAIL — modules not found.
 Register the six tools with Zod schemas. Shared conventions:
 
 - `limit` is `z.number().int().positive().max(200).default(50)`.
-- Pagination is an opaque `cursor` string, base64 of `{ offset: number }`. Keep it opaque so it can become a keyset cursor later without a schema change.
+- **Pagination is a round trip, so the response carries the next cursor.** A `cursor` input with no `next_cursor` output is unusable — the caller has no way to build page 2. Put both halves in `src/mcp/cursor.ts` so all six tools share one implementation:
+  ```ts
+  export function encodeCursor(offset: number): string;          // base64url of {"o":<n>}
+  export function decodeCursor(c: string | undefined): number;   // 0 when absent; throws CursorError on malformed
+  export class CursorError extends Error {}
+  ```
+  Every paginated tool returns `{ items: [...], next_cursor: string | null }` — `null` when the page came back shorter than `limit`, meaning there is no more. Never return a `next_cursor` that would yield an empty page. A malformed cursor is an `errorResult`, not a silent reset to offset 0.
+- **`presentMessage` does not embed reactions.** Doing so costs one query per row — 50 extra queries for a default page — and the reaction shape is not something a list view needs. Reactions appear only in single-message contexts (`wa_download_media`, and any future single-message tool), shaped `{ emoji: string, from: { id, name } }[]`. List and search results instead carry `reaction_count: number`, filled for the whole page by one grouped query:
+  `SELECT message_id, COUNT(*) c FROM reactions WHERE chat_id = ? AND message_id IN (…) GROUP BY message_id`.
 - Every description states plainly what the tool reads and that it works offline, because that is the property a model needs to know when the socket is down.
-- `wa_health` returns `{ connection, needs_pairing, last_event_age_sec, last_connected_at, self_id, counts: { chats, messages, contacts }, schema_version, transcription_available, read_only }`. **It must never include the bearer token or the ntfy token** (Constraint 14).
+- **`wa_health` and `/health` are the same function.** Two hand-written health payloads drift within a week, and Task 14's `startHttp` already takes a `health: () => Record<string, unknown>` callback. Define it once, in `src/mcp/health.ts`:
+  ```ts
+  export type HealthReport = {
+    ok: boolean; connection: ConnectionState; needs_pairing: boolean;
+    last_event_age_sec: number; last_connected_at: number | null; self_id: string | null;
+    counts: { chats: number; messages: number; contacts: number };
+    schema_version: number; transcription_available: boolean; read_only: boolean;
+  };
+  export function buildHealth(ctx: ToolContext): HealthReport;
+  ```
+  `wa_health` returns `jsonResult(buildHealth(ctx))`; `main.ts` passes `() => buildHealth(ctx)` into `startHttp`. **Neither may contain the bearer token or the ntfy token** (Constraint 14), which is why the type is a closed record rather than a spread of `Config`.
+- **`ok` is false when `connection === "logged_out"`,** and true in every other state. A logged-out server is permanently dead until someone re-pairs it, and a `/health` that keeps reporting `ok: true` makes it look fine forever. Every other state — including `disconnected` mid-backoff — is `ok: true`, because the read tools genuinely still work and a transient reconnect must not flap the container's health.
+- `schema_version` comes from a new `MetaRepo` (`src/db/meta.ts`, Task 2): `get(key): string | undefined`, `set(key, value): void`, `schemaVersion(): number`. Add it to `ToolContext`. Nothing else in the plan gave the tool layer a way to read `meta`.
 
 - [ ] **Step 5: Run the tests, see them pass**
 
@@ -2529,6 +2672,35 @@ Expected: FAIL — module not found.
 Six tools, each thin: validate with Zod, call `ctx.sender`, return `jsonResult`. Catch `ConnectionUnavailableError`, `NotFoundError` and `NotOwnMessageError` and turn them into `errorResult` — a tool must return `isError`, never throw through the SDK.
 
 `wa_send_file`'s input is a Zod object with optional `path` and `data`, refined so exactly one is present. A discriminated union would be cleaner in TypeScript but produces a JSON Schema that several MCP clients render poorly; the refinement keeps the schema flat.
+
+**`path` must be confined to a configured directory.** As written this is an arbitrary-file-read primitive: the caller names any path *inside the container* and the server sends its contents to a WhatsApp conversation. `/proc/self/environ` alone would exfiltrate `WA_MCP_TOKEN` and `NTFY_TOKEN`; `${WA_DATA_DIR}/wa.db` would exfiltrate every message ever received. Bearer auth does not fix this — it is a privilege escalation from "can call tools" to "can read the filesystem".
+
+Add to Task 1's `Config`:
+
+```ts
+sendFileDir: string | undefined;   // WA_SEND_FILE_DIR — unset disables path-based sending entirely
+```
+
+Default **unset**, meaning `wa_send_file` accepts `data` only and rejects `path` with a message naming the variable. When set, `send.ts` resolves the candidate with `realpath` and rejects anything that does not sit under the equally-realpathed `sendFileDir` — resolve both sides, then compare with a trailing separator, so a symlink out and a `..` sibling-prefix (`/data/uploads-evil` against `/data/uploads`) are both refused. Reject before reading the file, and never echo the resolved path back in the error.
+
+This is the right default because the deployment is a container serving a *remote* client: a server-side path has no legitimate caller. It exists at all only for a future bind-mounted upload directory.
+
+Add these cases to `src/wa/send.test.ts` (Task 9), where the enforcement lives:
+
+```ts
+test("path sending is refused when no directory is configured", async () => {
+  const h = harness({ sendFileDir: undefined });
+  await assert.rejects(() => h.sender.sendFile("c@s.whatsapp.net", { kind: "path", path: "/etc/passwd" }, {}),
+    /WA_SEND_FILE_DIR/);
+});
+
+test("path sending refuses traversal, symlink escape and sibling-prefix paths", async () => {
+  const h = harness({ sendFileDir: "/data/uploads" });
+  for (const p of ["/etc/passwd", "/data/uploads/../../etc/passwd", "/data/uploads-evil/x", "/proc/self/environ"]) {
+    await assert.rejects(() => h.sender.sendFile("c@s.whatsapp.net", { kind: "path", path: p }, {}), /outside/i, p);
+  }
+});
+```
 
 - [ ] **Step 4: Write the media tools**
 
@@ -2804,7 +2976,9 @@ ffmpeg is installed because Task 10's conversion tests genuinely exercise it. In
 
 - [ ] **Step 3: Update `.github/workflows/docker.yml`**
 
-Delete the `WACLI_REF` build-arg, the `workflow_dispatch` input that fed it, and the comment about pinning a wacli release. `env.IMAGE` stays `ghcr.io/${{ github.repository }}` — it follows the repository rename automatically. Add `needs: check` so an image is never published from a red tree, and merge the `ci` job into the same file or reference it via `workflow_call`.
+Delete the `WACLI_REF` build-arg, the `workflow_dispatch` input that fed it, and the comment about pinning a wacli release. `env.IMAGE` stays `ghcr.io/${{ github.repository }}` — it follows the repository rename automatically.
+
+**Gate the image build on the quality gate, by moving the `check` job into `docker.yml` as a second job** — one file, one `needs: check` edge, no `workflow_call` indirection. `ci.yml` from Step 2 keeps running on pull requests (where no image is built); `docker.yml` runs `check` then `build` on `main` and tags. Pick this shape and no other: two workflows that both define `check` is the kind of divergence that leaves one of them silently unmaintained.
 
 - [ ] **Step 4: Rewrite `smoke.mjs`**
 
@@ -2844,6 +3018,8 @@ git commit -m "feat(ops): Node 24 image with prebuilt whisper.cpp, CI gate, rewr
 2. `docker build` succeeds and `whisper-cli --help` runs inside the image.
 3. All 14 tools are advertised, `wa_`-prefixed, and the 6 write tools disappear under `WA_MCP_READONLY=1`.
 4. No `wacli`/`WACLI` identifier, env var, or string survives outside `docs/`.
-5. `grep -rln "@lid\|@s\.whatsapp\.net\|@g\.us" src/` names only `src/wa/jid.ts` and its test.
+5. The Constraint-11 check from Task 3 step 5 — the same command, excluding `*.test.ts`, `src/wa/jid.ts` and `src/wa/fixtures.ts` — prints nothing.
 6. Read tools return results with the connection down.
+7. `wa_send_file` refuses a `path` argument when `WA_SEND_FILE_DIR` is unset, and refuses traversal when it is set.
+8. A `lid-mapping.update` for a LID that already has a conversation leaves exactly one chat, carrying the earlier messages, searchable under the phone identity.
 
