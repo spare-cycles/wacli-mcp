@@ -19,6 +19,7 @@ import {
   imageBlock,
   keyframeTimestamps,
   pdfText,
+  probeDimensions,
   probeDuration,
   runTool,
   toWav16k,
@@ -253,6 +254,25 @@ void test("probeDuration reads a duration", async () => {
 
 void test("probeDuration on a file that is not media raises ConversionError", async () => {
   await assert.rejects(() => probeDuration(notMedia), ConversionError);
+});
+
+// --- dimensions -------------------------------------------------------------------------------
+
+void test("probeDimensions reads the size of a still, a video and a sticker alike", async () => {
+  assert.deepEqual(await probeDimensions(png), { width: 1280, height: 720 });
+  assert.deepEqual(await probeDimensions(mp4), { width: 320, height: 240 });
+  // WebP is the whole reason this goes through ffprobe rather than jimp, which cannot decode it.
+  assert.deepEqual(await probeDimensions(webp), { width: 512, height: 512 });
+});
+
+void test("probeDimensions answers undefined for a file with no picture in it", async () => {
+  // ffprobe exits 0 and prints nothing for an audio-only file, so "no dimensions" must not be read
+  // as a failure — and must not come back as NaN either.
+  assert.equal(await probeDimensions(wav), undefined);
+});
+
+void test("probeDimensions on a file that is not media raises ConversionError", async () => {
+  await assert.rejects(() => probeDimensions(notMedia), ConversionError);
 });
 
 // --- documents --------------------------------------------------------------------------------

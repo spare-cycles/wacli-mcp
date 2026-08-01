@@ -19,6 +19,8 @@ import { logger as defaultLogger } from "../logger.js";
 
 export type ImageBlock = { data: string; mimeType: string };
 
+export type Dimensions = { width: number; height: number };
+
 /** A conversion could not be performed: a missing tool, a bad exit, a timeout, an undecodable file. */
 export class ConversionError extends Error {
   override name = "ConversionError";
@@ -258,6 +260,28 @@ export async function probeDuration(path: string): Promise<number | undefined> {
   );
   const seconds = Number(stdout.toString("utf8").trim());
   return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+}
+
+/**
+ * The pixel size of an image or of a video's first video stream, or undefined when it declares none.
+ *
+ * Added for `wa_download_media`, which reports what the model is looking at. ffprobe rather than
+ * jimp because it answers for every format in one place — a WebP sticker included, which jimp cannot
+ * decode at all — and because the video branch needs exactly the same answer, where there is no
+ * decoded image to ask.
+ */
+export async function probeDimensions(path: string): Promise<Dimensions | undefined> {
+  const { stdout } = await runTool(
+    FFPROBE,
+    ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+    FFPROBE_TIMEOUT_MS,
+  );
+  // A file with no video stream at all — an audio-only container — prints nothing rather than
+  // failing, so "no dimensions" arrives here as an empty line, not as an error.
+  const [width, height] = stdout.toString("utf8").trim().split("x").map(Number);
+  if (width === undefined || height === undefined) return undefined;
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return undefined;
+  return { width, height };
 }
 
 /**

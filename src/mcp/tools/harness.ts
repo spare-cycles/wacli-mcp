@@ -101,13 +101,21 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
     onStateChange: () => undefined,
   };
 
+  /**
+   * The stub sender refuses whatever the real one refuses on connection grounds: `makeSender` calls
+   * `conn.requireSocket()` as the first statement of every method, so a stub that resolved happily
+   * while the socket is down would be a lie — and it would leave a write tool's mapping of that
+   * failure into an `isError` result untestable through the harness.
+   */
+  const refuse = (): Promise<never> => Promise.reject(new ConnectionUnavailableError(state));
+  const connected = state === "connected";
   const sender: Sender = {
-    sendText: () => Promise.resolve({ chatId: "c", messageId: "S1" }),
-    sendFile: () => Promise.resolve({ chatId: "c", messageId: "S2" }),
-    react: () => Promise.resolve(),
-    markRead: () => Promise.resolve(),
-    editMessage: () => Promise.resolve(),
-    deleteMessage: () => Promise.resolve(),
+    sendText: () => (connected ? Promise.resolve({ chatId: "c", messageId: "S1" }) : refuse()),
+    sendFile: () => (connected ? Promise.resolve({ chatId: "c", messageId: "S2" }) : refuse()),
+    react: () => (connected ? Promise.resolve() : refuse()),
+    markRead: () => (connected ? Promise.resolve() : refuse()),
+    editMessage: () => (connected ? Promise.resolve() : refuse()),
+    deleteMessage: () => (connected ? Promise.resolve() : refuse()),
   };
 
   const media: MediaStore = {
