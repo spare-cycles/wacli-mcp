@@ -43,18 +43,31 @@ void test("upsert then get round-trips", () => {
 
 void test("upsert is idempotent on (chat, id) and updates in place", () => {
   const r = repo();
-  r.upsert(msg());
-  r.upsert(msg({ text: "hello again", status: "delivered" }));
+  const inserted = r.upsert(msg());
+  const updated = r.upsert(msg({ text: "hello again", status: "delivered" }));
   assert.equal(r.count(), 1);
   assert.equal(r.get("c", "M1")?.text, "hello again");
   assert.equal(r.get("c", "M1")?.status, "delivered");
+  assert.equal(inserted, true, "a fresh insert must report true");
+  assert.equal(updated, false, "re-upserting the same (chat_id, id) must report false");
+});
+
+void test("upsert returns false on a partial update of an existing row", () => {
+  const r = repo();
+  r.upsert(msg());
+  const updated = r.upsert(msg({ text: undefined, status: "read" }));
+  assert.equal(updated, false);
+  assert.equal(r.get("c", "M1")?.text, "hello", "COALESCE must keep the prior text");
+  assert.equal(r.get("c", "M1")?.status, "read");
 });
 
 void test("the same message id in two chats is two rows", () => {
   const r = repo();
-  r.upsert(msg({ chatId: "c" }));
-  r.upsert(msg({ chatId: "c2" }));
+  const first = r.upsert(msg({ chatId: "c" }));
+  const second = r.upsert(msg({ chatId: "c2" }));
   assert.equal(r.count(), 2);
+  assert.equal(first, true, "a fresh insert into chat c must report true");
+  assert.equal(second, true, "the same message id in a different chat is a different logical message");
 });
 
 void test("getRaw returns the exact bytes stored", () => {

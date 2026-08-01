@@ -116,6 +116,25 @@ const SELECT_COLUMNS = `
   quoted_id, status, edited_ts, deleted_ts, media_type, media_sha
 `;
 
+const SEARCH_COLUMNS = `
+  m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text, m.transcript,
+  m.quoted_id, m.status, m.edited_ts, m.deleted_ts, m.media_type, m.media_sha,
+  snippet(messages_fts, 0, '[', ']', '…', 12) AS snip_text,
+  snippet(messages_fts, 1, '[', ']', '…', 12) AS snip_transcript
+`;
+
+/** Shared skeleton for the search query; `extraWhere` scopes it to one chat when non-empty. */
+function searchQuery(extraWhere: string): string {
+  return `
+    SELECT ${SEARCH_COLUMNS}
+      FROM messages_fts
+      JOIN messages m ON m.rowid = messages_fts.rowid
+     WHERE messages_fts MATCH :q AND m.deleted_ts IS NULL${extraWhere}
+     ORDER BY rank
+     LIMIT :limit OFFSET :offset
+  `;
+}
+
 export function makeMessagesRepo(db: Db): MessagesRepo {
   const hasStmt = db.prepare("SELECT 1 FROM messages WHERE chat_id = ? AND id = ?");
   const insertStmt = db.prepare(`
@@ -154,28 +173,8 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
      ORDER BY ts DESC, rowid DESC
      LIMIT :limit
   `);
-  const searchStmt = db.prepare(`
-    SELECT m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text, m.transcript,
-           m.quoted_id, m.status, m.edited_ts, m.deleted_ts, m.media_type, m.media_sha,
-           snippet(messages_fts, 0, '[', ']', '…', 12) AS snip_text,
-           snippet(messages_fts, 1, '[', ']', '…', 12) AS snip_transcript
-      FROM messages_fts
-      JOIN messages m ON m.rowid = messages_fts.rowid
-     WHERE messages_fts MATCH :q AND m.deleted_ts IS NULL
-     ORDER BY rank
-     LIMIT :limit OFFSET :offset
-  `);
-  const searchScopedStmt = db.prepare(`
-    SELECT m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text, m.transcript,
-           m.quoted_id, m.status, m.edited_ts, m.deleted_ts, m.media_type, m.media_sha,
-           snippet(messages_fts, 0, '[', ']', '…', 12) AS snip_text,
-           snippet(messages_fts, 1, '[', ']', '…', 12) AS snip_transcript
-      FROM messages_fts
-      JOIN messages m ON m.rowid = messages_fts.rowid
-     WHERE messages_fts MATCH :q AND m.deleted_ts IS NULL AND m.chat_id = :chatId
-     ORDER BY rank
-     LIMIT :limit OFFSET :offset
-  `);
+  const searchStmt = db.prepare(searchQuery(""));
+  const searchScopedStmt = db.prepare(searchQuery(" AND m.chat_id = :chatId"));
 
   function upsertOne(m: MessageInput): boolean {
     const existed = hasStmt.get(m.chatId, m.id) !== undefined;
