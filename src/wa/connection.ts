@@ -1,4 +1,3 @@
-import type { Boom } from "@hapi/boom";
 import {
   Browsers,
   makeCacheableSignalKeyStore,
@@ -65,12 +64,19 @@ export function backoffMs(attempt: number, random: () => number = Math.random): 
   return Math.max(MIN_DELAY_MS, Math.round(raw * jitter));
 }
 
+// Global Constraint 17: every timestamp in the store is integer Unix seconds, UTC. Neither
+// `lastEventAt` nor `lastConnectedAt` carries an `Ms` suffix, so both must go through this —
+// never raw `Date.now()`, which is milliseconds.
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
 export function makeConnection(deps: ConnectionDeps): WaConnection {
   const { config, logger, auth, loadMessage, onSocket } = deps;
   const makeSocket = deps.makeSocket ?? defaultMakeSocket;
 
   let state: ConnectionState = "disconnected";
-  let lastEventAt = Date.now();
+  let lastEventAt = nowSec();
   let lastConnectedAt: number | null = null;
   let attempts = 0;
   let selfId: string | null = null;
@@ -78,6 +84,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
   let sock: WASocket | undefined;
   let stopped = false;
   let pairingRequestedForSocket = false;
+  let missingPhoneNumberLoggedForSocket = false;
   let retryTimer: NodeJS.Timeout | undefined;
 
   const stateChangeListeners: ((s: ConnectionState) => void)[] = [];
@@ -92,7 +99,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
   }
 
   function touch(): void {
-    lastEventAt = Date.now();
+    lastEventAt = nowSec();
   }
 
   function clearRetryTimer(): void {
@@ -134,6 +141,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
   function createSocket(): void {
     if (stopped) return;
     pairingRequestedForSocket = false;
+    missingPhoneNumberLoggedForSocket = false;
     setState("connecting");
     try {
       const newSock = makeSocket({
@@ -190,13 +198,29 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
 
   function handleOpen(openedSock: WASocket): void {
     attempts = 0;
-    lastConnectedAt = Date.now();
+    lastConnectedAt = nowSec();
     selfId = openedSock.user?.id ?? null;
     setState("connected");
   }
 
   function handleQr(activeSock: WASocket, qr: string): void {
-    if (config.phoneNumber === undefined || pairingRequestedForSocket) {
+    if (config.phoneNumber === undefined) {
+      // Pairing is by code only (no rendered QR): without WA_PHONE_NUMBER this deployment sits in
+      // `pairing` forever with nothing to act on. Say so loudly, but only once per socket — the QR
+      // itself rotates and re-emits every ~20s, so an unguarded log here would spam. Never log the
+      // `qr` payload: it is a live credential, and anyone reading the logs could link their own
+      // device with it (Global Constraint 14 territory).
+      if (!missingPhoneNumberLoggedForSocket) {
+        missingPhoneNumberLoggedForSocket = true;
+        logger.error(
+          'wa: WA_PHONE_NUMBER is not set; pairing requires it (E.164 digits, no leading "+"). The server will keep waiting in the pairing state until it is configured.',
+        );
+      }
+      setState("pairing");
+      return;
+    }
+
+    if (pairingRequestedForSocket) {
       setState("pairing");
       return;
     }
@@ -222,7 +246,13 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
     // otherwise a stale 401 could clear live credentials or override the outcome stop() recorded.
     if (stopped) return;
 
-    const statusCode = (update.lastDisconnect?.error as Boom | undefined)?.output.statusCode;
+    // Baileys types this as `Boom | Error | undefined` and genuinely emits a bare `Error` on some
+    // reachable close paths (e.g. a WS-open validation failure), where `.output` doesn't exist.
+    // Read through a widened, honest shape instead of asserting `Boom` — asserting `Boom` (whose
+    // `.output` is non-optional) would erase the `Error` branch and let a bare Error's missing
+    // `.output` throw synchronously inside this listener.
+    const disconnectError = update.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined;
+    const statusCode = disconnectError?.output?.statusCode;
 
     if (statusCode === 401 /* DisconnectReason.loggedOut */) {
       setState("logged_out");

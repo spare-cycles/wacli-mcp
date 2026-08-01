@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
+import type { Config } from "../config.js";
 import { backoffMs, ConnectionUnavailableError, makeConnection, type ConnectionDeps } from "./connection.js";
 
 function fakeSocket() {
@@ -26,10 +27,10 @@ function firstSocket(sockets: ReturnType<typeof fakeSocket>[]): ReturnType<typeo
   return s;
 }
 
-function deps(over: Partial<ConnectionDeps> = {}) {
+function deps(over: Partial<ConnectionDeps> = {}, configOver: Partial<Config> = {}) {
   const sockets: ReturnType<typeof fakeSocket>[] = [];
   const base = {
-    config: { phoneNumber: "33612345678" },
+    config: { phoneNumber: "33612345678", ...configOver },
     logger: {
       info() {
         /* no-op */
@@ -84,6 +85,23 @@ void test("reaches connected on connection.update open", async () => {
   assert.equal(c.snapshot().attempts, 0, "a successful connect resets the backoff counter");
 });
 
+void test("lastEventAt and lastConnectedAt are Unix seconds, not milliseconds (Global Constraint 17)", async () => {
+  const { deps: d, sockets } = deps();
+  const c = makeConnection(d);
+  await c.start();
+  firstSocket(sockets).emit("connection.update", { connection: "open" });
+  const nowSec = Math.floor(Date.now() / 1000);
+  const snap = c.snapshot();
+  assert.ok(
+    Math.abs(snap.lastEventAt - nowSec) <= 2,
+    `lastEventAt (${snap.lastEventAt}) must be Unix seconds close to now (${nowSec}); a millisecond value would be off by ~1000x`,
+  );
+  assert.ok(
+    snap.lastConnectedAt !== null && Math.abs(snap.lastConnectedAt - nowSec) <= 2,
+    `lastConnectedAt (${String(snap.lastConnectedAt)}) must be Unix seconds close to now (${nowSec}); a millisecond value would be off by ~1000x`,
+  );
+});
+
 void test("requireSocket throws with the state named when not connected", () => {
   const { deps: d } = deps();
   const c = makeConnection(d);
@@ -133,6 +151,35 @@ void test("a pairing code is requested exactly once per socket", async () => {
   assert.equal(calls, 1, "a rotating QR must not spam requestPairingCode");
 });
 
+void test("a qr with no WA_PHONE_NUMBER logs an error once per socket, never the qr payload", async () => {
+  const { deps: d, sockets } = deps({}, { phoneNumber: undefined });
+  const errorCalls: unknown[][] = [];
+  const c = makeConnection({
+    ...d,
+    logger: {
+      ...d.logger,
+      error: (...args: unknown[]) => {
+        errorCalls.push(args);
+      },
+    },
+  });
+  await c.start();
+  firstSocket(sockets).emit("connection.update", { qr: "qr-payload-one" });
+  firstSocket(sockets).emit("connection.update", { qr: "qr-payload-two" });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(c.snapshot().state, "pairing");
+  assert.equal(errorCalls.length, 1, "the missing-phone-number diagnostic must log exactly once per socket");
+
+  const serialized = JSON.stringify(errorCalls[0]);
+  assert.match(serialized, /WA_PHONE_NUMBER/, "the diagnostic must name the missing env var");
+  assert.doesNotMatch(
+    serialized,
+    /qr-payload-(one|two)/,
+    "the diagnostic must never include the raw qr payload — it is a live credential",
+  );
+});
+
 void test("loggedOut is terminal: no reconnect, creds cleared", async () => {
   const { deps: d, sockets } = deps();
   let cleared = false;
@@ -167,6 +214,41 @@ void test("restartRequired recreates the socket immediately", async () => {
   await new Promise((r) => setImmediate(r));
   assert.equal(sockets.length, 2, "restartRequired is expected after pairing, not a failure");
   assert.equal(c.snapshot().state, "connecting");
+});
+
+void test("a bare Error (not a Boom) on close does not throw and falls back to ordinary backoff", async () => {
+  const { deps: d, sockets } = deps();
+  let cleared = false;
+  const c = makeConnection({
+    ...d,
+    auth: {
+      ...d.auth,
+      clear: () => {
+        cleared = true;
+      },
+    },
+  });
+  await c.start();
+
+  // Baileys genuinely emits a bare `Error` (not a `Boom`) on some reachable close paths, where
+  // `.output` does not exist. The listener must not throw synchronously here.
+  assert.doesNotThrow(() => {
+    firstSocket(sockets).emit("connection.update", {
+      connection: "close",
+      lastDisconnect: { error: new Error("stream errored before validation completed") },
+    });
+  }, "a bare Error on close must not crash the connection.update listener");
+
+  await new Promise((r) => setImmediate(r));
+  assert.equal(c.snapshot().state, "disconnected", "falls through to the ordinary backoff path, not a crash");
+  assert.equal(
+    c.snapshot().attempts,
+    1,
+    "an ordinary disconnect still counts as a failed attempt and schedules a retry",
+  );
+  assert.equal(cleared, false, "a bare Error must not be treated as a 401 logout");
+
+  await c.stop(); // clear the pending backoff timer so the process can exit
 });
 
 void test("backoff grows, caps, and is jittered", () => {
