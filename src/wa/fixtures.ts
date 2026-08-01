@@ -1,6 +1,8 @@
 /**
  * Hand-built `WAMessage`-shaped objects for tests. Not production code, and not loaded by it —
- * only `*.test.ts` files import this module.
+ * only `*.test.ts` files and `src/mcp/tools/harness.ts` import this module. Neither ships, and
+ * neither does this file: all three are named in `tsconfig.build.json`'s `exclude`, because the
+ * `*.test.ts` glob there catches none of them.
  *
  * This file is one of the two sanctioned exceptions to Global Constraint 11 (all raw JID
  * interpretation lives in `src/wa/jid.ts`): it holds JID **literals as data**, which a fixture for
@@ -13,6 +15,8 @@ export const FIXTURE_DM = "33612345678@s.whatsapp.net";
 export const FIXTURE_GROUP = "120363000000000000@g.us";
 export const FIXTURE_LID = "999@lid";
 export const FIXTURE_TS = 1_700_000_000;
+/** The account under test, for a harness that has to answer `selfId` without a socket. */
+export const FIXTURE_SELF = "33600000000@s.whatsapp.net";
 
 /** The options every fixture accepts; each one defaults to a plausible inbound DM. */
 export type FixtureOptions = { chat?: string; id?: string; ts?: number; fromMe?: boolean };

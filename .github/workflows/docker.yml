@@ -1,22 +1,34 @@
 name: build-image
 
-# Build and push the wacli-mcp container image to GHCR.
+# Build and push the wa-mcp container image to GHCR.
 # Tags: a semver tag push (v1.2.3) -> :1.2.3 + :latest; any main push -> :main + :sha-<short>.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      wacli_ref:
-        description: "wacli git ref (tag/branch) to build the binary from"
-        default: main
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  # The same gate `ci.yml` runs, restated here rather than reached for with `workflow_call`.
+  # It exists so `needs: check` below can gate publication: a workflow cannot depend on a job in
+  # another workflow, and nothing else stops a red tree from being tagged `:latest`.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pnpm test
+
   build:
+    needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -45,10 +57,8 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          # amd64 only: the whisper.cpp image the Dockerfile copies from publishes no other arch.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # WACLI_REF: a manual run can override; otherwise pin to a wacli release tag here
-          # (default `main` is for convenience — bump it deliberately for reproducible images).
-          build-args: |
-            WACLI_REF=${{ github.event.inputs.wacli_ref || 'main' }}

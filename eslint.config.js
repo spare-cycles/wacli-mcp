@@ -4,7 +4,10 @@ import tseslint from "typescript-eslint";
 import prettier from "eslint-config-prettier";
 
 export default tseslint.config(
-  { ignores: ["dist/", "node_modules/", "eslint.config.js"] },
+  // `smoke.mjs` is ignored, not merely untyped: `projectService` fatals on any file no tsconfig
+  // includes ("was not found by the project service"), and `tsconfig.json` includes `src/**/*.ts`
+  // only. Being outside `src/` is therefore not enough to keep it out of the gate — this line is.
+  { ignores: ["dist/", "node_modules/", "eslint.config.js", "smoke.mjs"] },
   js.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,

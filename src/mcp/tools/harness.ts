@@ -34,6 +34,7 @@ import { makeReactionsRepo } from "../../db/reactions.js";
 import type { MediaFile, MediaStore } from "../../media/store.js";
 import type { Transcriber } from "../../media/transcribe.js";
 import { ConnectionUnavailableError, type ConnectionState, type WaConnection } from "../../wa/connection.js";
+import { FIXTURE_SELF } from "../../wa/fixtures.js";
 import type { Sender } from "../../wa/send.js";
 import type { ToolContext } from "../context.js";
 import { registerReadTools } from "./reads.js";
@@ -60,7 +61,13 @@ export type Harness = {
   close: () => Promise<void>;
 };
 
-const SELF_ID = "33600000000@s.whatsapp.net";
+/**
+ * Imported rather than spelled out here: Constraint 11's enforcing check excludes `*.test.ts`,
+ * `src/wa/jid.ts` and `src/wa/fixtures.ts` and nothing else, so a JID literal in this file — which
+ * is scaffolding, not a test — is a hit the check has no way to forgive. Keeping every test-data
+ * JID in `fixtures.ts` keeps that command a clean signal instead of one with a known exception.
+ */
+const SELF_ID = FIXTURE_SELF;
 
 /** Global Constraint 17: every timestamp is integer Unix seconds, never `Date.now()` milliseconds. */
 function nowSec(): number {
