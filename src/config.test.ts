@@ -17,6 +17,13 @@ void test("defaults are applied", () => {
   assert.equal(c.maxResultChars, 200_000);
   assert.equal(c.ntfy, undefined);
   assert.equal(c.phoneNumber, undefined);
+  assert.equal(c.maxUploadBytes, 64 * 1024 * 1024);
+});
+
+void test("path-based file sending is off unless a directory is named", () => {
+  assert.equal(loadConfig({ ...base }).sendFileDir, undefined);
+  assert.equal(loadConfig({ ...base, WA_SEND_FILE_DIR: "" }).sendFileDir, undefined);
+  assert.equal(loadConfig({ ...base, WA_SEND_FILE_DIR: "/data/uploads" }).sendFileDir, "/data/uploads");
 });
 
 void test("readOnly accepts wacli-era truthy spellings", () => {
@@ -40,6 +47,9 @@ void test("numeric vars fall back on garbage and clamp on range", () => {
   assert.equal(loadConfig({ ...base, PORT: "0" }).port, 8080);
   assert.equal(loadConfig({ ...base, WA_VIDEO_KEYFRAMES: "999" }).videoKeyframes, 16);
   assert.equal(loadConfig({ ...base, WA_VIDEO_KEYFRAMES: "2" }).videoKeyframes, 2);
+  assert.equal(loadConfig({ ...base, WA_MAX_UPLOAD_BYTES: "-1" }).maxUploadBytes, 64 * 1024 * 1024);
+  assert.equal(loadConfig({ ...base, WA_MAX_UPLOAD_BYTES: "999999999999" }).maxUploadBytes, 256 * 1024 * 1024);
+  assert.equal(loadConfig({ ...base, WA_MAX_UPLOAD_BYTES: "2048" }).maxUploadBytes, 2048);
 });
 
 void test("ntfy is all-or-nothing", () => {

@@ -16,6 +16,16 @@ export type Config = {
   whisperThreads: number; // WA_WHISPER_THREADS, default max(1, cpus-1)
   whisperMaxSeconds: number; // WA_WHISPER_MAX_SECONDS, default 900
   maxImageBytes: number; // WA_MAX_IMAGE_BYTES, default 5 MiB
+  maxUploadBytes: number; // WA_MAX_UPLOAD_BYTES, default 64 MiB, clamped [1, 256 MiB]
+  /**
+   * WA_SEND_FILE_DIR: the one directory `wa_send_file`'s `path` argument may resolve inside.
+   *
+   * Unset by default, which disables path-based sending entirely. That is the right default because
+   * the deployment is a container serving a *remote* client, for which a server-side path has no
+   * legitimate caller: left open, `path` is an arbitrary-file-read primitive that would hand
+   * `/proc/self/environ` — every secret in the process environment — to a WhatsApp conversation.
+   */
+  sendFileDir: string | undefined;
   videoKeyframes: number; // WA_VIDEO_KEYFRAMES, default 4, clamped [1, 16]
   maxResultChars: number; // WA_MCP_MAX_RESULT_CHARS, default 200_000
   sessionTtlMs: number; // fixed 30 * 60_000
@@ -82,6 +92,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     ),
     whisperMaxSeconds: envInt(env["WA_WHISPER_MAX_SECONDS"], 900, 1, 14_400),
     maxImageBytes: envInt(env["WA_MAX_IMAGE_BYTES"], 5 * 1024 * 1024, 1, 100 * 1024 * 1024),
+    maxUploadBytes: envInt(env["WA_MAX_UPLOAD_BYTES"], 64 * 1024 * 1024, 1, 256 * 1024 * 1024),
+    sendFileDir: env["WA_SEND_FILE_DIR"] || undefined,
     videoKeyframes: envInt(env["WA_VIDEO_KEYFRAMES"], 4, 1, 16),
     maxResultChars: envInt(env["WA_MCP_MAX_RESULT_CHARS"], 200_000, 1_000, 50_000_000),
     sessionTtlMs: 30 * 60_000,
