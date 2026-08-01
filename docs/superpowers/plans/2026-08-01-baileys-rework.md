@@ -1950,6 +1950,8 @@ Step 8's "newly inserted" condition is what makes the idempotency test pass: hav
 
 **Step 8's unread bump is suppressed on the history path.** `messaging-history.set` carries the server-authoritative `Chat.unreadCount`, which the chat half of the batch has already written. Bumping again per inbound message on top of it makes a chat WhatsApp reports as fully read surface an unread count equal to its inbound history depth — visible directly in `wa_chats_list`. So `ingestMessages` takes an option (`{ bumpUnread: false }`) that the history path passes and the live `messages.upsert` path does not; `chats.touch` and `clearUnread` still run either way. The live path keeps the unconditional bump because it covers both `notify` and the offline `append` drain, which really are unread. (Found by review during Task 8.)
 
+A consequence worth stating: a `messaging-history.set` whose `chats` array omits a chat that its `messages` array mentions leaves that chat at `unreadCount = 0`, because the history path no longer bumps and no server count arrived to write. That is the intended reading of "the server's count is authoritative" — the alternative, falling back to counting inbound rows, is exactly the inflation this rule removes.
+
 **The per-chunk transaction needs a test that fails when it is removed.** It is the sole justification for handing `IngestDeps` the raw `db`, and neither a row count nor the per-message try/catch observes it — both stay green if `inTransaction`'s body is replaced by a bare `fn()`. Cover it with a failure raised *outside* `ingestMessage`'s own catch (a repo stub that throws on the 501st row) asserting chunk 1 survived and chunk 2 did not.
 
 Wrap the whole body in try/catch; on error log `{ err, messageId }` at warn and return.
