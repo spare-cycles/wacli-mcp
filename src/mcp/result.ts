@@ -36,11 +36,29 @@ export function jsonResult(data: unknown, maxChars: number): ToolResult {
   const full = data === undefined ? "null" : JSON.stringify(data, null, 2);
   const text =
     full.length > maxChars
-      ? full.slice(0, maxChars) +
-        `\n\n…[truncated: ${full.length} chars total, showing first ${maxChars}. ` +
+      ? truncateToCodepoint(full, maxChars) +
+        `\n\n…[truncated: ${full.length} chars total, showing first ${maxChars}. The response was cut ` +
+        `mid-JSON, so what is above is an incomplete document and will not parse as it stands. ` +
         `Narrow the request with a smaller "limit" or more filters.]`
       : full;
   return { content: [{ type: "text", text }] };
+}
+
+/**
+ * The first `maxChars` UTF-16 code units of `s`, minus a trailing half of a character.
+ *
+ * A plain `slice` cuts code units, and every emoji is two of them — so a boundary landing inside one
+ * leaves a lone surrogate, which is not a character at all: it renders as a replacement glyph, and
+ * re-encoding it (a JSON re-serialize, a transport that insists on well-formed UTF-8) mangles or
+ * rejects it. Dropping the orphan costs one character and cannot produce one.
+ */
+function truncateToCodepoint(s: string, maxChars: number): string {
+  const last = s.charCodeAt(maxChars - 1);
+  // A high surrogate in the final position is the leading half of a pair whose trailing half is
+  // being cut off. `charCodeAt` out of range answers NaN, which fails this test, so maxChars <= 0
+  // needs no special case.
+  const isOrphanedHighSurrogate = last >= 0xd800 && last <= 0xdbff;
+  return s.slice(0, isOrphanedHighSurrogate ? maxChars - 1 : maxChars);
 }
 
 export function textResult(text: string): ToolResult {

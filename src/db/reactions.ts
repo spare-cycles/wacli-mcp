@@ -2,17 +2,26 @@ import type { Db } from "./client.js";
 
 export type ReactionRow = { chatId: string; messageId: string; senderId: string; emoji: string; ts: number };
 
+/** A message named the way this store keys one: an id is unique only inside its own chat. */
+export type MessageKey = { chatId: string; messageId: string };
+
+export type ReactionCount = MessageKey & { count: number };
+
 export type ReactionsRepo = {
   /** An empty emoji removes the reaction. Same (chat, message, sender) replaces. */
   set: (r: ReactionRow) => void;
   forMessage: (chatId: string, messageId: string) => ReactionRow[];
   /**
-   * How many reactions each of `messageIds` carries, in **one** grouped query.
+   * How many reactions each of `keys` carries, in **one** grouped query — for a whole page, however
+   * many chats that page spans.
    *
-   * This exists so a list of fifty messages costs one query rather than fifty `forMessage` calls.
-   * Messages with no reactions are simply absent from the map.
+   * It takes `(chatId, messageId)` pairs rather than one chat and its ids because a search page
+   * legitimately spans as many chats as it has hits: scoping the query to a single chat would turn a
+   * 200-hit cross-chat search into 200 queries, which is the same order of cost that reaching for
+   * `forMessage` per row would have had. Messages with no reactions are simply absent from the
+   * answer, never present with a zero.
    */
-  countsFor: (chatId: string, messageIds: readonly string[]) => Map<string, number>;
+  countsFor: (keys: readonly MessageKey[]) => ReactionCount[];
   count: () => number;
 };
 
@@ -51,21 +60,24 @@ export function makeReactionsRepo(db: Db): ReactionsRepo {
     return rows.map(toReactionRow);
   }
 
-  function countsFor(chatId: string, messageIds: readonly string[]): Map<string, number> {
-    const counts = new Map<string, number>();
-    if (messageIds.length === 0) return counts;
+  function countsFor(keys: readonly MessageKey[]): ReactionCount[] {
+    if (keys.length === 0) return [];
     // The placeholder count varies with the page size, so this one statement cannot be prepared
     // ahead of time. The list is bounded by the tools' `limit` cap (200), so the SQL stays small.
-    const placeholders = messageIds.map(() => "?").join(", ");
+    //
+    // `(chat_id, message_id) IN (VALUES …)` is a row-value comparison, which SQLite answers from the
+    // reactions primary key (`SEARCH reactions USING COVERING INDEX … (chat_id=? AND message_id=?)`)
+    // rather than by scanning — so one statement covers a page spanning any number of chats.
+    const placeholders = keys.map(() => "(?, ?)").join(", ");
+    const params = keys.flatMap((k) => [k.chatId, k.messageId]);
     const rows = db
       .prepare(
-        `SELECT message_id, COUNT(*) AS c FROM reactions
-          WHERE chat_id = ? AND message_id IN (${placeholders})
-          GROUP BY message_id`,
+        `SELECT chat_id, message_id, COUNT(*) AS c FROM reactions
+          WHERE (chat_id, message_id) IN (VALUES ${placeholders})
+          GROUP BY chat_id, message_id`,
       )
-      .all(chatId, ...messageIds) as { message_id: string; c: number }[];
-    for (const row of rows) counts.set(row.message_id, row.c);
-    return counts;
+      .all(...params) as { chat_id: string; message_id: string; c: number }[];
+    return rows.map((row) => ({ chatId: row.chat_id, messageId: row.message_id, count: row.c }));
   }
 
   function count(): number {

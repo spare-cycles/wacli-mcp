@@ -68,8 +68,17 @@ function paginate<T>(
   return { rows: hasMore ? rows.slice(0, limit) : rows, nextCursor: hasMore ? encodeCursor(offset + limit) : null };
 }
 
+/**
+ * The `{ next_cursor, items }` envelope every paginated tool answers with.
+ *
+ * `next_cursor` is serialized **before** `items` on purpose. `jsonResult` truncates from the end, so
+ * whatever is last is what a page over `maxResultChars` loses — and with `items` first, the one field
+ * that is always lost is the cursor. That breaks the pagination round trip on exactly the pages that
+ * need it most, on top of the JSON already being cut short. This way the caller can still read where
+ * to continue from, and the truncation note tells it what happened.
+ */
 function page(items: Record<string, unknown>[], nextCursor: string | null, ctx: ToolContext): ToolResult {
-  return jsonResult({ items, next_cursor: nextCursor }, ctx.config.maxResultChars);
+  return jsonResult({ next_cursor: nextCursor, items }, ctx.config.maxResultChars);
 }
 
 /**
@@ -83,25 +92,18 @@ function reactionKey(chatId: string, messageId: string): string {
 }
 
 /**
- * Reaction counts for a whole page, in one grouped query per distinct chat.
+ * Reaction counts for a whole page, in **one** grouped query — one per page, not one per row and not
+ * one per chat the page touches.
  *
- * A list scoped to one chat therefore costs exactly one query; a cross-chat search costs one per
- * chat it touched. Either way it is not one per row, which for a default page would be fifty.
+ * The per-chat shape this replaced was fine for a list scoped to one chat and quietly awful for a
+ * search: a 200-hit page spanning 200 chats issued 200 queries, which is the order of cost the
+ * requirement exists to avoid.
  */
 function reactionCounts(ctx: ToolContext, rows: readonly MessageRow[]): Map<string, number> {
-  const idsByChat = new Map<string, string[]>();
-  for (const row of rows) {
-    const existing = idsByChat.get(row.chatId);
-    if (existing === undefined) idsByChat.set(row.chatId, [row.id]);
-    else existing.push(row.id);
-  }
-
   const counts = new Map<string, number>();
-  for (const [chatId, messageIds] of idsByChat) {
-    for (const [messageId, n] of ctx.reactions.countsFor(chatId, messageIds)) {
-      counts.set(reactionKey(chatId, messageId), n);
-    }
-  }
+  if (rows.length === 0) return counts;
+  const keys = rows.map((row) => ({ chatId: row.chatId, messageId: row.id }));
+  for (const c of ctx.reactions.countsFor(keys)) counts.set(reactionKey(c.chatId, c.messageId), c.count);
   return counts;
 }
 

@@ -602,3 +602,36 @@ void test("available() is false when the binary is present but broken", async ()
   });
   assert.equal(await t.available(), false);
 });
+
+void test("available() forks once per TTL, however often it is asked", async () => {
+  // `wa_health` is a tool a model may poll, and Task 14's `/health` is a container healthcheck that
+  // runs on a timer — an unmemoized probe forks whisper on every one of those calls.
+  const log = join(root, "help-calls.txt");
+  const bin = writeStub("whisper-counted", `echo run >> "${log}"\nexit 0`);
+  const t = makeTranscriber({
+    config: configFor(freshDataDir(), { WA_WHISPER_BIN: bin }),
+    logger: captureLogger().logger,
+    availabilityTtlMs: 10_000,
+  });
+
+  assert.equal(await t.available(), true);
+  assert.equal(await t.available(), true);
+  // Concurrent callers too: the promise is cached, not just its settled value.
+  assert.deepEqual(await Promise.all([t.available(), t.available()]), [true, true]);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 1, "one probe covers the whole TTL");
+});
+
+void test("the availability memo expires, so a repaired install is picked up without a restart", async () => {
+  const log = join(root, "help-calls-expiry.txt");
+  const bin = writeStub("whisper-counted-expiry", `echo run >> "${log}"\nexit 0`);
+  const t = makeTranscriber({
+    config: configFor(freshDataDir(), { WA_WHISPER_BIN: bin }),
+    logger: captureLogger().logger,
+    availabilityTtlMs: 1,
+  });
+
+  assert.equal(await t.available(), true);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(await t.available(), true);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 2, "past the TTL the binary is probed again");
+});

@@ -45,7 +45,15 @@ export type Transcriber = {
    * timeout rather than running unbounded.
    */
   transcribeFile: (path: string) => Promise<string>;
-  /** Whether the whisper binary can run at all. Never throws. */
+  /**
+   * Whether the whisper binary can run at all. Never throws.
+   *
+   * Memoized for `availabilityTtlMs`: this is what `wa_health` and Task 14's `/health` report, both
+   * of which a model or a container healthcheck may poll freely, and an unmemoized probe forks a
+   * process on every one of those calls. The answer is near-constant in practice — the binary is
+   * baked into the image — so the TTL exists only so a repaired install is picked up without a
+   * restart, not because the value is expected to change.
+   */
   available: () => Promise<boolean>;
 };
 
@@ -56,6 +64,8 @@ export type TranscriberDeps = {
   fetchImpl?: typeof fetch | undefined;
   /** Injectable for the same reason: a test cannot afford to wait out the real budget. */
   stallTimeoutMs?: number | undefined;
+  /** How long an `available()` answer is reused. Injectable so a test can watch the memo expire. */
+  availabilityTtlMs?: number | undefined;
 };
 
 /** Transcription could not be produced: no model, an over-long recording, or nothing said. */
@@ -69,6 +79,14 @@ const MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/mai
 const DEFAULT_STALL_TIMEOUT_MS = 60_000;
 /** `--help` either answers immediately or the binary is broken; there is no slow success here. */
 const HELP_TIMEOUT_MS = 10_000;
+/**
+ * How long one `--help` probe stands for the next answer.
+ *
+ * A minute is long enough that a health endpoint polled every few seconds forks once rather than
+ * every time, and short enough that an operator who installs the missing binary sees the server
+ * agree within a minute instead of after a restart.
+ */
+const DEFAULT_AVAILABILITY_TTL_MS = 60_000;
 /**
  * Whisper's budget: ten times the recording, never less than a minute. Deliberately generous — the
  * NAS this deploys to has no GPU, and `large-v3-turbo` on a cold CPU is far slower than real time.
@@ -181,6 +199,7 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
   const { config, logger } = deps;
   const doFetch = deps.fetchImpl ?? fetch;
   const stallTimeoutMs = deps.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+  const availabilityTtlMs = deps.availabilityTtlMs ?? DEFAULT_AVAILABILITY_TTL_MS;
 
   const modelsDir = join(config.dataDir, "models");
   const modelPath = join(modelsDir, `ggml-${config.whisperModel}.bin`);
@@ -189,6 +208,8 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
   const tmpDir = join(config.dataDir, "tmp");
 
   let inFlight: Promise<string> | undefined;
+  /** The last `--help` probe and when it was started. `undefined` until the first call. */
+  let availability: { startedAtMs: number; probe: Promise<boolean> } | undefined;
 
   /** Run one filesystem step, labelling any failure with the errno it carried. */
   async function fsStep<T>(path: string, step: () => Promise<T>): Promise<T> {
@@ -380,7 +401,7 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
     }
   }
 
-  async function available(): Promise<boolean> {
+  async function probeWhisper(): Promise<boolean> {
     try {
       await runTool(config.whisperBin, ["--help"], HELP_TIMEOUT_MS);
       return true;
@@ -389,6 +410,20 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
       // throws would turn "transcription is unavailable" into "health checks are broken".
       return false;
     }
+  }
+
+  function available(): Promise<boolean> {
+    const startedAtMs = Date.now();
+    // The *promise* is what is cached, not its value, so callers arriving while a probe is still
+    // running share it instead of each forking their own. Unlike `ensureModel`'s `inFlight`, caching
+    // it past settlement is safe here precisely because `probeWhisper` never rejects: there is no
+    // failure to make permanent, only a `false` that expires with the TTL like any other answer.
+    if (availability !== undefined && startedAtMs - availability.startedAtMs < availabilityTtlMs) {
+      return availability.probe;
+    }
+    const probe = probeWhisper();
+    availability = { startedAtMs, probe };
+    return probe;
   }
 
   return { ensureModel, transcribeFile, available };

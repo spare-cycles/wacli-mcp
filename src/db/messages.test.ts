@@ -156,6 +156,19 @@ void test("a transcript hit on a message with an empty text is still a transcrip
   assert.match(hit.snippet, /demain/);
 });
 
+void test("a caption that does not match leaves the transcript hit labelled as one", () => {
+  // The case an "is the snippet empty?" rule cannot see: `snippet()` answers a column that did *not*
+  // match with that column's leading text, unmarked — so a non-empty caption is indistinguishable
+  // from a real text hit unless the markers themselves are read. A captioned video is the common
+  // shape for this: real text of its own, and the words the caller searched for only in the speech.
+  const r = repo();
+  r.upsert(msg({ id: "V1", kind: "video", text: "voici la legende de ma video sans le mot" }));
+  r.setTranscript("c", "V1", "on se retrouve demain");
+  const hit = r.search("demain", {}, 10, 0)[0];
+  assert.equal(hit?.matchedTranscript, true, "the words are in the speech, not in the caption");
+  assert.match(hit.snippet, /demain/, "a snippet that does not contain the hit is worse than no snippet");
+});
+
 void test("search can be scoped to one chat", () => {
   const r = repo();
   r.upsert(msg({ chatId: "c", id: "M1", text: "orange" }));

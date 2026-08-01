@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { loadConfig } from "../../config.js";
 import type { MessageKind } from "../../db/messages.js";
 import type { ToolContext } from "../context.js";
+import { decodeCursor } from "../cursor.js";
 import { harness, resultJson, resultPage, resultText } from "./harness.js";
 
 const READ_TOOLS = [
@@ -52,6 +53,29 @@ function at(items: readonly Record<string, unknown>[], i: number): Record<string
   const row = items[i];
   assert.ok(row !== undefined, `expected an item at index ${i}`);
   return row;
+}
+
+/**
+ * Count the reaction queries a page really issues, by wrapping the repo in the live context.
+ *
+ * The handlers read `ctx.reactions` at call time rather than closing over it, so replacing it after
+ * the server is built still observes the real calls.
+ */
+function countReactionQueries(ctx: ToolContext): { countsFor: number; forMessage: number } {
+  const real = ctx.reactions;
+  const calls = { countsFor: 0, forMessage: 0 };
+  ctx.reactions = {
+    ...real,
+    countsFor: (keys) => {
+      calls.countsFor++;
+      return real.countsFor(keys);
+    },
+    forMessage: (chatId, messageId) => {
+      calls.forMessage++;
+      return real.forMessage(chatId, messageId);
+    },
+  };
+  return calls;
 }
 
 // ── Health ────────────────────────────────────────────────────────────────
@@ -345,25 +369,40 @@ void test("a page of reaction counts is one grouped query, not one per row", asy
     },
   });
 
-  // The handlers read `ctx.reactions` at call time, so wrapping it here counts the real queries.
-  const real = h.ctx.reactions;
-  const calls = { countsFor: 0, forMessage: 0 };
-  h.ctx.reactions = {
-    ...real,
-    countsFor: (chatId, messageIds) => {
-      calls.countsFor++;
-      return real.countsFor(chatId, messageIds);
-    },
-    forMessage: (chatId, messageId) => {
-      calls.forMessage++;
-      return real.forMessage(chatId, messageId);
-    },
-  };
-
+  const calls = countReactionQueries(h.ctx);
   const { items } = resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: GROUP } }));
   assert.equal(items.length, 3);
   assert.equal(calls.countsFor, 1, "one grouped query covers the whole page");
   assert.equal(calls.forMessage, 0, "a list view must never fetch reaction rows one message at a time");
+  await h.close();
+});
+
+void test("a search page spanning many chats is still one grouped query", async () => {
+  // The case the per-chat shape got wrong: `wa_messages_search` pages span as many chats as they
+  // have hits, so a query scoped to one chat is one query per chat — the same order of cost as
+  // asking per row, which is what the requirement exists to rule out.
+  const chats = Array.from({ length: 12 }, (_, i) => `1203630000000000${i.toString().padStart(2, "0")}@g.us`);
+  const h = await harness({
+    seed: (ctx) => {
+      for (const [i, chatId] of chats.entries()) {
+        seedChat(ctx, chatId, true, [{ id: "M1", ts: 10 + i, text: "shared keyword here" }]);
+        ctx.reactions.set({ chatId, messageId: "M1", senderId: ALICE, emoji: "👍", ts: 11 + i });
+      }
+    },
+  });
+
+  const calls = countReactionQueries(h.ctx);
+  const { items } = resultPage(
+    await h.client.callTool({ name: "wa_messages_search", arguments: { query: "keyword" } }),
+  );
+  assert.equal(items.length, chats.length);
+  assert.deepEqual(
+    items.map((i) => i["reaction_count"]),
+    items.map(() => 1),
+    "every chat's own reaction is counted against its own message",
+  );
+  assert.equal(calls.countsFor, 1, `12 chats in one page must still cost one query, not ${chats.length}`);
+  assert.equal(calls.forMessage, 0);
   await h.close();
 });
 
@@ -399,6 +438,39 @@ void test("wa_messages_search returns transcript hits labelled as such", async (
 
   assert.equal(typed["matched_transcript"], false, "a hit on the message text is not a transcript hit");
   assert.match(typed["snippet"] as string, /bonjour/);
+  await h.close();
+});
+
+void test("a transcript hit is labelled as one even when the message carries text of its own", async () => {
+  // `text: null` — the case the test above covers — is the *easy* one: FTS5 answers `snippet()` with
+  // NULL there. The two shapes below are the ones that need the match markers to be read. A caption
+  // plus a transcript is the ordinary case for a video, so this goes live the moment anything writes
+  // a transcript.
+  const h = await harness({
+    seed: (ctx) => {
+      seedChat(ctx, ALICE, false, [
+        { id: "C1", ts: 10, kind: "video", text: "voici la legende de ma video sans le mot" },
+        { id: "E1", ts: 20, kind: "audio", text: "" },
+      ]);
+      ctx.messages.setTranscript(ALICE, "C1", "bonjour tout le monde");
+      ctx.messages.setTranscript(ALICE, "E1", "bonjour les amis");
+    },
+  });
+
+  const { items } = resultPage(
+    await h.client.callTool({ name: "wa_messages_search", arguments: { query: "bonjour" } }),
+  );
+  const byId = new Map(items.map((i) => [i["id"] as string, i]));
+  const captioned = byId.get("C1");
+  const emptyText = byId.get("E1");
+
+  assert.ok(captioned, "the captioned video must be among the hits");
+  assert.equal(captioned["matched_transcript"], true, "a caption without the query is not what matched");
+  assert.match(captioned["snippet"] as string, /bonjour/, "the snippet must contain the words searched for");
+
+  assert.ok(emptyText, "the empty-text voice note must be among the hits");
+  assert.equal(emptyText["matched_transcript"], true);
+  assert.match(emptyText["snippet"] as string, /bonjour/);
   await h.close();
 });
 
@@ -649,7 +721,33 @@ void test("an oversized payload is truncated with the true length named", async 
     },
   });
   const text = resultText(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: ALICE } }));
-  assert.ok(text.length < 1200, `expected a capped payload, got ${text.length} chars`);
+  assert.ok(text.length < 1400, `expected a capped payload, got ${text.length} chars`);
   assert.match(text, /truncated: \d{4,} chars total/);
+  assert.match(text, /will not parse/, "the note must say the JSON above is incomplete, not merely shortened");
+  await h.close();
+});
+
+void test("a truncated page still carries its next_cursor, so the round trip survives the cut", async () => {
+  // `jsonResult` cuts from the end, so field order decides what a page over the cap loses. With
+  // `items` first, the casualty is always the cursor — and a caller that cannot read the cursor
+  // cannot narrow its request by paging either, which is the remedy the note recommends.
+  const config = { ...loadConfig({ WA_DATA_DIR: "/tmp/wa-trunc-cursor" }), maxResultChars: 500 };
+  const h = await harness({
+    overrides: { config },
+    seed: (ctx) => {
+      seedChat(
+        ctx,
+        ALICE,
+        false,
+        Array.from({ length: 6 }, (_, i) => ({ id: `M${i}`, ts: i + 1, text: "x".repeat(400) })),
+      );
+    },
+  });
+
+  const text = resultText(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: ALICE, limit: 2 } }));
+  assert.match(text, /truncated/, "the seed must be big enough to be cut, or this proves nothing");
+  const cursor = /"next_cursor": "([^"]+)"/.exec(text)?.[1];
+  assert.ok(cursor, "the cursor must survive a payload the tool had to cut");
+  assert.equal(decodeCursor(cursor), 2, "and it must be the real cursor onto page 2, not a stump");
   await h.close();
 });

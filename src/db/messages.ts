@@ -106,9 +106,30 @@ function toMessageRow(raw: MessageRowRaw): MessageRow {
   };
 }
 
-/** A snippet column that is NULL or empty: either way, that column carried no match. */
-function emptyToUndefined(snippet: string | null): string | undefined {
-  return snippet === null || snippet === "" ? undefined : snippet;
+/**
+ * How a matched term is marked inside a snippet, before it is rendered for a reader.
+ *
+ * `snippet()` does not report whether the column it was asked about took part in the match: for a
+ * column that did not, it answers that column's *leading text*, unmarked — NULL only when the column
+ * itself is NULL, and `""` only when it is empty. So the presence of these markers is the only thing
+ * in the result that distinguishes "this column matched" from "this column exists". Reading the
+ * snippet's emptiness instead mislabels the ordinary case of a captioned video — a caption that does
+ * not contain the query, plus a transcript that does — as a text hit, and hands back a snippet with
+ * none of the searched words in it.
+ *
+ * They are control characters (SOH/STX) rather than `[`/`]` so that a bracket typed by a human in a
+ * message can never be read as a match marker; nothing in a WhatsApp message body produces them.
+ */
+const MATCH_OPEN = "\u0001";
+const MATCH_CLOSE = "\u0002";
+
+/**
+ * The snippet of a column that really matched, with its markers rendered as `[…]` for the reader —
+ * or `undefined` when that column took no part in the match.
+ */
+function matchedSnippet(snippet: string | null): string | undefined {
+  if (snippet?.includes(MATCH_OPEN) !== true) return undefined;
+  return snippet.replaceAll(MATCH_OPEN, "[").replaceAll(MATCH_CLOSE, "]");
 }
 
 /** Wrap a raw user query as a single quoted FTS5 string so no operator character reaches the parser. */
@@ -124,8 +145,8 @@ const SELECT_COLUMNS = `
 const SEARCH_COLUMNS = `
   m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text, m.transcript,
   m.quoted_id, m.status, m.edited_ts, m.deleted_ts, m.media_type, m.media_sha,
-  snippet(messages_fts, 0, '[', ']', '…', 12) AS snip_text,
-  snippet(messages_fts, 1, '[', ']', '…', 12) AS snip_transcript
+  snippet(messages_fts, 0, char(1), char(2), '…', 12) AS snip_text,
+  snippet(messages_fts, 1, char(1), char(2), '…', 12) AS snip_transcript
 `;
 
 /** Shared skeleton for the search query; `extraWhere` scopes it to one chat when non-empty. */
@@ -270,14 +291,13 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
         ? (searchScopedStmt.all({ q, chatId: opts.chatId, limit, offset }) as SearchRowRaw[])
         : (searchStmt.all({ q, limit, offset }) as SearchRowRaw[]);
     return rows.map((row) => {
-      // FTS5's `snippet()` answers NULL for a column that did not match — but for a column that is
-      // an empty *string* it answers with an empty string instead, and an empty snippet is just as
-      // much "this column did not match" as NULL is. Reading only for NULL makes a hit on the
-      // transcript of a message whose text is `''` report itself as a text hit, with a blank
-      // snippet. Storable today (an `extendedTextMessage` with an empty body lands as `''`, not
-      // NULL), so this is cheaper to rule out than to rediscover from a blank search result.
-      const snipText = emptyToUndefined(row.snip_text);
-      const snipTranscript = emptyToUndefined(row.snip_transcript);
+      // Which column matched is read from the markers, never from whether its snippet is empty:
+      // `snippet()` returns unmarked leading text for a column that took no part in the match, so
+      // emptiness answers a different question (see `matchedSnippet`). A message matching in both
+      // columns is a text hit, and shows the text snippet — the transcript label means the words
+      // were found *only* in speech, which is what makes it worth telling the model about.
+      const snipText = matchedSnippet(row.snip_text);
+      const snipTranscript = matchedSnippet(row.snip_transcript);
       return {
         ...toMessageRow(row),
         matchedTranscript: snipText === undefined && snipTranscript !== undefined,
