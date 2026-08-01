@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+/**
+ * Bootstrap: the one place the real objects are constructed and handed to each other.
+ *
+ * It owns wiring and nothing else. Every decision it looks like it is making — what a tool may
+ * reach, when a socket reconnects, what `/health` says — belongs to the module being wired, and the
+ * two exceptions here (`loadMessage`, which adapts a Baileys key to a repository lookup, and
+ * `shutdown`, which is process-level by nature) are named as such below.
+ *
+ * **Failure policy, inverted from the retired stdio server on purpose.** `uncaughtException` and
+ * `unhandledRejection` are logged and the process keeps running. That server spoke to one client
+ * over a pipe, so dying was honest; this one holds the only WhatsApp connection in the deployment
+ * and serves every client over HTTP, so taking it down over one bad request drops the socket, the
+ * ingest stream and every other session with it. A crash loop is not a recovery strategy when
+ * reconnecting costs a fresh handshake with WhatsApp.
+ *
+ * A boot failure is the opposite case and still exits non-zero: nothing is running yet, so there is
+ * nothing to protect, and a container that stays up with no server in it is worse than one that
+ * restarts.
+ */
+
+import { pathToFileURL } from "node:url";
+import type { WAMessageKey } from "baileys";
+import type { Logger } from "pino";
+import { makeAlerter, type Alerter } from "./alerts.js";
+import { loadConfig } from "./config.js";
+import { makeAuthStore } from "./db/auth-state.js";
+import { makeChatsRepo } from "./db/chats.js";
+import { closeDb, openDb, type Db } from "./db/client.js";
+import { makeContactsRepo } from "./db/contacts.js";
+import { makeMessagesRepo } from "./db/messages.js";
+import { makeMetaRepo } from "./db/meta.js";
+import { makeReactionsRepo } from "./db/reactions.js";
+import { startHttp, type HttpHandle } from "./http.js";
+import { logger } from "./logger.js";
+import { makeMediaStore } from "./media/store.js";
+import { makeTranscriber } from "./media/transcribe.js";
+import type { ToolContext } from "./mcp/context.js";
+import { buildHealth } from "./mcp/health.js";
+import { buildMcpServer } from "./mcp/server.js";
+import { makeConnection, type WaConnection } from "./wa/connection.js";
+import { makeIngest } from "./wa/ingest.js";
+import { canonicalId } from "./wa/jid.js";
+import { makeSender } from "./wa/send.js";
+
+export type ShutdownDeps = {
+  logger: Logger;
+  http: HttpHandle;
+  conn: WaConnection;
+  alerter: Alerter;
+  db: Db;
+  /** Seam: the real one is `process.exit`, which a test cannot call. */
+  exit: (code: number) => void;
+};
+
+/** POSIX convention: 128 + the signal number. */
+const EXIT_CODES = { SIGINT: 130, SIGTERM: 143 } as const;
+
+export type StopSignal = keyof typeof EXIT_CODES;
+
+/**
+ * Shut down in dependency order — stop accepting requests, stop the socket, stop alerting, close the
+ * store — then exit.
+ *
+ * Every step is guarded on its own: a hung socket or an already-closed handle must not be the reason
+ * the database never gets closed, and the exit code is the signal's whatever happened along the way.
+ * A container is about to SIGKILL us regardless; the only real goal is a clean SQLite close.
+ */
+export async function shutdown(deps: ShutdownDeps, signal: StopSignal): Promise<void> {
+  const { logger: log } = deps;
+  log.info({ signal }, "main: shutting down");
+
+  await step(log, "http", () => deps.http.close());
+  await step(log, "connection", () => deps.conn.stop());
+  await step(log, "alerts", () => {
+    deps.alerter.stop();
+    return Promise.resolve();
+  });
+  await step(log, "database", () => {
+    closeDb(deps.db);
+    return Promise.resolve();
+  });
+
+  deps.exit(EXIT_CODES[signal]);
+}
+
+async function step(log: Logger, what: string, run: () => Promise<void>): Promise<void> {
+  try {
+    await run();
+  } catch (err) {
+    log.warn({ err, what }, "main: a shutdown step failed");
+  }
+}
+
+export async function bootstrap(): Promise<void> {
+  const config = loadConfig(process.env);
+  const db = openDb(config.dbPath);
+
+  const chats = makeChatsRepo(db);
+  const contacts = makeContactsRepo(db);
+  const messages = makeMessagesRepo(db);
+  const reactions = makeReactionsRepo(db);
+  const meta = makeMetaRepo(db);
+  const auth = makeAuthStore(db);
+
+  /**
+   * The socket's `getMessage` contract, backed by the store (Risk 3).
+   *
+   * The one adapter in this file: Baileys hands a raw key, the repository wants a canonical chat id,
+   * and `canonicalId` is the only thing allowed to bridge the two (Global Constraint 11).
+   */
+  const loadMessage = (key: WAMessageKey): Promise<Uint8Array | undefined> => {
+    const { remoteJid, id } = key;
+    if (remoteJid == null || remoteJid === "" || id == null || id === "") return Promise.resolve(undefined);
+    return Promise.resolve(messages.getRaw(canonicalId(remoteJid, { pnForLid: contacts.pnForLid }), id));
+  };
+
+  /**
+   * The one cycle in the wiring. `ingest` needs the account's own id to decide `from_me`, and that
+   * id does not exist until the connection has opened; `conn` needs `ingest.attach` to give every
+   * new socket its listeners. A `let` plus a closure that reads the connection *at call time* is the
+   * whole resolution — a container or a service locator would be a much larger machine for one edge.
+   */
+  let live: WaConnection | undefined = undefined;
+  const selfId = (): string | null => live?.snapshot().selfId ?? null;
+
+  const ingest = makeIngest({ db, chats, contacts, messages, reactions, logger, selfId });
+  const conn = makeConnection({ config, logger, auth, loadMessage, onSocket: ingest.attach });
+  live = conn;
+
+  const sender = makeSender({
+    conn,
+    ingest,
+    messages,
+    chats,
+    contacts,
+    maxUploadBytes: config.maxUploadBytes,
+    sendFileDir: config.sendFileDir,
+  });
+  const media = makeMediaStore({ dir: config.mediaDir, messages, conn, logger });
+  const transcriber = makeTranscriber({ config, logger });
+
+  const alerter = makeAlerter({ config, logger });
+  conn.onStateChange(alerter.onState);
+
+  const ctx: ToolContext = {
+    config,
+    logger,
+    chats,
+    contacts,
+    messages,
+    reactions,
+    meta,
+    conn,
+    sender,
+    media,
+    transcriber,
+  };
+
+  const http = await startHttp({
+    config,
+    logger,
+    buildServer: () => buildMcpServer(ctx),
+    health: () => buildHealth(ctx),
+  });
+
+  installProcessHandlers({ logger, http, conn, alerter, db, exit: (code) => process.exit(code) });
+
+  // Fire and forget: it proves the ntfy token and the egress work before the first real incident,
+  // and it must not delay the connection if ntfy is slow or down.
+  void alerter.selfTest();
+
+  await conn.start();
+  logger.info({ readOnly: config.readOnly, dataDir: config.dataDir }, "main: started");
+}
+
+function installProcessHandlers(deps: ShutdownDeps): void {
+  let shuttingDown = false;
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.once(signal, () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      void shutdown(deps, signal);
+    });
+  }
+  // Logged, never fatal — see the failure policy at the top of this file.
+  process.on("uncaughtException", (err) => {
+    deps.logger.error({ err }, "main: uncaught exception (the server stays up)");
+  });
+  process.on("unhandledRejection", (reason) => {
+    deps.logger.error({ err: reason }, "main: unhandled rejection (the server stays up)");
+  });
+}
+
+/** True only when this file is what node was told to run — so a test may import it safely. */
+function isEntrypoint(): boolean {
+  const argv = process.argv[1];
+  return argv !== undefined && import.meta.url === pathToFileURL(argv).href;
+}
+
+if (isEntrypoint()) {
+  try {
+    await bootstrap();
+  } catch (err) {
+    logger.error({ err }, "main: failed to start");
+    process.exit(1);
+  }
+}
