@@ -1674,7 +1674,9 @@ State machine rules, each pinned by a test above:
 
 1. `start()` sets `connecting` and builds a socket; `onSocket(sock)` is called before any listener of ours, so ingest sees every event.
 2. `connection.update` with `connection === "open"` → `connected`, `attempts = 0`, `lastConnectedAt = now`.
-3. `connection.update` carrying a `qr` → if `config.phoneNumber` is set and we have not yet requested a code **for this socket**, call `requestPairingCode(phoneNumber)` and log the result prominently (`logger.info({ pairingCode }, "…")`, and a plain `console.log` banner so it is unmissable in Portainer). Set `pairing`. Guard with a per-socket boolean — the QR rotates every ~20 s and each rotation re-emits.
+3. `connection.update` carrying a `qr` → if `config.phoneNumber` is set and we have not yet requested a code **for this socket**, call `requestPairingCode(phoneNumber)` and log the result prominently (`logger.info({ pairingCode }, "…")`, and a plain `console.log` banner so it is unmissable in Portainer). Set `pairing`. Guard per-socket — the QR rotates every ~20 s and each rotation re-emits.
+
+   **If `config.phoneNumber` is NOT set, log an error naming the variable, once per socket.** Decision 5 chose pairing-by-code and deliberately renders no QR, so an operator who deploys without `WA_PHONE_NUMBER` otherwise gets a server that sits in `pairing` forever with nothing to act on and no diagnostic — the QR string is received and discarded. The message must say plainly that pairing requires `WA_PHONE_NUMBER` (E.164, no `+`) and that the server will keep waiting until it is set. Do not log the QR payload itself: it is a live credential that would let anyone reading the logs link their own device. (Found by review during Task 7.)
 4. `connection.update` with `connection === "close"`: read `statusCode` from `(lastDisconnect?.error as Boom)?.output?.statusCode`.
    - `DisconnectReason.loggedOut` (401) → `logged_out`, `auth.clear()`, **no** retry.
    - `DisconnectReason.restartRequired` (515) → recreate the socket immediately, staying at `connecting`, without incrementing `attempts`.
