@@ -23,7 +23,11 @@ Every task's requirements implicitly include this section. Copied verbatim from 
 7. **No native npm modules in the *runtime* dependency tree.** Storage is `node:sqlite` (built in). Image work is `jimp` (pure JS). `whatsapp-rust-bridge`, pulled in by baileys, is Rust→WebAssembly and is fine. Do not add `sharp`, `better-sqlite3`, or any runtime package with a compile or prebuild step. This constraint is scoped to `dependencies` deliberately: `devDependencies` already contain `tsx`, which ships prebuilt esbuild binaries, and that is fine — it never enters the image, which installs with `pnpm prune --prod`.
 8. **Baileys is pinned exactly:** `"baileys": "7.0.0-rc14"` — no caret, no tilde. It is a prerelease and rc→rc has broken APIs before.
 9. **Naming:** every MCP tool is `wa_*`; the package is `wa-mcp`.
-10. **No `WACLI_` anywhere.** Not an env var, not an identifier, not a string, not a comment, in any file that survives.
+10. **No `WACLI_` in production code.** Not an env var read, not an identifier, not a string, not a comment, in any non-test file that survives. **Test files may name the old variables** for the single purpose of asserting they are *ignored* — `src/config.test.ts`'s "no WACLI_ variable is consulted" is the intended and only such use. Scoped the same way as Constraint 11, and for the same reason: the constraint is about behaviour, and a test that pins the absence of a behaviour has to name it. The check is therefore:
+    ```bash
+    grep -rn 'WACLI\|wacli' src/ --include='*.ts' | grep -v '\.test\.ts:'
+    ```
+    Expected: nothing.
 11. **All raw JID interpretation lives in `src/wa/jid.ts`.** No other module may contain the substrings `@lid`, `@s.whatsapp.net`, or `@g.us`, or split a JID on `@` or `:`. This is the single most important structural rule in the codebase — see Risk 1.
 12. **`src/mcp/tools/*` must not import from `baileys`.** Tool handlers talk to repositories, `wa/send.ts`, and `media/*`. Baileys types stop at the `wa/` and `media/` boundary.
 13. **Read tools work in every connection state.** They query SQLite and must never touch the socket. Only write tools and the media pipeline may require a live connection.
