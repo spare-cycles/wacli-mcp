@@ -1948,6 +1948,10 @@ and map `type` onto our `MessageKind`. `extractText` reads, in order: `content.c
 
 Step 8's "newly inserted" condition is what makes the idempotency test pass: have `messages.upsert` return a boolean `inserted` (add it to the `MessagesRepo` signature in Task 5 — `upsert(m): boolean`) rather than counting blind. **Update Task 5's interface accordingly; this is the one cross-task signature to keep in sync.**
 
+**Step 8's unread bump is suppressed on the history path.** `messaging-history.set` carries the server-authoritative `Chat.unreadCount`, which the chat half of the batch has already written. Bumping again per inbound message on top of it makes a chat WhatsApp reports as fully read surface an unread count equal to its inbound history depth — visible directly in `wa_chats_list`. So `ingestMessages` takes an option (`{ bumpUnread: false }`) that the history path passes and the live `messages.upsert` path does not; `chats.touch` and `clearUnread` still run either way. The live path keeps the unconditional bump because it covers both `notify` and the offline `append` drain, which really are unread. (Found by review during Task 8.)
+
+**The per-chunk transaction needs a test that fails when it is removed.** It is the sole justification for handing `IngestDeps` the raw `db`, and neither a row count nor the per-message try/catch observes it — both stay green if `inTransaction`'s body is replaced by a bare `fn()`. Cover it with a failure raised *outside* `ingestMessage`'s own catch (a repo stub that throws on the 501st row) asserting chunk 1 survived and chunk 2 did not.
+
 Wrap the whole body in try/catch; on error log `{ err, messageId }` at warn and return.
 
 - [ ] **Step 5: Run the test, see it pass**
