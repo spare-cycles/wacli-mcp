@@ -21,7 +21,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { ChatListFilter, ChatRow } from "../../db/chats.js";
+import type { ChatListFilter } from "../../db/chats.js";
 import type { MessageListFilter, MessageRow, SearchHit } from "../../db/messages.js";
 import { canonicalId } from "../../wa/jid.js";
 import type { ToolContext } from "../context.js";
@@ -132,7 +132,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
       description:
         "WhatsApp server health: connection state, whether pairing is needed, seconds since the last socket " +
         `event, row counts in the local store, schema version, and whether transcription can run. ${OFFLINE} ` +
-        '`ok` is false only when the account has been logged out, which needs a human to re-pair."',
+        "`ok` is false only when the account has been logged out, which needs a human to re-pair.",
       inputSchema: {},
       annotations: READ_ONLY_TOOL,
     },
@@ -187,7 +187,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
     ({ limit, cursor }) => {
       try {
         const filter: ChatListFilter = { isGroup: true };
-        const { rows, nextCursor } = paginate<ChatRow>(cursor, limit, (l, o) => ctx.chats.list(filter, l, o));
+        const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.chats.list(filter, l, o));
         return page(
           rows.map((c) => presentChat(c, ctx)),
           nextCursor,
