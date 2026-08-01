@@ -1,4 +1,4 @@
-import type { BaileysEventMap, WAMessage, WASocket } from "baileys";
+import { WAMessageStatus, type BaileysEventMap, type WAMessage, type WASocket } from "baileys";
 import { strict as assert } from "node:assert";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -9,7 +9,7 @@ import type { Logger } from "pino";
 import { makeChatsRepo } from "../db/chats.js";
 import { openDb } from "../db/client.js";
 import { makeContactsRepo } from "../db/contacts.js";
-import { makeMessagesRepo } from "../db/messages.js";
+import { makeMessagesRepo, type MessageInput, type MessagesRepo } from "../db/messages.js";
 import { makeReactionsRepo } from "../db/reactions.js";
 import * as fx from "./fixtures.js";
 import { classify, extractText, makeIngest } from "./ingest.js";
@@ -48,6 +48,49 @@ function harness(selfId: () => string | null = () => SELF) {
   } as unknown as Logger;
   const ingest = makeIngest({ db, ...repos, logger, selfId });
   return { db, ...repos, ingest };
+}
+
+/**
+ * A harness whose `messages.upsert` throws on its `failOnCall`-th call, and whose `logger.warn`
+ * rethrows what `ingestMessage`'s own catch hands it.
+ *
+ * That catch exists to skip one malformed *message*, and it contains every failure it can see — so
+ * a failure has to escape it to reach the chunk boundary at all, and rethrowing from the logger is
+ * how this harness produces one. What it stands in for is a store that is failing rather than a
+ * payload that is malformed, which is the only thing the per-chunk transaction can protect
+ * against, and the only way any assertion in this suite observes that transaction.
+ */
+function failingHarness(failOnCall: number) {
+  const db = openDb(join(dir, `i${n++}.db`));
+  const messages = makeMessagesRepo(db);
+  let calls = 0;
+  const failing: MessagesRepo = {
+    ...messages,
+    upsert: (m: MessageInput) => {
+      calls += 1;
+      if (calls === failOnCall) throw new Error("the store is failing");
+      return messages.upsert(m);
+    },
+  };
+  const logger = {
+    info: () => undefined,
+    debug: () => undefined,
+    error: () => undefined,
+    warn: (fields: { err: Error }) => {
+      throw fields.err;
+    },
+  } as unknown as Logger;
+  const chats = makeChatsRepo(db);
+  const ingest = makeIngest({
+    db,
+    chats,
+    contacts: makeContactsRepo(db),
+    messages: failing,
+    reactions: makeReactionsRepo(db),
+    logger,
+    selfId: () => SELF,
+  });
+  return { chats, messages, ingest };
 }
 
 /** A socket stub carrying nothing but the event emitter `attach` subscribes to. */
@@ -251,10 +294,38 @@ void test("ingesting the same message twice is idempotent", () => {
   assert.equal(h.chats.get(DM)?.unreadCount, 1, "a redelivery must not double-count unread");
 });
 
-void test("ingestMessages is atomic and handles a history batch", () => {
+void test("a redelivery cannot walk a stored status backwards", () => {
+  const h = harness();
+  const read = { ...fx.textMessage({ id: "M1", fromMe: true }), status: WAMessageStatus.READ };
+  h.ingest.ingestMessage(read);
+  assert.equal(h.messages.get(DM, "M1")?.status, "read");
+
+  h.ingest.ingestMessage({ ...read, status: WAMessageStatus.PENDING });
+  assert.equal(h.messages.get(DM, "M1")?.status, "read", "a redelivered PENDING must not replace a stored `read`");
+});
+
+void test("ingestMessages writes every message of a batch", () => {
   const h = harness();
   h.ingest.ingestMessages([fx.textMessage({ id: "A", ts: 1 }), fx.textMessage({ id: "B", ts: 2 })]);
   assert.equal(h.messages.count(), 2);
+});
+
+void test("a chunk that fails rolls back whole, and the chunk before it survives", () => {
+  // 502 messages: chunk 1 is H0..H499 and commits, chunk 2 is H500..H501 and fails on its *second*
+  // row. Failing on its first would leave nothing to roll back, so the assertions below would hold
+  // with or without the transaction.
+  const h = failingHarness(502);
+  const ms = Array.from({ length: 502 }, (_, i) => fx.textMessage({ id: `H${String(i)}`, ts: 1_700_000_000 + i }));
+  assert.throws(
+    () => {
+      h.ingest.ingestMessages(ms);
+    },
+    /the store is failing/,
+    "a failure the per-message guard cannot absorb must reach the caller, not be half-applied",
+  );
+  assert.equal(h.messages.count(), 500, "the failing chunk rolls back whole; the one before it is already committed");
+  assert.equal(h.messages.get(DM, "H499")?.id, "H499", "a committed chunk survives the failure of the next");
+  assert.equal(h.messages.get(DM, "H500"), undefined, "a row written before the failure must not outlive its chunk");
 });
 
 void test("a malformed message is logged and skipped, not thrown", () => {
@@ -345,6 +416,32 @@ void test("messages.update maps a status code to a name and never moves it backw
   assert.equal(h.messages.get(DM, "M1")?.status, "read", "a late per-device ack must not un-read a message");
 });
 
+void test("an error is written only while nothing has acknowledged the message", () => {
+  const h = harness();
+  const s = socket();
+  h.ingest.attach(s.sock);
+  const fail = (id: string) => {
+    s.emit("messages.update", [
+      { key: { remoteJid: DM, id, fromMe: true }, update: { status: WAMessageStatus.ERROR } },
+    ]);
+  };
+
+  h.ingest.ingestMessage(fx.textMessage({ id: "M1", fromMe: true }));
+  s.emit("messages.update", [
+    { key: { remoteJid: DM, id: "M1", fromMe: true }, update: { status: WAMessageStatus.READ } },
+  ]);
+  fail("M1");
+  assert.equal(h.messages.get(DM, "M1")?.status, "read", "one failed per-device delivery must not un-read a message");
+
+  h.ingest.ingestMessage(fx.textMessage({ id: "M2", fromMe: true }));
+  fail("M2");
+  assert.equal(h.messages.get(DM, "M2")?.status, "error", "with nothing stored, the failure is the news");
+
+  h.ingest.ingestMessage({ ...fx.textMessage({ id: "M3", fromMe: true }), status: WAMessageStatus.PENDING });
+  fail("M3");
+  assert.equal(h.messages.get(DM, "M3")?.status, "error", "a message still pending has acknowledged nothing either");
+});
+
 void test("message-receipt.update sets status and never creates a row", () => {
   const h = harness();
   const s = socket();
@@ -427,6 +524,21 @@ void test("contacts.upsert keys the row by the phone identity and stores bare lo
   assert.equal(h.contacts.pnForLid("999"), DM, "and that makes canonicalId resolve the LID from then on");
 });
 
+void test("a contact carrying both identities folds a chat already ingested under the LID", () => {
+  const h = harness();
+  const s = socket();
+  h.ingest.attach(s.sock);
+  h.ingest.ingestMessage(fx.lidMessage({ chat: "999@lid", id: "L1", text: "coucou" }));
+  s.emit("contacts.upsert", [{ id: "999@lid", lid: "999@lid", phoneNumber: DM, name: "Alice" }]);
+  assert.equal(
+    h.chats.get("999@lid"),
+    undefined,
+    "the pair a contact reveals must fold the LID chat, as a mapping does",
+  );
+  assert.equal(h.messages.get(DM, "L1")?.text, "coucou", "and its messages come along");
+  assert.equal(h.contacts.get(DM)?.name, "Alice");
+});
+
 void test("contacts.update keeps a LID-only contact under its LID id", () => {
   const h = harness();
   const s = socket();
@@ -463,6 +575,31 @@ void test("messaging-history.set ingests mappings, contacts, chats and messages"
     DM,
     "the mappings in the same payload must be applied before its messages",
   );
+});
+
+void test("a history sync leaves the server's unread count alone; the live path bumps it", () => {
+  const inbound = () => [
+    fx.textMessage({ id: "H1", ts: 1_700_000_001 }),
+    fx.textMessage({ id: "H2", ts: 1_700_000_002 }),
+    fx.textMessage({ id: "H3", ts: 1_700_000_003 }),
+  ];
+
+  const history = harness();
+  const hs = socket();
+  history.ingest.attach(hs.sock);
+  hs.emit("messaging-history.set", { chats: [{ id: DM, unreadCount: 0 }], contacts: [], messages: inbound() });
+  assert.equal(history.messages.count(), 3);
+  assert.equal(
+    history.chats.get(DM)?.unreadCount,
+    0,
+    "the chat half of the batch carries the server's own count; the messages must not bump it",
+  );
+
+  const live = harness();
+  const ls = socket();
+  live.ingest.attach(ls.sock);
+  ls.emit("messages.upsert", { messages: inbound(), type: "notify" });
+  assert.equal(live.chats.get(DM)?.unreadCount, 3, "the same messages arriving live really are unread");
 });
 
 void test("messaging-history.set ingests a payload larger than one chunk", () => {

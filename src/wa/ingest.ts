@@ -47,12 +47,27 @@ export type IngestDeps = {
   selfId: () => string | null;
 };
 
+/** Per-batch ingest policy. */
+export type IngestOptions = {
+  /**
+   * Whether a newly-inserted inbound message bumps its chat's unread count. Defaults to true, which
+   * is what the live `messages.upsert` path wants: it carries both `notify` and the offline
+   * `append` drain, and both really are unread.
+   *
+   * `messaging-history.set` passes false. That payload carries the server-authoritative
+   * `Chat.unreadCount`, which the chat half of the same batch has already written; bumping once per
+   * inbound message on top of it would leave a chat WhatsApp reports as fully read showing an
+   * unread count equal to its inbound history depth.
+   */
+  bumpUnread?: boolean | undefined;
+};
+
 export type Ingest = {
   /** Wire every listener onto a freshly created socket. */
   attach: (sock: WASocket) => void;
   /** Ingest one message. Exported so send.ts can re-ingest what it produced. */
   ingestMessage: (m: WAMessage) => void;
-  ingestMessages: (ms: readonly WAMessage[]) => void;
+  ingestMessages: (ms: readonly WAMessage[], opts?: IngestOptions) => void;
 };
 
 /**
@@ -95,8 +110,14 @@ const STATUS_NAMES: Record<number, string> = {
   [WAMessageStatus.PLAYED]: "played",
 };
 
-/** Delivery states only ever move forwards; "error" is unranked and always worth surfacing. */
-const STATUS_RANK: Record<string, number> = { pending: 1, sent: 2, delivered: 3, read: 4, played: 5 };
+/** The lowest rung: a message nothing has acknowledged yet. Named because `advanceStatus` keys on it. */
+const PENDING_RANK = 1;
+
+/**
+ * Delivery states only ever move forwards. `"error"` is deliberately absent: it is not a rung on
+ * this ladder, and `advanceStatus` governs it by a separate rule.
+ */
+const STATUS_RANK: Record<string, number> = { pending: PENDING_RANK, sent: 2, delivered: 3, read: 4, played: 5 };
 
 /**
  * Wire control, never conversation. Baileys routes a revoke, an edit and a reaction through
@@ -160,6 +181,22 @@ function receiptStatus(receipt: proto.IUserReceipt): string | undefined {
   return undefined;
 }
 
+/**
+ * The lid↔pn pair a contact reveals by carrying both identities, in the raw JID form
+ * `contacts.linkIdentity` takes, or undefined when it names only one identity. A contact carrying
+ * both *is* a mapping — the same fact `lid-mapping.update` and `messaging-history.set`'s
+ * `lidPnMappings` deliver — and recording it is what folds a conversation already ingested under
+ * the LID id.
+ */
+function lidPnPairOf(c: Partial<Contact>): LIDMapping | undefined {
+  const rawId = c.id;
+  if (rawId == null || rawId === "") return undefined;
+  const lid = c.lid ?? rawId;
+  const pn = c.phoneNumber ?? rawId;
+  if (lidFromJid(lid) === undefined || phoneFromJid(pn) === undefined) return undefined;
+  return { lid, pn };
+}
+
 function quotedIdOf(content: WAMessageContent | undefined): string | undefined {
   if (content === undefined) return undefined;
   const type = getContentType(content);
@@ -197,6 +234,15 @@ export function makeIngest(deps: IngestDeps): Ingest {
     return id === null ? undefined : canonical(id);
   }
 
+  /**
+   * The whole of this module's SQL, and the one invariant it imposes on everything reachable from
+   * `fn`: **SQLite has no nested transactions.** A `BEGIN` issued while one is already open fails
+   * with "cannot start a transaction within a transaction", so no repository call that opens its
+   * own may be made from inside `fn` — today that means `contacts.upsertMany`
+   * (`db/contacts.ts:156`) and `contacts.linkIdentity` (`db/contacts.ts:204`), neither of which may
+   * ever be called from `applyChat`, `ingestMessage`, or anything they reach. Contact and identity
+   * work therefore runs outside the chunk loop; see `applyHistory` and `upsertContacts`.
+   */
   function inTransaction(fn: () => void): void {
     db.exec("BEGIN");
     try {
@@ -208,7 +254,10 @@ export function makeIngest(deps: IngestDeps): Ingest {
     }
   }
 
-  /** One transaction per chunk: bounded rollback, bounded commit cost. */
+  /**
+   * One transaction per chunk: bounded rollback, bounded commit cost. `apply` runs inside that
+   * transaction and must not open one of its own — see `inTransaction`.
+   */
   function runChunked<T>(items: readonly T[], label: string, apply: (item: T) => void): void {
     if (items.length === 0) return;
     const chunks = Math.ceil(items.length / CHUNK_SIZE);
@@ -257,7 +306,28 @@ export function makeIngest(deps: IngestDeps): Ingest {
     return chatId;
   }
 
-  function ingestMessage(m: WAMessage): void {
+  /**
+   * Write a delivery status only when it is news, never when it would undo what is stored.
+   *
+   * `message-receipt.update` must never create a row, and per-device receipts in a group arrive
+   * interleaved — Bob's "delivered" lands after Alice's "read" and must not undo it. Ranked states
+   * therefore only ever move forwards. `"error"` is not ranked: a single failed per-device delivery
+   * must not demote a message the other recipients have already read, so it is written only while
+   * nothing has acknowledged the message yet — no stored status, or one still at `pending`.
+   */
+  function advanceStatus(chatId: string, id: string, status: string): void {
+    const row = messages.get(chatId, id);
+    if (row === undefined) return;
+    const currentRank = row.status === null ? 0 : (STATUS_RANK[row.status] ?? 0);
+    const nextRank = STATUS_RANK[status];
+    if (nextRank === undefined) {
+      // Unranked — in practice only "error".
+      if (currentRank > PENDING_RANK) return;
+    } else if (nextRank <= currentRank) return;
+    messages.setStatus(chatId, id, status);
+  }
+
+  function ingestMessage(m: WAMessage, opts: IngestOptions = {}): void {
     let messageId: string | undefined;
     try {
       const key = m.key;
@@ -289,22 +359,33 @@ export function makeIngest(deps: IngestDeps): Ingest {
         kind: kindOf(content),
         text: textOf(content),
         quotedId: quotedIdOf(content),
-        status: m.status == null ? undefined : STATUS_NAMES[m.status],
+        // `status` is deliberately not part of this payload: the upsert's ON CONFLICT does
+        // `status = COALESCE(excluded.status, messages.status)` (`db/messages.ts`), so a
+        // redelivery carrying PENDING would *replace* a stored `read`. It goes through
+        // `advanceStatus` below instead — the same monotonic guard every other path uses.
+
         // The encoded envelope, byte-faithful, because the socket's getMessage contract is served
         // from it (Risk 3). Task 7 decodes it and unwraps `.message`; keep the two in step.
         raw: proto.WebMessageInfo.encode(m).finish(),
       });
 
+      const status = m.status == null ? undefined : STATUS_NAMES[m.status];
+      if (status !== undefined) advanceStatus(chatId, messageId, status);
+
       chats.touch(chatId, ts);
       if (fromMe) chats.clearUnread(chatId);
-      else if (inserted) chats.bumpUnread(chatId, 1);
+      // `bumpUnread` defaults to true and is suppressed only by the history path, which has
+      // already written the server's own count for this chat. See `IngestOptions`.
+      else if (inserted && (opts.bumpUnread ?? true)) chats.bumpUnread(chatId, 1);
     } catch (err) {
       logger.warn({ err, messageId }, "ingest: failed to ingest message");
     }
   }
 
-  function ingestMessages(ms: readonly WAMessage[]): void {
-    runChunked(ms, "messages", ingestMessage);
+  function ingestMessages(ms: readonly WAMessage[], opts: IngestOptions = {}): void {
+    runChunked(ms, "messages", (m) => {
+      ingestMessage(m, opts);
+    });
   }
 
   /** The new content of an edit, or undefined when this update is not an edit. */
@@ -318,17 +399,6 @@ export function makeIngest(deps: IngestDeps): Ingest {
       return normalizeMessageContent(protocolMessage.editedMessage);
     }
     return undefined;
-  }
-
-  function advanceStatus(chatId: string, id: string, status: string): void {
-    // `message-receipt.update` must never create a row, and per-device receipts in a group arrive
-    // interleaved — Bob's "delivered" lands after Alice's "read" and must not undo it.
-    const row = messages.get(chatId, id);
-    if (row === undefined) return;
-    const nextRank = STATUS_RANK[status] ?? 0;
-    const currentRank = row.status === null ? 0 : (STATUS_RANK[row.status] ?? 0);
-    if (nextRank !== 0 && nextRank <= currentRank) return;
-    messages.setStatus(chatId, id, status);
   }
 
   function applyMessageUpdate({ key, update }: BaileysEventMap["messages.update"][number]): void {
@@ -447,10 +517,19 @@ export function makeIngest(deps: IngestDeps): Ingest {
 
   function upsertContacts(cs: readonly Partial<Contact>[]): void {
     const inputs: ContactInput[] = [];
+    const pairs: LIDMapping[] = [];
     for (const c of cs) {
       const input = toContactInput(c);
-      if (input !== undefined) inputs.push(input);
+      if (input === undefined) continue;
+      const pair = lidPnPairOf(c);
+      if (pair !== undefined) pairs.push(pair);
+      inputs.push(input);
     }
+    // Mappings first, as in `applyHistory`: folding the LID conversation before writing the
+    // contact means a chat already ingested under the LID id is merged now rather than only when
+    // some future message happens to resolve. Both loops open their own transactions, so this runs
+    // outside any chunk — see `inTransaction`.
+    for (const pair of pairs) applyLidMapping(pair);
     contacts.upsertMany(inputs);
   }
 
@@ -476,7 +555,10 @@ export function makeIngest(deps: IngestDeps): Ingest {
     for (const mapping of h.lidPnMappings ?? []) applyLidMapping(mapping);
     upsertContacts(h.contacts);
     runChunked(h.chats, "chats", applyChat);
-    ingestMessages(h.messages);
+    // No unread bump on this path: `applyChat` has just written the server's own `unreadCount` for
+    // every chat in the batch, and bumping per inbound message on top of it would report a chat
+    // WhatsApp calls read as having as many unreads as it has inbound history. See `IngestOptions`.
+    ingestMessages(h.messages, { bumpUnread: false });
   }
 
   // --- wiring ------------------------------------------------------------------------------
