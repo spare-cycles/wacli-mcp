@@ -33,6 +33,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
+    "@hapi/boom": "9.1.4",
     "@types/express": "^5.0.0",
     "@types/node": "^24.0.0",
     "eslint": "^9.13.0",
