@@ -18,6 +18,14 @@
  * **`shutdown()` is tested, because it has a real failure mode.** It runs on the way out with things
  * already breaking, and the property that matters is that one broken step does not skip the ones
  * after it — above all the SQLite close, which is the only step whose omission leaves state behind.
+ *
+ * **`installProcessHandlers()` is tested through a `process` seam, not through a child process.**
+ * The claim is a negative — `uncaughtException` and `unhandledRejection` are logged and the process
+ * *stays up* — and a child process can only evidence a negative by not having died yet, which is a
+ * race dressed as an assertion and needs a spawn, a pipe and a timeout to say less. A fake with
+ * `once`/`on` fires both handlers synchronously and lets the test assert the thing that actually
+ * matters: `deps.exit` was never called. `process` satisfies `ProcessEvents` structurally, so the
+ * production path passes the real one and there is no adapter to be wrong.
  */
 
 import { strict as assert } from "node:assert";
@@ -25,11 +33,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { setImmediate as tick } from "node:timers/promises";
 import type { Logger } from "pino";
 import type { Alerter } from "./alerts.js";
 import { openDb, type Db } from "./db/client.js";
 import type { HttpHandle } from "./http.js";
-import { shutdown, type ShutdownDeps } from "./main.js";
+import { installProcessHandlers, shutdown, type ProcessEvents, type ShutdownDeps } from "./main.js";
 import type { WaConnection } from "./wa/connection.js";
 
 const root = mkdtempSync(join(tmpdir(), "wa-main-"));
@@ -146,6 +155,60 @@ void test("SIGINT exits 130", async () => {
   await shutdown(r.deps, "SIGINT");
 
   assert.deepEqual(r.exits, [130]);
+});
+
+/** Records what was registered and fires it on demand. Nothing here touches the real `process`. */
+function fakeProcess(): { proc: ProcessEvents; emit: (event: string, arg?: unknown) => void; events: string[] } {
+  const handlers = new Map<string, (arg: unknown) => void>();
+  const events: string[] = [];
+  const register = (event: string, listener: (arg: unknown) => void): void => {
+    events.push(event);
+    handlers.set(event, listener);
+  };
+  return {
+    proc: { once: register, on: register },
+    emit: (event, arg) => {
+      const handler = handlers.get(event);
+      assert.ok(handler, `nothing was registered for ${event}`);
+      handler(arg);
+    },
+    events,
+  };
+}
+
+void test("an uncaught exception and an unhandled rejection are logged, and neither exits", () => {
+  const r = rig();
+  const p = fakeProcess();
+
+  installProcessHandlers(r.deps, p.proc);
+  assert.deepEqual(p.events, ["SIGINT", "SIGTERM", "uncaughtException", "unhandledRejection"]);
+
+  p.emit("uncaughtException", new Error("a tool threw where nobody was catching"));
+  p.emit("unhandledRejection", new Error("a promise nobody awaited"));
+
+  // The deliberate inversion of the retired stdio server: this process holds the only WhatsApp
+  // connection in the deployment and serves every client over HTTP, so dying over one bad request
+  // would drop the socket, the ingest stream and every other session with it.
+  assert.deepEqual(r.exits, [], "the server stays up");
+  const errors = r.entries.filter((e) => e.level === "error");
+  assert.equal(errors.length, 2, "both are reported, at error");
+  assert.ok(
+    errors.every((e) => e.msg.includes("the server stays up")),
+    "and each says so, so a log reader is not left wondering whether it died",
+  );
+});
+
+void test("a second signal does not start a second shutdown", async () => {
+  const r = rig();
+  const p = fakeProcess();
+  installProcessHandlers(r.deps, p.proc);
+
+  p.emit("SIGTERM");
+  p.emit("SIGTERM");
+  await tick();
+
+  assert.deepEqual(r.order, ["http", "conn", "alerter"], "each step ran exactly once");
+  assert.deepEqual(r.exits, [143]);
 });
 
 void test("a step that throws does not skip the ones after it", async () => {

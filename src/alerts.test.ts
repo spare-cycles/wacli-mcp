@@ -119,6 +119,10 @@ function titleOf(call: Publish | undefined): string {
   return typeof call?.body["title"] === "string" ? call.body["title"] : "";
 }
 
+function messageOf(call: Publish | undefined): string {
+  return typeof call?.body["message"] === "string" ? call.body["message"] : "";
+}
+
 function activeTimeouts(): number {
   return process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
 }
@@ -237,6 +241,44 @@ void test("logged_out alerts immediately, without waiting for the grace", () => 
   assert.match(titleOf(calls[2]), /reconnected/i);
 
   alerter.stop();
+});
+
+void test("a pairing episode is paged as unpaired, not as a disconnection", () => {
+  const clock = fakeClock();
+  const { impl, calls } = stubFetch();
+  const { logger } = captureLogger();
+  const alerter = alerterUnder(clock, impl, logger);
+
+  // The first-boot sequence, exactly as `wa/connection.ts` produces it: `createSocket` sets
+  // `connecting`, then the first QR sets `pairing`. So the state that *opens* the episode is the
+  // uninformative one, and a notice built from it alone would say "disconnected" about a server
+  // that has simply never been linked.
+  alerter.onState("connecting");
+  alerter.onState("pairing");
+  assert.deepEqual(clock.delays(), [GRACE_MS], "still one episode, still one grace timer");
+
+  clock.fire();
+
+  assert.equal(calls.length, 1);
+  assert.match(titleOf(calls[0]), /pair/i);
+  assert.doesNotMatch(titleOf(calls[0]), /disconnected/i);
+  assert.match(messageOf(calls[0]), /WA_PHONE_NUMBER/, "and it names what unblocks it");
+  assert.match(messageOf(calls[0]), /pairing code/i);
+
+  // A real disconnection still reads as one — the two notices are not interchangeable.
+  const other = fakeClock();
+  const second = stubFetch();
+  const { logger: otherLogger } = captureLogger();
+  const dropped = alerterUnder(other, second.impl, otherLogger);
+  dropped.onState("disconnected");
+  other.fire();
+
+  assert.match(titleOf(second.calls[0]), /disconnected/i);
+  assert.notEqual(titleOf(second.calls[0]), titleOf(calls[0]));
+  assert.doesNotMatch(messageOf(second.calls[0]), /WA_PHONE_NUMBER/);
+
+  alerter.stop();
+  dropped.stop();
 });
 
 // --- configuration and secrets ------------------------------------------------------------------

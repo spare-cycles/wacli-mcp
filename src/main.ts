@@ -59,6 +59,19 @@ const EXIT_CODES = { SIGINT: 130, SIGTERM: 143 } as const;
 export type StopSignal = keyof typeof EXIT_CODES;
 
 /**
+ * The slice of `process` that `installProcessHandlers` touches, as a seam.
+ *
+ * Narrow on purpose: the point is to make the *failure policy* — the inversion described at the top
+ * of this file — assertable, and the only way to assert "and it did not exit" is to hand the
+ * registration a fake and then fire the handlers. `process` satisfies this structurally, so the
+ * production call passes the real one and nothing is adapted.
+ */
+export type ProcessEvents = {
+  once: (event: StopSignal, listener: () => void) => void;
+  on: (event: "uncaughtException" | "unhandledRejection", listener: (reason: unknown) => void) => void;
+};
+
+/**
  * Shut down in dependency order — stop accepting requests, stop the socket, stop alerting, close the
  * store — then exit.
  *
@@ -174,20 +187,20 @@ export async function bootstrap(): Promise<void> {
   logger.info({ readOnly: config.readOnly, dataDir: config.dataDir }, "main: started");
 }
 
-function installProcessHandlers(deps: ShutdownDeps): void {
+export function installProcessHandlers(deps: ShutdownDeps, proc: ProcessEvents = process): void {
   let shuttingDown = false;
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.once(signal, () => {
+    proc.once(signal, () => {
       if (shuttingDown) return;
       shuttingDown = true;
       void shutdown(deps, signal);
     });
   }
   // Logged, never fatal — see the failure policy at the top of this file.
-  process.on("uncaughtException", (err) => {
+  proc.on("uncaughtException", (err) => {
     deps.logger.error({ err }, "main: uncaught exception (the server stays up)");
   });
-  process.on("unhandledRejection", (reason) => {
+  proc.on("unhandledRejection", (reason) => {
     deps.logger.error({ err: reason }, "main: unhandled rejection (the server stays up)");
   });
 }

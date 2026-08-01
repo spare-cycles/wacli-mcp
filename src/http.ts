@@ -14,7 +14,14 @@
  *
  * Global Constraint 8 lives here more than anywhere: this module holds `WA_MCP_TOKEN`. It is never
  * logged, never echoed in a refusal, and no log line here carries request headers — which is where a
- * caller's credential would be found.
+ * caller's credential would be found. Nor does one carry a request *body*: no log line in this file
+ * is ever handed a raw error object, for the reason spelled out on `errorType`.
+ *
+ * The middleware order is load-bearing, and it is `/health` → auth → `express.json` on the MCP path
+ * → the MCP routes → the error middleware. Two of those placements are the whole point: `/health`
+ * ahead of the gate keeps the container healthcheck credential-free even at `MCP_HTTP_PATH=/`, and
+ * the parser behind the gate — mounted on the path rather than globally — is what stops an
+ * anonymous `POST /anything` from having ~90 MB buffered and parsed on its behalf.
  */
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
@@ -45,7 +52,7 @@ export type HttpHandle = {
   port: number;
 };
 
-type HttpSession = { transport: StreamableHTTPServerTransport; server: McpServer; lastSeen: number };
+type HttpSession = { transport: StreamableHTTPServerTransport; server: McpServer; lastSeenMs: number };
 
 /** The longest a sweep may be from the next, however long the session TTL is. */
 const SWEEP_INTERVAL_CAP_MS = 60_000;
@@ -106,6 +113,45 @@ function statusOf(err: unknown): number {
   return typeof code === "number" && code >= 400 && code <= 499 ? code : 500;
 }
 
+/**
+ * How a failure is classified in a log line, and the only field a *rejected request* contributes.
+ *
+ * **No log line in this file may be handed a raw error object.** body-parser hangs the entire raw
+ * payload off a parse failure (`createError(400, err, { body: str })`) and pino's standard error
+ * serializer copies `message`, `stack` and *every own enumerable key* — so one `{ err }` writes an
+ * arbitrary caller's body, bounded only by the ~90 MB parser limit, into the log. Two ways that
+ * bites: a malformed POST from anyone at all, and a legitimate `wa_send_file` whose base64 argument
+ * lands on disk the one time the client gets the envelope wrong.
+ *
+ * `message` is left out of the rejected-request line for the same reason, and it is not paranoia:
+ * V8 quotes the input it choked on (`Unexpected token 'L', "LEAKMARKER"... is not valid JSON`), so
+ * the message is a body echo too — shorter than `body`, and still attacker-controlled. `type` is
+ * body-parser's own classification (`entity.parse.failed`, `entity.too.large`), which is what
+ * actually tells an operator what went wrong and is a fixed vocabulary rather than caller input.
+ */
+function errorType(err: unknown): string {
+  if (typeof err === "object" && err !== null) {
+    const { type } = err as { type?: unknown };
+    if (typeof type === "string") return type;
+    if (err instanceof Error) return err.name;
+  }
+  return "unknown";
+}
+
+/**
+ * The whole error, field by field, for failures this server itself produced.
+ *
+ * Safe where `errorType` alone is not, because these are ours: `statusOf` sends every
+ * parser-decided failure — every error that can carry a caller's body — down the 4xx branch, so
+ * nothing that reaches a line built from this has ever seen the request payload. Picking the three
+ * fields explicitly rather than passing `err` keeps that true no matter what an error grows later.
+ */
+function errorDetail(err: unknown): { type: string; message: string; stack: string | undefined } {
+  const type = errorType(err);
+  if (err instanceof Error) return { type, message: err.message, stack: err.stack };
+  return { type, message: "a non-Error value was thrown", stack: undefined };
+}
+
 /** Adapt an async handler to Express while keeping every rejection contained and the 500 shape ours. */
 function wrap(logger: Logger, fn: (req: Request, res: Response) => Promise<void>): RequestHandler {
   return (req, res, next) => {
@@ -113,7 +159,7 @@ function wrap(logger: Logger, fn: (req: Request, res: Response) => Promise<void>
       // Hand it to the error middleware when nothing has been written yet, so there is exactly one
       // place that decides what a failed request looks like.
       if (res.headersSent) {
-        logger.error({ err, method: req.method }, "http: request failed after the response had started");
+        logger.error({ ...errorDetail(err), method: req.method }, "http: request failed after the response started");
         res.end();
         return;
       }
@@ -156,14 +202,18 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
 
   // Base64 in a `wa_send_file` argument is 4 bytes per 3, plus room for the rest of the envelope.
   const bodyLimitBytes = Math.ceil((config.maxUploadBytes * 4) / 3) + 1024 * 1024;
-  app.use(express.json({ limit: bodyLimitBytes }));
+  // Mounted on the MCP path, never globally, and after the gate above so the ordering still puts
+  // auth in front of parsing. Global, this buffers and parses that ~90 MB for `POST /anything` —
+  // from a caller who has presented no credential at all — before falling through to a 404. The
+  // only requests worth spending that on are the ones already through the gate.
+  app.use(config.httpPath, express.json({ limit: bodyLimitBytes }));
 
   // A client that stops polling never closes its stream, so `onclose` alone would leak its session
   // forever. Unref'd: a sweeper must not be the reason the process stays up.
   const sweeper = setInterval(() => {
-    const now = Date.now();
+    const nowMs = Date.now();
     for (const [id, session] of sessions) {
-      if (now - session.lastSeen > config.sessionTtlMs) {
+      if (nowMs - session.lastSeenMs > config.sessionTtlMs) {
         sessions.delete(id);
         void closeSession(session);
       }
@@ -176,7 +226,7 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
       await session.transport.close();
       await session.server.close();
     } catch (err) {
-      logger.warn({ err }, "http: error closing a session");
+      logger.warn(errorDetail(err), "http: error closing a session");
     }
   }
 
@@ -191,7 +241,7 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
           res.status(404).json(jsonRpcError(RPC_UNKNOWN_SESSION, "Unknown or expired session"));
           return;
         }
-        existing.lastSeen = Date.now();
+        existing.lastSeenMs = Date.now();
         await existing.transport.handleRequest(req, res, body);
         return;
       }
@@ -204,7 +254,7 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => {
-          sessions.set(id, { transport, server, lastSeen: Date.now() });
+          sessions.set(id, { transport, server, lastSeenMs: Date.now() });
         },
       });
       // Set before `connect`, which chains rather than replaces it (SDK `Protocol.connect`).
@@ -212,16 +262,21 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
         const id = transport.sessionId;
         if (id !== undefined) sessions.delete(id);
       };
-      // Cast: the transport is a Transport at runtime; its accessor-typed `onclose`/`onerror` trip
-      // `exactOptionalPropertyTypes` against the interface's optional members.
-      await server.connect(transport as Transport);
-      await transport.handleRequest(req, res, body);
-      // An initialize the transport refuses — the common one is a client whose `Accept` header does
-      // not list `text/event-stream`, answered 406 — never reaches `onsessioninitialized`, so this
-      // pair is in no map and nothing else would ever close it. Without this, a misconfigured client
-      // leaks one `McpServer` and one transport per retry.
-      if (transport.sessionId === undefined) {
-        await closeSession({ transport, server, lastSeen: Date.now() });
+      try {
+        // Cast: the transport is a Transport at runtime; its accessor-typed `onclose`/`onerror` trip
+        // `exactOptionalPropertyTypes` against the interface's optional members.
+        await server.connect(transport as Transport);
+        await transport.handleRequest(req, res, body);
+      } finally {
+        // An initialize that never opened a session — the transport refused it (a client whose
+        // `Accept` header omits `text/event-stream` is answered 406), or `connect`/`handleRequest`
+        // threw on the way — reaches `onsessioninitialized` never, so this pair is in no map and
+        // nothing else would ever close it. `finally` and not a trailing `if`: the throwing path is
+        // the one where a leak is least likely to be noticed, and it leaks the same `McpServer` and
+        // transport per retry.
+        if (transport.sessionId === undefined) {
+          await closeSession({ transport, server, lastSeenMs: Date.now() });
+        }
       }
     }),
   );
@@ -234,7 +289,7 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
       res.status(404).json(jsonRpcError(RPC_UNKNOWN_SESSION, "Unknown or expired session"));
       return;
     }
-    existing.lastSeen = Date.now();
+    existing.lastSeenMs = Date.now();
     await existing.transport.handleRequest(req, res);
   });
   app.get(config.httpPath, handleSessionRequest);
@@ -243,9 +298,13 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
   // Last, and with four parameters: Express identifies error middleware by arity alone.
   app.use(((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     const status = statusOf(err);
-    // `req.headers` is never logged: that is where a caller's bearer token is.
-    if (status === 500) logger.error({ err, method: req.method, path: req.path }, "http: request failed");
-    else logger.warn({ err, method: req.method, path: req.path, status }, "http: request rejected");
+    // Neither `req.headers` (where a caller's bearer token is) nor the error object (where a
+    // caller's *body* is — see `errorType`) ever reaches a log line here.
+    if (status === 500) {
+      logger.error({ ...errorDetail(err), method: req.method, path: req.path }, "http: request failed");
+    } else {
+      logger.warn({ type: errorType(err), method: req.method, path: req.path, status }, "http: request rejected");
+    }
     if (res.headersSent) {
       res.end();
       return;
@@ -260,13 +319,23 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
   }) satisfies express.ErrorRequestHandler);
 
   return new Promise<HttpHandle>((resolve, reject) => {
+    // Only ever a *listen* failure — EADDRINUSE, EACCES on a privileged port. It has to come off
+    // again the moment the promise settles: left on, every later server error would be handed to an
+    // already-resolved `reject`, which is a no-op, and the failure would disappear without a trace.
+    const onListenError = (err: Error): void => {
+      reject(err);
+    };
     const server: HttpServer = app.listen(config.port, "0.0.0.0", () => {
+      server.off("error", onListenError);
+      server.on("error", (err) => {
+        logger.error(errorDetail(err), "http: server error");
+      });
       const address = server.address();
       const port = typeof address === "object" && address !== null ? address.port : config.port;
       logger.info({ port, path: config.httpPath, authenticated: token !== "" }, "http: listening");
       resolve({ port, close: () => closeServer(server) });
     });
-    server.on("error", reject);
+    server.on("error", onListenError);
   });
 
   async function closeServer(server: HttpServer): Promise<void> {

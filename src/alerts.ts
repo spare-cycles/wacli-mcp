@@ -16,6 +16,9 @@
  *   it, someone has to re-pair the device, and every second of grace is a second wasted.
  * - Recovery is announced only if a down alert actually went out, so a drop that healed inside the
  *   grace stays silent in both directions.
+ * - `pairing` is a down state like any other, but it is not a *disconnection*, and the notice says
+ *   so. A deployment that has never been paired sits there forever with nothing to reconnect to,
+ *   and paging its operator with "disconnected for ~N min" names the wrong problem and no remedy.
  *
  * Two invariants this module owes the rest of the server. **A publish failure never propagates** —
  * `onState` is called from inside the connection's state machine, so an exception here would climb
@@ -103,6 +106,11 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
   const ntfy: NtfyConfig | undefined = config.ntfy;
 
   let episode: Episode | null = null;
+  /**
+   * The connection state the notice should describe. Not the same thing as the `Episode`: "down"
+   * covers three states that need three different things said about them.
+   */
+  let episodeState: ConnectionState | null = null;
   let episodeSince: number | null = null;
   /** Whether this episode has already been published, which is what makes recovery worth announcing. */
   let alerted = false;
@@ -144,6 +152,19 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
   function downNotice(): Notice {
     const mins = minutesSince(episodeSince);
     const since = episodeSince === null ? "an unknown time" : isoOf(episodeSince);
+    // A first deployment sits in `pairing` indefinitely and is *not* a disconnection: nothing
+    // dropped, nothing is going to reconnect, and the operator is holding a page that names the
+    // wrong problem and no remedy. `wa/connection.ts` already logs an error for the missing
+    // `WA_PHONE_NUMBER`, but nobody reads container logs at 03:00 — the notification is the one
+    // place the fix has to be spelled out.
+    if (episodeState === "pairing") {
+      return {
+        title: "🔗 wa-mcp waiting to be paired",
+        message: `WhatsApp is not linked: the server has been waiting to be paired for ~${mins} min (since ${since}). Set WA_PHONE_NUMBER (E.164 digits, no leading "+") and restart, then enter the pairing code from the logs in WhatsApp → Linked devices. Stored reads still answer; sends and media downloads do not.`,
+        priority: 5,
+        tags: ["rotating_light", "link"],
+      };
+    }
     return {
       title: "🚨 wa-mcp disconnected",
       message: `WhatsApp has been disconnected for ~${mins} min (since ${since}). Stored reads still answer; sends and media downloads do not.`,
@@ -191,11 +212,19 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
     arm(realertMs);
   }
 
-  function onDown(): void {
-    // An episode already running — armed grace or ongoing cadence — must not be restarted by the
-    // next `connecting`/`disconnected` flap, or a connection that never settles would never alert.
-    if (episode !== null) return;
+  function onDown(s: ConnectionState): void {
+    if (episode !== null) {
+      // An episode already running — armed grace or ongoing cadence — must not be restarted by the
+      // next `connecting`/`disconnected` flap, or a connection that never settles would never
+      // alert. The *diagnosis* still improves though: a first boot is `connecting` → `pairing`, so
+      // the state that opened the episode is the uninformative one and only this upgrade keeps the
+      // notice from saying "disconnected" about a server that has simply never been paired. It
+      // touches nothing else — same timer, same `episodeSince`, same cadence.
+      if (s === "pairing") episodeState = "pairing";
+      return;
+    }
     episode = "down";
+    episodeState = s;
     episodeSince = nowSec();
     alerted = false;
     arm(graceMs);
@@ -204,6 +233,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
   function onLoggedOut(): void {
     if (episode === "logged_out") return;
     episode = "logged_out";
+    episodeState = "logged_out";
     episodeSince = nowSec();
     alerted = true;
     void publish(loggedOutNotice());
@@ -215,6 +245,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
     const recovered = alerted;
     const downFor = minutesSince(episodeSince);
     episode = null;
+    episodeState = null;
     episodeSince = null;
     alerted = false;
     if (recovered) void publish(recoveryNotice(downFor));
@@ -234,7 +265,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
       case "connecting":
       case "disconnected":
       case "pairing":
-        onDown();
+        onDown(s);
         break;
     }
   }
@@ -258,6 +289,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
   function stop(): void {
     disarm();
     episode = null;
+    episodeState = null;
     episodeSince = null;
     alerted = false;
   }

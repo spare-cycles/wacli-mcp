@@ -39,6 +39,23 @@ const HEALTH: Record<string, unknown> = {
 
 type Entry = { level: string; obj: Record<string, unknown>; msg: string };
 
+/**
+ * Render captured entries the way pino would put them on disk.
+ *
+ * `JSON.stringify` alone is not good enough for the body-leak assertions: an `Error`'s `message` and
+ * `stack` are non-enumerable, so a plain stringify silently drops exactly the field a leak could hide
+ * in. pino's standard error serializer takes `message`, `stack` **and every own enumerable key**
+ * (`pino-std-serializers/lib/err.js`), which is what turns body-parser's `err.body` — the entire raw
+ * request payload — into a log line. This mirrors that, so "the marker is not in the log" means it.
+ */
+function rendered(entries: Entry[]): string {
+  return JSON.stringify(entries, (_key, value: unknown) => {
+    if (!(value instanceof Error)) return value;
+    const own = Object.entries(value as unknown as Record<string, unknown>);
+    return { name: value.name, message: value.message, stack: value.stack, ...Object.fromEntries(own) };
+  });
+}
+
 /** A logger that records instead of printing, so a test can assert what was reported and with what. */
 function captureLogger(): { logger: Logger; entries: Entry[] } {
   const entries: Entry[] = [];
@@ -67,11 +84,20 @@ type Server = {
   closes: { n: number };
 };
 
-/** Start a server on an ephemeral port, torn down when the test ends. */
+/**
+ * Start a server on an ephemeral port, torn down when the test ends.
+ *
+ * `breakConnect` makes every built `McpServer` reject on `connect`, which is the only *deterministic*
+ * way to drive a rejection through the initialize path from out here. `transport.handleRequest`
+ * cannot be made to reject over the network at all: it delegates to `@hono/node-server`'s
+ * `getRequestListener`, which catches request, fetch and response errors alike and turns each into a
+ * status code. Both failures are covered by the same `finally`, and this is the half a test can pin.
+ */
 async function start(
   t: TestContext,
   over: Partial<Config> = {},
   health: () => Promise<Record<string, unknown>> = () => Promise.resolve({ ...HEALTH }),
+  breakConnect = false,
 ): Promise<Server> {
   const { logger, entries } = captureLogger();
   const builds = { n: 0 };
@@ -93,6 +119,7 @@ async function start(
         closes.n += 1;
         await closeOriginal();
       };
+      if (breakConnect) server.connect = () => Promise.reject(new Error("transport handshake failed"));
       return server;
     },
     health,
@@ -338,6 +365,22 @@ void test("an initialize the transport refuses leaks nothing", async (t) => {
   assert.equal(s.closes.n, 1, "a session that never opened is closed again rather than left behind");
 });
 
+void test("an initialize that throws leaks nothing either", async (t) => {
+  const s = await start(t, { mcpToken: "secret" }, undefined, true);
+
+  // The same leak, down the other path. A trailing `if` after the two awaits is skipped entirely
+  // when one of them rejects — which is the case where a leak is least likely to be noticed — so
+  // the cleanup only holds if it is in a `finally`.
+  const res = await mcpPost(s, INITIALIZE, { authorization: "Bearer secret" });
+
+  assert.equal(res.status, 500, "the failure is still answered with our envelope");
+  assert.equal(s.builds.n, 1);
+  assert.equal(s.closes.n, 1, "and the McpServer built for the doomed session is closed anyway");
+
+  const still = await fetch(`${s.base}/health`);
+  assert.equal(still.status, 200, "the server is still serving afterwards");
+});
+
 void test("an idle session is swept, and the sweeper holds nothing open", async (t) => {
   const timersBefore = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
   const s = await start(t, { sessionTtlMs: 50 });
@@ -372,4 +415,58 @@ void test("a malformed body is a 400, not a 500 and not a crash", async (t) => {
 
   const still = await fetch(`${s.base}/health`);
   assert.equal(still.status, 200);
+});
+
+/**
+ * Ten characters, at offset 0 of the payload, because both leak paths have to be reachable for this
+ * test to mean anything:
+ *
+ * - `err.body` — body-parser attaches the *entire* raw payload to a parse failure, so any marker
+ *   anywhere in the body is enough for that one.
+ * - `err.message` — V8's parse error quotes the input, but truncates to the first ten characters
+ *   once the payload is longer than twenty. A marker further in would leave that path untested.
+ */
+const LEAK_MARKER = "LEAKMARKER";
+
+void test("a rejected body never reaches a log line", async (t) => {
+  const s = await start(t, { mcpToken: "secret" });
+
+  const res = await mcpPost(s, `${LEAK_MARKER}{"jsonrpc":"2.0"}`, { authorization: "Bearer secret" });
+
+  assert.equal(res.status, 400);
+  // Logging the error object writes the caller's payload — up to the body limit, ~90 MB at the
+  // default `WA_MAX_UPLOAD_BYTES` — to disk, once per malformed request. A `wa_send_file` base64
+  // argument is the legitimate version of the same accident.
+  assert.doesNotMatch(rendered(s.entries), /LEAKMARKER/, "the request body must not be logged, in any field");
+  assert.ok(
+    s.entries.some((e) => e.level === "warn" && e.obj["type"] === "entity.parse.failed"),
+    "what is logged instead is the parser's own classification of the failure",
+  );
+});
+
+void test("a body is only ever parsed behind the auth gate", async (t) => {
+  const s = await start(t, { mcpToken: "secret" });
+  const payload = `${LEAK_MARKER}{"jsonrpc":"2.0"}`;
+
+  // A path the server has no route for. A globally-mounted parser buffers and parses this anyway —
+  // up to the ~90 MB body limit — for a caller who has presented no credential at all, and only
+  // then falls through to a 404.
+  const stray = await fetch(`${s.base}/anything`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: payload,
+  });
+  assert.equal(stray.status, 404, "no route, and so no parse either");
+
+  // And on the MCP path itself the gate still runs before the parser, so a wrong credential is
+  // answered without the payload ever being read.
+  const refused = await mcpPost(s, payload, { authorization: "Bearer wrong" });
+  assert.equal(refused.status, 401);
+
+  assert.equal(
+    s.entries.filter((e) => e.obj["type"] === "entity.parse.failed").length,
+    0,
+    "neither request reached the parser, so neither could have leaked a body",
+  );
+  assert.doesNotMatch(rendered(s.entries), /LEAKMARKER/);
 });
