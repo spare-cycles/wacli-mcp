@@ -28,7 +28,9 @@ Every task's requirements implicitly include this section. Copied verbatim from 
     grep -rn 'WACLI\|wacli' src/ --include='*.ts' | grep -v '\.test\.ts:'
     ```
     Expected: nothing.
-11. **All raw JID interpretation lives in `src/wa/jid.ts`.** No other module may contain the substrings `@lid`, `@s.whatsapp.net`, or `@g.us`, or split a JID on `@` or `:`. This is the single most important structural rule in the codebase — see Risk 1.
+11. **All raw JID interpretation lives in `src/wa/jid.ts`.** No other **production** module may contain the substrings `@lid`, `@s.whatsapp.net`, or `@g.us`, or split a JID on `@` or `:`. This is the single most important structural rule in the codebase — see Risk 1.
+
+    Scoped to non-test files, exactly as Constraint 10 is, and for the same reason: the rule bans *interpreting* a JID, and test files plus `src/wa/fixtures.ts` necessarily contain JID **literals as data** — a test for identity folding has to name a LID. The enforcing check is the one in Task 3 step 5, which excludes `*.test.ts`, `src/wa/jid.ts` and `src/wa/fixtures.ts`. If the wording and that command ever disagree again, the command governs.
 12. **`src/mcp/tools/*` must not import from `baileys`.** Tool handlers talk to repositories, `wa/send.ts`, and `media/*`. Baileys types stop at the `wa/` and `media/` boundary.
 13. **Read tools work in every connection state.** They query SQLite and must never touch the socket. Only write tools and the media pipeline may require a live connection.
 14. **Secrets are never logged.** `WA_MCP_TOKEN` and `NTFY_TOKEN` must not appear in any log line, error message, or `/health` response.
@@ -38,6 +40,14 @@ Every task's requirements implicitly include this section. Copied verbatim from 
     - Convert at the boundary with `Number(m.messageTimestamp)`; protobuf may hand back a `Long`, not a `number`, and `Long` fails silently in arithmetic comparisons.
     - Anything derived from `Date.now()` divides by 1000 and floors. Durations exposed to callers (`last_event_age_sec`) are seconds too; the only milliseconds in the codebase are timer arguments and `sessionTtlMs`, both of which carry `Ms` in the name.
 18. **Repository rows map snake_case columns to camelCase fields, at the repository boundary and nowhere else.** Every repo exports row types in camelCase (`chatId`, `fromMe`, `lastMessageTs`); no layer above `src/db/` ever sees a snake_case key. SQLite integers `0`/`1` become real booleans in the same step. Four repositories doing this four different ways is how the tool layer ends up with `from_me` in one result shape and `fromMe` in another.
+19. **Every factory-returned interface declares its members as function properties, not method shorthand,** and its implementation closes over local functions rather than reaching through `this`:
+    ```ts
+    export type MetaRepo = { get: (key: string) => string | undefined };   // yes
+    export type MetaRepo = { get(key: string): string | undefined };       // no
+    ```
+    Two reasons, one of which is enforced. `@typescript-eslint/unbound-method` keys off the **type declaration**, so method shorthand makes any destructuring of the repo (`const { get } = makeMetaRepo(db)`) a lint error — and every repository in this plan is consumed by destructuring somewhere. And a method reaching `this` inside an object literal returned from a factory silently breaks when destructured or passed as a callback, with no compile-time warning.
+
+    **The interface blocks written in Tasks 4, 5, 10, 11 and 12 use method shorthand — that is a plan-wide typo, and this constraint governs.** Translate them to function-property syntax as you implement; the parameter and return types are unchanged. Established while fixing Task 2.
 
 ---
 
