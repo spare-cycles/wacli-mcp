@@ -14,7 +14,13 @@
 #     wacli --store /data/wacli auth
 
 # ── 1) Build the Linux wacli binary (CGO + sqlite_fts5) ──────────────────────
-FROM golang:1.25-bookworm AS wacli
+FROM golang:1.26-bookworm AS wacli
+# GOTOOLCHAIN=auto, deliberately: WACLI_REF defaults to `main`, so upstream can raise its
+# go.mod directive at any time while this base image stays pinned. The golang images set
+# GOTOOLCHAIN=local, which turns that into a hard build failure
+#   ("go.mod requires go >= 1.26.5 (running go 1.25.12; GOTOOLCHAIN=local)")
+# rather than a toolchain download. `auto` lets the build fetch what go.mod asks for.
+ENV GOTOOLCHAIN=auto
 ARG WACLI_REPO=https://github.com/openclaw/wacli
 ARG WACLI_REF=main
 RUN apt-get update \
