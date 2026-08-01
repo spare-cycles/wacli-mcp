@@ -72,6 +72,13 @@ export function makeContactsRepo(db: Db): ContactsRepo {
   const getStmt = db.prepare(`SELECT ${SELECT_COLUMNS} FROM contacts WHERE id = ?`);
   const countStmt = db.prepare("SELECT COUNT(*) AS n FROM contacts");
   const pnForLidStmt = db.prepare("SELECT id FROM contacts WHERE lid = ? AND phone_number IS NOT NULL");
+  const searchStmt = db.prepare(
+    `SELECT ${SELECT_COLUMNS} FROM contacts
+     WHERE LOWER(name) LIKE :like ESCAPE '\\'
+        OR LOWER(notify) LIKE :like ESCAPE '\\'
+        OR LOWER(phone_number) LIKE :like ESCAPE '\\'
+     LIMIT :limit OFFSET :offset`,
+  );
 
   // --- linkIdentity's statements. Prepared once, run inside one transaction per call. ---
 
@@ -119,6 +126,15 @@ export function makeContactsRepo(db: Db): ContactsRepo {
   // Group messages carry the participant as sender_id, so the same person can appear as a LID
   // sender in a group whose chat id was never a LID itself.
   const repointSenderStmt = db.prepare("UPDATE messages SET sender_id = :phoneId WHERE sender_id = :lidId");
+  // Same rationale as messages.sender_id above, and for the same reason as the reactions.chat_id
+  // re-point: the same person can hold a reaction under both identities on the same message
+  // (e.g. one reaction recorded before identity resolution, one after), which collides on the
+  // (chat_id, message_id, sender_id) primary key. UPDATE OR IGNORE keeps the row already under
+  // the phone id and drops whatever is left stuck under the LID id.
+  const repointReactionsSenderStmt = db.prepare(
+    "UPDATE OR IGNORE reactions SET sender_id = :phoneId WHERE sender_id = :lidId",
+  );
+  const dropLeftoverReactionsSenderStmt = db.prepare("DELETE FROM reactions WHERE sender_id = ?");
 
   function upsertOne(c: ContactInput): void {
     upsertStmt.run({
@@ -154,15 +170,7 @@ export function makeContactsRepo(db: Db): ContactsRepo {
 
   function search(query: string, limit: number, offset: number): ContactRow[] {
     const like = `%${escapeLike(query)}%`.toLowerCase();
-    const rows = db
-      .prepare(
-        `SELECT ${SELECT_COLUMNS} FROM contacts
-         WHERE LOWER(name) LIKE :like ESCAPE '\\'
-            OR LOWER(notify) LIKE :like ESCAPE '\\'
-            OR LOWER(phone_number) LIKE :like ESCAPE '\\'
-         LIMIT :limit OFFSET :offset`,
-      )
-      .all({ like, limit, offset }) as ContactRowRaw[];
+    const rows = searchStmt.all({ like, limit, offset }) as ContactRowRaw[];
     return rows.map(toContactRow);
   }
 
@@ -217,6 +225,8 @@ export function makeContactsRepo(db: Db): ContactsRepo {
       repointReactionsChatStmt.run({ phoneId: phoneJid, lidId: lidJid });
       dropLeftoverReactionsStmt.run(lidJid);
       repointSenderStmt.run({ phoneId: phoneJid, lidId: lidJid });
+      repointReactionsSenderStmt.run({ phoneId: phoneJid, lidId: lidJid });
+      dropLeftoverReactionsSenderStmt.run(lidJid);
 
       if (lidChat !== undefined) deleteChatStmt.run(lidJid);
 

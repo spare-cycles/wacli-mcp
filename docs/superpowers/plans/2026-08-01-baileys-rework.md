@@ -991,7 +991,7 @@ Implementation notes that the tests pin down:
 
   1. If a `chats` row exists under the LID id, merge it into the phone id: `ensure` the phone chat, take `MAX(last_message_ts)`, sum `unread_count`, keep the non-null `name`, then delete the LID chat row.
   2. Re-point its messages: `UPDATE messages SET chat_id = :phone WHERE chat_id = :lid`, and the same for `reactions`. The FTS update trigger fires per row and keeps the index consistent for free.
-  3. Re-point senders too: `UPDATE messages SET sender_id = :phone WHERE sender_id = :lid` — group messages carry the participant, so the same person can appear as a LID sender in a group whose chat id was never a LID.
+  3. Re-point senders too — **in both tables**: `UPDATE messages SET sender_id = :phone WHERE sender_id = :lid` and `UPDATE reactions SET sender_id = :phone WHERE sender_id = :lid`. Group messages carry the participant, so the same person can appear as a LID sender in a group whose chat id was never a LID. Missing the `reactions` half leaves a reaction attributed to a contact row this very transaction deletes, with nothing to self-heal it — `sender_id` is not a foreign key, so no CASCADE catches it. (Found by review during Task 4, after an earlier draft of this step named only `messages`.)
   4. A `(chat_id, id)` collision is possible if the same message somehow landed under both ids: use `UPDATE OR IGNORE` and then delete whatever is left under the LID id, rather than letting the unique index abort the whole merge.
 
   Order matters: re-point messages **before** deleting the LID chat row, or the foreign key drops them.
