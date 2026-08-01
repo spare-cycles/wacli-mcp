@@ -5,5 +5,5 @@ dist
 .remember
 .vscode
 *.log
-smoke.mjs
 README.md
+docs
