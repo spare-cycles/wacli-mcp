@@ -26,7 +26,12 @@ import { loadConfig, type Config, type NtfyConfig } from "./config.js";
 
 const GRACE_MS = 60_000;
 const REALERT_MS = 300_000;
-const NTFY: NtfyConfig = { baseUrl: "https://ntfy.example/", topic: "alerts", token: "ntfy-secret" };
+const NTFY: NtfyConfig = {
+  baseUrl: "https://ntfy.example/",
+  topic: "alerts",
+  infoTopic: "infos",
+  token: "ntfy-secret",
+};
 
 function configWith(ntfy: NtfyConfig | undefined): Config {
   return { ...loadConfig({}), ntfy };
@@ -372,7 +377,7 @@ void test("selfTest publishes a startup notice and never rejects", async () => {
   await alerter.selfTest();
 
   assert.equal(calls.length, 1, "the startup notice is what proves the token and the egress work");
-  assert.equal(calls[0]?.body["topic"], NTFY.topic);
+  assert.equal(calls[0]?.body["topic"], NTFY.infoTopic, "routine traffic belongs on the info topic");
   assert.deepEqual(clock.delays(), [], "and it arms nothing");
 
   const rejecting = stubFetch(() => Promise.reject(new Error("ntfy unreachable")));
@@ -382,6 +387,56 @@ void test("selfTest publishes a startup notice and never rejects", async () => {
 
   alerter.stop();
   failing.stop();
+});
+
+// --- topic routing ------------------------------------------------------------------------------
+
+void test("every incident notice goes to the alert topic, including the all-clear", async () => {
+  const clock = fakeClock();
+  const { impl, calls } = stubFetch();
+  const { logger } = captureLogger();
+  const alerter = alerterUnder(clock, impl, logger);
+
+  alerter.onState("disconnected");
+  clock.fire(); // the grace expires: "disconnected"
+  alerter.onState("connected"); // and the recovery that closes it
+  await tick();
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(
+    calls.map((c) => c.body["topic"]),
+    [NTFY.topic, NTFY.topic],
+    "an operator watching the alert topic must see the all-clear for an alarm they saw there",
+  );
+  assert.match(titleOf(calls[1]), /reconnected/);
+
+  const paired = stubFetch();
+  const pairing = alerterUnder(fakeClock(), paired.impl, captureLogger().logger);
+  pairing.onState("logged_out");
+  await tick();
+  assert.equal(paired.calls[0]?.body["topic"], NTFY.topic);
+
+  alerter.stop();
+  pairing.stop();
+});
+
+void test("an unset NTFY_TOPIC_INFO sends everything to the one topic it was given", async () => {
+  const { impl, calls } = stubFetch();
+  const { logger } = captureLogger();
+  // What `loadConfig` produces with no `NTFY_TOPIC_INFO`: the pre-split, single-topic behaviour.
+  const single = alerterUnder(fakeClock(), impl, logger, { ...NTFY, infoTopic: NTFY.topic });
+
+  await single.selfTest();
+  single.onState("logged_out");
+  await tick();
+
+  assert.deepEqual(
+    calls.map((c) => c.body["topic"]),
+    [NTFY.topic, NTFY.topic],
+    "adding the info topic can only move traffic off the alert topic, never silence the alert one",
+  );
+
+  single.stop();
 });
 
 // --- the real timer -----------------------------------------------------------------------------

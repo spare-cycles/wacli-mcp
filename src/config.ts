@@ -1,6 +1,6 @@
 import os from "node:os";
 
-export type NtfyConfig = { baseUrl: string; topic: string; token: string };
+export type NtfyConfig = { baseUrl: string; topic: string; infoTopic: string; token: string };
 
 export type Config = {
   dataDir: string; // WHATSAPP_DATA_DIR, default "/data/whatsapp"
@@ -61,12 +61,20 @@ function parsePhoneNumber(raw: string | undefined): string | undefined {
   return raw;
 }
 
-/** ntfy is all-or-nothing: both NTFY_BASE_URL and NTFY_TOPIC must be non-empty. */
+/**
+ * ntfy is all-or-nothing: both NTFY_BASE_URL and NTFY_TOPIC must be non-empty.
+ *
+ * `NTFY_TOPIC` is the *problem* channel and stays required — a deployment that sets only the base URL
+ * gets no alerting at all rather than alerting nobody watches. `NTFY_TOPIC_INFO` is the routine one
+ * and is optional: unset, informational notices fall back to `topic`, which is exactly the
+ * single-topic behaviour that existed before the split. So adding the variable can only ever move
+ * traffic *off* the alert channel, never silence it.
+ */
 function parseNtfy(env: NodeJS.ProcessEnv): NtfyConfig | undefined {
   const baseUrl = env["NTFY_BASE_URL"];
   const topic = env["NTFY_TOPIC"];
   if (!baseUrl || !topic) return undefined;
-  return { baseUrl, topic, token: env["NTFY_TOKEN"] || "" };
+  return { baseUrl, topic, infoTopic: env["NTFY_TOPIC_INFO"] || topic, token: env["NTFY_TOKEN"] || "" };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): Config {

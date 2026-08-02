@@ -80,7 +80,18 @@ export function unrefSchedule(fn: () => void, ms: number): () => void {
   };
 }
 
-type Notice = { title: string; message: string; priority: number; tags: string[] };
+/**
+ * Which ntfy topic a notice belongs on.
+ *
+ * `alert` is the incident channel and `info` is the routine one, so the split is by *audience*, not
+ * by sentiment: recovery is good news and still goes to `alert`, because a subscriber who sees
+ * "disconnected" on that topic and never sees the all-clear is worse off than one who sees neither.
+ * The pair belongs together in one thread. Only genuinely routine traffic — the startup self-test —
+ * is `info`.
+ */
+type Channel = "alert" | "info";
+
+type Notice = { title: string; message: string; priority: number; tags: string[]; channel: Channel };
 
 /** What the current non-connected episode is, or `null` when the connection is up. */
 type Episode = "down" | "logged_out";
@@ -127,7 +138,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
     // malformed credential rather than none at all.
     if (ntfy.token !== "") headers["authorization"] = `Bearer ${ntfy.token}`;
     const body = JSON.stringify({
-      topic: ntfy.topic,
+      topic: notice.channel === "info" ? ntfy.infoTopic : ntfy.topic,
       title: notice.title,
       message: notice.message,
       priority: notice.priority,
@@ -163,6 +174,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
         message: `WhatsApp is not linked: the server has been waiting to be paired for ~${mins} min (since ${since}). Set WHATSAPP_PHONE_NUMBER (E.164 digits, no leading "+") and restart, then enter the pairing code from the logs in WhatsApp → Linked devices. Stored reads still answer; sends and media downloads do not.`,
         priority: 5,
         tags: ["rotating_light", "link"],
+        channel: "alert",
       };
     }
     return {
@@ -170,6 +182,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
       message: `WhatsApp has been disconnected for ~${mins} min (since ${since}). Stored reads still answer; sends and media downloads do not.`,
       priority: 5,
       tags: ["rotating_light"],
+      channel: "alert",
     };
   }
 
@@ -180,6 +193,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
         "WhatsApp logged this device out. Nothing reconnects on its own: the device has to be paired again (set WHATSAPP_PHONE_NUMBER and restart to get a pairing code).",
       priority: 5,
       tags: ["rotating_light", "no_entry"],
+      channel: "alert",
     };
   }
 
@@ -189,6 +203,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
       message: `WhatsApp reconnected at ${isoOf(nowSec())} after ~${downFor} min.`,
       priority: 3,
       tags: ["white_check_mark"],
+      channel: "alert",
     };
   }
 
@@ -276,6 +291,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
       message: `Server up at ${isoOf(nowSec())}; connecting to WhatsApp…`,
       priority: 2,
       tags: ["information_source"],
+      channel: "info",
     });
   }
 
