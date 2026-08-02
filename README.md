@@ -115,7 +115,7 @@ Every variable is optional except where noted. Invalid numbers fall back to the 
 | `NTFY_BASE_URL` | — | ntfy server for connection alerts. Alerting is all-or-nothing: it is off unless both this and `NTFY_TOPIC` are set. |
 | `NTFY_TOPIC` | — | ntfy topic to publish to. |
 | `NTFY_TOKEN` | — | Bearer token for ntfy, if the server needs one. Travels in a header and appears in no log line. |
-| `LOG_LEVEL` | `info` | pino level for every log line the process writes: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. Read in `src/logger.ts`, not through `loadConfig`, so it is the one variable here that is not part of `Config`. |
+| `LOG_LEVEL` | `info` | pino level for every log line the process writes: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. Read in `src/logger.ts`, not through `loadConfig`, so it is the one variable here that is not part of `Config`. **`trace` and `debug` are not safe to leave on.** The same logger is handed to Baileys, which logs raw stanzas at those levels — including the pairing `ref`, which is a live credential. Turn them on to debug, then turn them back off. |
 
 Alerting debounces on purpose: a dropped socket must stay down for a grace period before anyone is paged, re-alerts on
 a cadence while still down, and announces recovery only if a down alert actually went out. `logged_out` skips the grace

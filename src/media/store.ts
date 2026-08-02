@@ -174,10 +174,11 @@ export function makeMediaStore(deps: MediaStoreDeps): MediaStore {
     try {
       data = await download(message, { reuploadRequest: (m) => sock.updateMediaMessage(m), logger });
     } catch (err) {
-      // The error's own fields, never the error: an undici- or axios-shaped failure from
-      // `downloadMediaMessage` hangs the WhatsApp CDN media URL off itself, and pino's standard
-      // serializer copies every own enumerable key — so one `{ err }` writes a capability URL for
-      // the attachment's encrypted bytes into the log. See `errorFields`.
+      // The error's own fields, never the error: baileys hangs the WhatsApp CDN media URL off the
+      // failure *and* puts it in the message (``Failed to fetch stream from ${url}``), and pino's
+      // standard serializer copies every own enumerable key — so one `{ err }` writes a capability
+      // URL for the attachment's encrypted bytes into the log. `errorFields` closes both channels:
+      // it picks two fields and scrubs URLs out of the message it keeps.
       logger.warn({ ...errorFields(err), chatId, messageId }, "media: download failed");
       throw new MediaUnavailableError(
         `could not download the media for message ${messageId} in chat ${chatId}: WhatsApp media URLs expire, ` +

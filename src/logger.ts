@@ -10,6 +10,23 @@ export function makeLogger(level = process.env["LOG_LEVEL"] || "info"): Logger {
 export const logger: Logger = makeLogger();
 
 /**
+ * Absolute `http(s)` URLs, so a message carrying one can be reduced to the fact that it did.
+ * Stops at whitespace, quotes and the brackets a message is likely to wrap a URL in.
+ */
+const URL_IN_TEXT = /\bhttps?:\/\/[^\s"'<>)\]]+/gi;
+
+/** Replace every absolute URL in `text` with a placeholder naming its host. */
+export function scrubUrls(text: string): string {
+  return text.replace(URL_IN_TEXT, (match) => {
+    try {
+      return `<url ${new URL(match).host}>`;
+    } catch {
+      return "<url>";
+    }
+  });
+}
+
+/**
  * The two fields an error contributes to a log line — and the reason a log line is never handed the
  * error itself.
  *
@@ -20,8 +37,14 @@ export const logger: Logger = makeLogger();
  * from `downloadMediaMessage` carries the **WhatsApp CDN media URL** — a capability URL that grants
  * whoever holds it the attachment's encrypted bytes. Picking the two fields explicitly keeps that
  * true no matter what an error grows later.
+ *
+ * Picking fields is not enough on its own, because a thrower can put the same secret in the
+ * message: baileys raises ``new Boom(`Failed to fetch stream from ${url}`, …)``
+ * (`lib/Utils/messages-media.js`) on exactly the common failure — an expired media URL answering
+ * non-2xx. So the message is scrubbed of absolute URLs as well; the host survives, which is the
+ * part with diagnostic value, and the signed path and query — the capability — do not.
  */
 export function errorFields(err: unknown): { errorType: string; errorMessage: string } {
-  if (err instanceof Error) return { errorType: err.name, errorMessage: err.message };
+  if (err instanceof Error) return { errorType: err.name, errorMessage: scrubUrls(err.message) };
   return { errorType: typeof err, errorMessage: "a non-Error value was thrown" };
 }
