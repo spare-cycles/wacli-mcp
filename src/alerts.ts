@@ -2,7 +2,7 @@
  * ntfy alerting, driven by the connection's state changes.
  *
  * This is the retired supervisor's debounce with its input replaced. That process polled a heartbeat
- * file because the connection lived in a *different* process; here `wa/connection.ts` calls
+ * file because the connection lived in a *different* process; here `whatsapp/connection.ts` calls
  * `onState` directly, so the state machine is fed by events and the heartbeat file is gone with the
  * process that needed it.
  *
@@ -32,7 +32,7 @@
 
 import type { Config, NtfyConfig } from "./config.js";
 import type { Logger } from "pino";
-import type { ConnectionState } from "./wa/connection.js";
+import type { ConnectionState } from "./whatsapp/connection.js";
 
 export type Alerter = {
   /** Feed a connection state transition in. Never throws. */
@@ -154,19 +154,19 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
     const since = episodeSince === null ? "an unknown time" : isoOf(episodeSince);
     // A first deployment sits in `pairing` indefinitely and is *not* a disconnection: nothing
     // dropped, nothing is going to reconnect, and the operator is holding a page that names the
-    // wrong problem and no remedy. `wa/connection.ts` already logs an error for the missing
-    // `WA_PHONE_NUMBER`, but nobody reads container logs at 03:00 — the notification is the one
+    // wrong problem and no remedy. `whatsapp/connection.ts` already logs an error for the missing
+    // `WHATSAPP_PHONE_NUMBER`, but nobody reads container logs at 03:00 — the notification is the one
     // place the fix has to be spelled out.
     if (episodeState === "pairing") {
       return {
-        title: "🔗 wa-mcp waiting to be paired",
-        message: `WhatsApp is not linked: the server has been waiting to be paired for ~${mins} min (since ${since}). Set WA_PHONE_NUMBER (E.164 digits, no leading "+") and restart, then enter the pairing code from the logs in WhatsApp → Linked devices. Stored reads still answer; sends and media downloads do not.`,
+        title: "🔗 whatsapp-mcp waiting to be paired",
+        message: `WhatsApp is not linked: the server has been waiting to be paired for ~${mins} min (since ${since}). Set WHATSAPP_PHONE_NUMBER (E.164 digits, no leading "+") and restart, then enter the pairing code from the logs in WhatsApp → Linked devices. Stored reads still answer; sends and media downloads do not.`,
         priority: 5,
         tags: ["rotating_light", "link"],
       };
     }
     return {
-      title: "🚨 wa-mcp disconnected",
+      title: "🚨 whatsapp-mcp disconnected",
       message: `WhatsApp has been disconnected for ~${mins} min (since ${since}). Stored reads still answer; sends and media downloads do not.`,
       priority: 5,
       tags: ["rotating_light"],
@@ -175,9 +175,9 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
 
   function loggedOutNotice(): Notice {
     return {
-      title: "🚨 wa-mcp logged out",
+      title: "🚨 whatsapp-mcp logged out",
       message:
-        "WhatsApp logged this device out. Nothing reconnects on its own: the device has to be paired again (set WA_PHONE_NUMBER and restart to get a pairing code).",
+        "WhatsApp logged this device out. Nothing reconnects on its own: the device has to be paired again (set WHATSAPP_PHONE_NUMBER and restart to get a pairing code).",
       priority: 5,
       tags: ["rotating_light", "no_entry"],
     };
@@ -185,7 +185,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
 
   function recoveryNotice(downFor: number): Notice {
     return {
-      title: "✅ wa-mcp reconnected",
+      title: "✅ whatsapp-mcp reconnected",
       message: `WhatsApp reconnected at ${isoOf(nowSec())} after ~${downFor} min.`,
       priority: 3,
       tags: ["white_check_mark"],
@@ -272,7 +272,7 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
 
   async function selfTest(): Promise<void> {
     await publish({
-      title: "wa-mcp started",
+      title: "whatsapp-mcp started",
       message: `Server up at ${isoOf(nowSec())}; connecting to WhatsApp…`,
       priority: 2,
       tags: ["information_source"],

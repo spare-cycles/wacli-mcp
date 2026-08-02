@@ -41,7 +41,7 @@ import { cleanTranscript, makeTranscriber, modelWriteError, TranscriptionError }
 
 const run = promisify(execFile);
 
-const root = mkdtempSync(join(tmpdir(), "wa-transcribe-"));
+const root = mkdtempSync(join(tmpdir(), "whatsapp-transcribe-"));
 after(() => {
   rmSync(root, { recursive: true, force: true });
 });
@@ -71,7 +71,7 @@ function freshDataDir(): string {
 }
 
 function configFor(dataDir: string, extra: NodeJS.ProcessEnv = {}): Config {
-  return loadConfig({ WA_DATA_DIR: dataDir, WA_WHISPER_MODEL: MODEL, ...extra });
+  return loadConfig({ WHATSAPP_DATA_DIR: dataDir, WHATSAPP_WHISPER_MODEL: MODEL, ...extra });
 }
 
 type Entry = { level: string; obj: Record<string, unknown>; msg: string };
@@ -299,7 +299,7 @@ void test("a non-2xx download names the status, the URL and the env var that fix
   assert.ok(err instanceof TranscriptionError, `expected TranscriptionError, got ${err.name}`);
   assert.ok(err.message.includes("404"), `status missing from: ${err.message}`);
   assert.ok(err.message.includes(MODEL_URL), `URL missing from: ${err.message}`);
-  assert.ok(err.message.includes("WA_WHISPER_MODEL"), `the knob to turn is missing from: ${err.message}`);
+  assert.ok(err.message.includes("WHATSAPP_WHISPER_MODEL"), `the knob to turn is missing from: ${err.message}`);
   assert.equal(existsSync(modelPathIn(dataDir)), false);
 });
 
@@ -450,11 +450,11 @@ void test("a write failure keeps its errno rather than becoming a generic downlo
 
 void test("modelWriteError reports ENOSPC as itself", () => {
   const err = Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
-  const mapped = modelWriteError(err, "/data/wa/models/ggml-x.bin.part");
+  const mapped = modelWriteError(err, "/data/whatsapp/models/ggml-x.bin.part");
   assert.ok(mapped instanceof TranscriptionError);
   assert.ok(mapped.message.includes("ENOSPC"), `the errno must survive: ${mapped.message}`);
   assert.ok(/full/i.test(mapped.message), `and be explained: ${mapped.message}`);
-  assert.ok(mapped.message.includes("/data/wa/models/ggml-x.bin.part"));
+  assert.ok(mapped.message.includes("/data/whatsapp/models/ggml-x.bin.part"));
 });
 
 void test("a failed download does not poison the next call", async () => {
@@ -489,7 +489,7 @@ void test("a recording over the limit is refused, naming the limit, the duration
   const dataDir = freshDataDir();
   const fetcher = stubFetch(() => okResponse(MODEL_BYTES));
   const t = makeTranscriber({
-    config: configFor(dataDir, { WA_WHISPER_MAX_SECONDS: "1" }),
+    config: configFor(dataDir, { WHATSAPP_WHISPER_MAX_SECONDS: "1" }),
     logger: captureLogger().logger,
     fetchImpl: fetcher.impl,
   });
@@ -498,7 +498,7 @@ void test("a recording over the limit is refused, naming the limit, the duration
   assert.ok(err instanceof TranscriptionError, `expected TranscriptionError, got ${err.name}`);
   assert.match(err.message, /^this recording is \d+(\.\d)?s long/);
   assert.ok(/\b1s\b/.test(err.message), `the limit must be named: ${err.message}`);
-  assert.ok(err.message.includes("WA_WHISPER_MAX_SECONDS"), `the knob must be named: ${err.message}`);
+  assert.ok(err.message.includes("WHATSAPP_WHISPER_MAX_SECONDS"), `the knob must be named: ${err.message}`);
   assert.deepEqual(fetcher.urls, [], "a rejected recording must not trigger a 574 MB download");
 });
 
@@ -510,7 +510,7 @@ void test("transcribeFile runs whisper with the expected argv and returns cleane
     // The redirection target is quoted: a TMPDIR with a space in it must break no stub here.
     `printf '%s\\n' "$@" > "${args}"\nprintf '[00:00:00.000 --> 00:00:02.000]   Bonjour le monde.\\n'`,
   );
-  const config = configFor(dataDir, { WA_WHISPER_BIN: bin });
+  const config = configFor(dataDir, { WHATSAPP_WHISPER_BIN: bin });
   const fetcher = stubFetch(() => okResponse(MODEL_BYTES));
   const t = makeTranscriber({ config, logger: captureLogger().logger, fetchImpl: fetcher.impl });
 
@@ -535,7 +535,7 @@ void test("the temp wav is removed even when whisper fails", async () => {
   const bin = writeStub("whisper-fail", `echo "failed to load model" >&2\nexit 1`);
   const fetcher = stubFetch(() => okResponse(MODEL_BYTES));
   const t = makeTranscriber({
-    config: configFor(dataDir, { WA_WHISPER_BIN: bin }),
+    config: configFor(dataDir, { WHATSAPP_WHISPER_BIN: bin }),
     logger: captureLogger().logger,
     fetchImpl: fetcher.impl,
   });
@@ -549,7 +549,7 @@ void test("whisper output with no speech in it raises TranscriptionError", async
   const bin = writeStub("whisper-silent", `printf '[00:00:00.000 --> 00:00:02.000]   [BLANK_AUDIO]\\n'`);
   const fetcher = stubFetch(() => okResponse(MODEL_BYTES));
   const t = makeTranscriber({
-    config: configFor(dataDir, { WA_WHISPER_BIN: bin }),
+    config: configFor(dataDir, { WHATSAPP_WHISPER_BIN: bin }),
     logger: captureLogger().logger,
     fetchImpl: fetcher.impl,
   });
@@ -562,12 +562,12 @@ void test("a missing whisper binary fails loudly instead of hanging", async () =
   const dataDir = freshDataDir();
   const fetcher = stubFetch(() => okResponse(MODEL_BYTES));
   const t = makeTranscriber({
-    config: configFor(dataDir, { WA_WHISPER_BIN: "wa-mcp-no-such-whisper" }),
+    config: configFor(dataDir, { WHATSAPP_WHISPER_BIN: "whatsapp-mcp-no-such-whisper" }),
     logger: captureLogger().logger,
     fetchImpl: fetcher.impl,
   });
 
-  await assert.rejects(() => t.transcribeFile(wav), /wa-mcp-no-such-whisper/);
+  await assert.rejects(() => t.transcribeFile(wav), /whatsapp-mcp-no-such-whisper/);
   assert.deepEqual(tmpEntries(dataDir), []);
 });
 
@@ -577,7 +577,7 @@ void test("available() probes with --help and nothing else, and is true when tha
   const args = join(root, "argv-help.txt");
   const bin = writeStub("whisper-help", `printf '%s\\n' "$@" > "${args}"\nexit 0`);
   const t = makeTranscriber({
-    config: configFor(freshDataDir(), { WA_WHISPER_BIN: bin }),
+    config: configFor(freshDataDir(), { WHATSAPP_WHISPER_BIN: bin }),
     logger: captureLogger().logger,
   });
   assert.equal(await t.available(), true);
@@ -588,7 +588,7 @@ void test("available() probes with --help and nothing else, and is true when tha
 
 void test("available() is false — never a throw — when the binary is missing", async () => {
   const t = makeTranscriber({
-    config: configFor(freshDataDir(), { WA_WHISPER_BIN: "wa-mcp-no-such-whisper" }),
+    config: configFor(freshDataDir(), { WHATSAPP_WHISPER_BIN: "whatsapp-mcp-no-such-whisper" }),
     logger: captureLogger().logger,
   });
   assert.equal(await t.available(), false);
@@ -597,19 +597,19 @@ void test("available() is false — never a throw — when the binary is missing
 void test("available() is false when the binary is present but broken", async () => {
   const bin = writeStub("whisper-broken", `echo "libggml.so.0: cannot open shared object file" >&2\nexit 127`);
   const t = makeTranscriber({
-    config: configFor(freshDataDir(), { WA_WHISPER_BIN: bin }),
+    config: configFor(freshDataDir(), { WHATSAPP_WHISPER_BIN: bin }),
     logger: captureLogger().logger,
   });
   assert.equal(await t.available(), false);
 });
 
 void test("available() forks once per TTL, however often it is asked", async () => {
-  // `wa_health` is a tool a model may poll, and Task 14's `/health` is a container healthcheck that
+  // `whatsapp_health` is a tool a model may poll, and Task 14's `/health` is a container healthcheck that
   // runs on a timer — an unmemoized probe forks whisper on every one of those calls.
   const log = join(root, "help-calls.txt");
   const bin = writeStub("whisper-counted", `echo run >> "${log}"\nexit 0`);
   const t = makeTranscriber({
-    config: configFor(freshDataDir(), { WA_WHISPER_BIN: bin }),
+    config: configFor(freshDataDir(), { WHATSAPP_WHISPER_BIN: bin }),
     logger: captureLogger().logger,
     availabilityTtlMs: 10_000,
   });
@@ -625,7 +625,7 @@ void test("the availability memo expires, so a repaired install is picked up wit
   const log = join(root, "help-calls-expiry.txt");
   const bin = writeStub("whisper-counted-expiry", `echo run >> "${log}"\nexit 0`);
   const t = makeTranscriber({
-    config: configFor(freshDataDir(), { WA_WHISPER_BIN: bin }),
+    config: configFor(freshDataDir(), { WHATSAPP_WHISPER_BIN: bin }),
     logger: captureLogger().logger,
     availabilityTtlMs: 1,
   });

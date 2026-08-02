@@ -7,12 +7,12 @@ import { decodeCursor } from "../cursor.js";
 import { harness, resultJson, resultPage, resultText } from "./harness.js";
 
 const READ_TOOLS = [
-  "wa_health",
-  "wa_chats_list",
-  "wa_messages_list",
-  "wa_messages_search",
-  "wa_contacts_search",
-  "wa_groups_list",
+  "whatsapp_health",
+  "whatsapp_chats_list",
+  "whatsapp_messages_list",
+  "whatsapp_messages_search",
+  "whatsapp_contacts_search",
+  "whatsapp_groups_list",
 ] as const;
 
 const ALICE = "33611111111@s.whatsapp.net";
@@ -80,14 +80,14 @@ function countReactionQueries(ctx: ToolContext): { countsFor: number; forMessage
 
 // ── Health ────────────────────────────────────────────────────────────────
 
-void test("wa_health reports the connection state and row counts without a socket", async () => {
+void test("whatsapp_health reports the connection state and row counts without a socket", async () => {
   const h = await harness({
     state: "disconnected",
     seed: (ctx) => {
       seedChat(ctx, ALICE, false, [{ id: "M1", ts: 10 }]);
     },
   });
-  const data = resultJson(await h.client.callTool({ name: "wa_health", arguments: {} }));
+  const data = resultJson(await h.client.callTool({ name: "whatsapp_health", arguments: {} }));
 
   assert.equal(data["connection"], "disconnected");
   assert.equal(typeof data["counts"], "object");
@@ -99,50 +99,50 @@ void test("wa_health reports the connection state and row counts without a socke
   await h.close();
 });
 
-void test("wa_health is ok in every state except logged_out", async () => {
+void test("whatsapp_health is ok in every state except logged_out", async () => {
   for (const state of ["disconnected", "connecting", "pairing", "connected"] as const) {
     const h = await harness({ state });
-    const data = resultJson(await h.client.callTool({ name: "wa_health", arguments: {} }));
+    const data = resultJson(await h.client.callTool({ name: "whatsapp_health", arguments: {} }));
     assert.equal(data["ok"], true, `${state} still serves reads, so it must not flap the healthcheck`);
     await h.close();
   }
 
   const h = await harness({ state: "logged_out" });
-  const data = resultJson(await h.client.callTool({ name: "wa_health", arguments: {} }));
+  const data = resultJson(await h.client.callTool({ name: "whatsapp_health", arguments: {} }));
   assert.equal(data["ok"], false, "a logged-out server is dead until someone re-pairs it");
   assert.equal(data["needs_pairing"], true);
   await h.close();
 });
 
-void test("wa_health reports the age of the last event in seconds, not milliseconds", async () => {
+void test("whatsapp_health reports the age of the last event in seconds, not milliseconds", async () => {
   const h = await harness({ lastEventAgeSec: 42 });
-  const data = resultJson(await h.client.callTool({ name: "wa_health", arguments: {} }));
+  const data = resultJson(await h.client.callTool({ name: "whatsapp_health", arguments: {} }));
   const age = data["last_event_age_sec"] as number;
   assert.ok(age >= 42 && age <= 44, `expected ~42 seconds, got ${age}`);
   await h.close();
 });
 
-void test("wa_health carries no secret from the config", async () => {
+void test("whatsapp_health carries no secret from the config", async () => {
   const config = loadConfig({
-    WA_DATA_DIR: "/tmp/wa-health-secrets",
-    WA_MCP_TOKEN: "bearer-SUPERSECRET",
+    WHATSAPP_DATA_DIR: "/tmp/whatsapp-health-secrets",
+    WHATSAPP_MCP_TOKEN: "bearer-SUPERSECRET",
     NTFY_BASE_URL: "https://ntfy.example",
     NTFY_TOPIC: "t",
     NTFY_TOKEN: "ntfy-ALSOSECRET",
   });
   const h = await harness({ overrides: { config } });
-  const text = resultText(await h.client.callTool({ name: "wa_health", arguments: {} }));
+  const text = resultText(await h.client.callTool({ name: "whatsapp_health", arguments: {} }));
 
-  assert.doesNotMatch(text, /SUPERSECRET/, "WA_MCP_TOKEN must never reach a health response");
+  assert.doesNotMatch(text, /SUPERSECRET/, "WHATSAPP_MCP_TOKEN must never reach a health response");
   assert.doesNotMatch(text, /ALSOSECRET/, "NTFY_TOKEN must never reach a health response");
   assert.doesNotMatch(text, /ntfy\.example/);
   await h.close();
 });
 
-void test("wa_health reflects whether transcription can run", async () => {
+void test("whatsapp_health reflects whether transcription can run", async () => {
   for (const available of [true, false]) {
     const h = await harness({ transcriptionAvailable: available });
-    const data = resultJson(await h.client.callTool({ name: "wa_health", arguments: {} }));
+    const data = resultJson(await h.client.callTool({ name: "whatsapp_health", arguments: {} }));
     assert.equal(data["transcription_available"], available);
     await h.close();
   }
@@ -152,8 +152,13 @@ void test("wa_health reflects whether transcription can run", async () => {
 
 void test("every read tool works while the connection is down", async () => {
   const h = await harness({ state: "disconnected" });
-  for (const name of ["wa_chats_list", "wa_messages_list", "wa_contacts_search", "wa_groups_list"]) {
-    const res = await h.client.callTool({ name, arguments: name === "wa_contacts_search" ? { query: "a" } : {} });
+  for (const name of [
+    "whatsapp_chats_list",
+    "whatsapp_messages_list",
+    "whatsapp_contacts_search",
+    "whatsapp_groups_list",
+  ]) {
+    const res = await h.client.callTool({ name, arguments: name === "whatsapp_contacts_search" ? { query: "a" } : {} });
     assert.notEqual(res.isError, true, `${name} must not require a socket`);
   }
   await h.close();
@@ -167,7 +172,7 @@ void test("every read tool works while logged out, including search", async () =
     },
   });
   for (const name of READ_TOOLS) {
-    const args = name === "wa_messages_search" || name === "wa_contacts_search" ? { query: "bonjour" } : {};
+    const args = name === "whatsapp_messages_search" || name === "whatsapp_contacts_search" ? { query: "bonjour" } : {};
     const res = await h.client.callTool({ name, arguments: args });
     assert.notEqual(res.isError, true, `${name} must answer from SQLite in every connection state`);
   }
@@ -191,7 +196,7 @@ void test("every read tool describes what it reads and says it works offline", a
 
 // ── Chats ─────────────────────────────────────────────────────────────────
 
-void test("wa_chats_list returns chats newest first and falls back to the contact's name", async () => {
+void test("whatsapp_chats_list returns chats newest first and falls back to the contact's name", async () => {
   const h = await harness({
     seed: (ctx) => {
       ctx.contacts.upsert({ id: ALICE, name: "Alice" });
@@ -201,7 +206,7 @@ void test("wa_chats_list returns chats newest first and falls back to the contac
       ctx.chats.touch(GROUP, 20);
     },
   });
-  const { items, nextCursor } = resultPage(await h.client.callTool({ name: "wa_chats_list", arguments: {} }));
+  const { items, nextCursor } = resultPage(await h.client.callTool({ name: "whatsapp_chats_list", arguments: {} }));
 
   assert.deepEqual(ids(items), [GROUP, ALICE]);
   assert.equal(at(items, 0)["name"], "Les Copains");
@@ -212,7 +217,7 @@ void test("wa_chats_list returns chats newest first and falls back to the contac
   await h.close();
 });
 
-void test("wa_chats_list filters by name, group flag, archive and unread", async () => {
+void test("whatsapp_chats_list filters by name, group flag, archive and unread", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, ALICE, false, [{ id: "M1", ts: 10 }]);
@@ -223,7 +228,7 @@ void test("wa_chats_list filters by name, group flag, archive and unread", async
     },
   });
   const call = async (args: Record<string, unknown>): Promise<string[]> =>
-    ids(resultPage(await h.client.callTool({ name: "wa_chats_list", arguments: args })).items);
+    ids(resultPage(await h.client.callTool({ name: "whatsapp_chats_list", arguments: args })).items);
 
   assert.deepEqual(await call({ query: "alic" }), [ALICE], "the name filter is case-insensitive and a substring");
   assert.deepEqual(await call({ is_group: true }), [GROUP]);
@@ -234,7 +239,7 @@ void test("wa_chats_list filters by name, group flag, archive and unread", async
   await h.close();
 });
 
-void test("wa_groups_list returns only groups, with participant counts", async () => {
+void test("whatsapp_groups_list returns only groups, with participant counts", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, ALICE, false, [{ id: "M1", ts: 10 }]);
@@ -242,7 +247,7 @@ void test("wa_groups_list returns only groups, with participant counts", async (
       ctx.chats.patch(GROUP, { name: "Les Copains", participantCount: 7 });
     },
   });
-  const { items } = resultPage(await h.client.callTool({ name: "wa_groups_list", arguments: {} }));
+  const { items } = resultPage(await h.client.callTool({ name: "whatsapp_groups_list", arguments: {} }));
   assert.deepEqual(ids(items), [GROUP]);
   assert.equal(at(items, 0)["participant_count"], 7);
   await h.close();
@@ -250,7 +255,7 @@ void test("wa_groups_list returns only groups, with participant counts", async (
 
 // ── Messages ──────────────────────────────────────────────────────────────
 
-void test("wa_messages_list resolves sender names rather than returning bare jids", async () => {
+void test("whatsapp_messages_list resolves sender names rather than returning bare jids", async () => {
   const h = await harness({
     seed: (ctx) => {
       ctx.contacts.upsert({ id: ALICE, name: "Alice Martin" });
@@ -262,7 +267,7 @@ void test("wa_messages_list resolves sender names rather than returning bare jid
       ]);
     },
   });
-  const { items } = resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: GROUP } }));
+  const { items } = resultPage(await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: GROUP } }));
 
   assert.deepEqual(ids(items), ["M3", "M2", "M1"]);
   assert.deepEqual(at(items, 2)["sender"], { id: ALICE, name: "Alice Martin" }, "a stored name wins");
@@ -275,7 +280,7 @@ void test("wa_messages_list resolves sender names rather than returning bare jid
   await h.close();
 });
 
-void test("wa_messages_list filters by chat, sender, direction and time window", async () => {
+void test("whatsapp_messages_list filters by chat, sender, direction and time window", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, GROUP, true, [
@@ -287,7 +292,7 @@ void test("wa_messages_list filters by chat, sender, direction and time window",
     },
   });
   const call = async (args: Record<string, unknown>): Promise<string[]> =>
-    ids(resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: args })).items);
+    ids(resultPage(await h.client.callTool({ name: "whatsapp_messages_list", arguments: args })).items);
 
   assert.deepEqual(await call({}), ["D1", "M3", "M2", "M1"], "no chat filter walks every chat");
   assert.deepEqual(await call({ chat: ALICE }), ["D1"]);
@@ -300,7 +305,7 @@ void test("wa_messages_list filters by chat, sender, direction and time window",
   await h.close();
 });
 
-void test("wa_messages_list walks a chat forwards under asc", async () => {
+void test("whatsapp_messages_list walks a chat forwards under asc", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, ALICE, false, [
@@ -311,7 +316,7 @@ void test("wa_messages_list walks a chat forwards under asc", async () => {
     },
   });
   const call = async (args: Record<string, unknown>): Promise<string[]> =>
-    ids(resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: args })).items);
+    ids(resultPage(await h.client.callTool({ name: "whatsapp_messages_list", arguments: args })).items);
 
   assert.deepEqual(await call({ chat: ALICE }), ["M3", "M2", "M1"], "the default stays newest first");
   assert.deepEqual(await call({ chat: ALICE, asc: true }), ["M1", "M2", "M3"]);
@@ -320,7 +325,7 @@ void test("wa_messages_list walks a chat forwards under asc", async () => {
   await h.close();
 });
 
-void test("the message filters narrow both wa_messages_list and wa_messages_search alike", async () => {
+void test("the message filters narrow both whatsapp_messages_list and whatsapp_messages_search alike", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, GROUP, true, [
@@ -332,9 +337,9 @@ void test("the message filters narrow both wa_messages_list and wa_messages_sear
     },
   });
   const list = async (args: Record<string, unknown>): Promise<string[]> =>
-    ids(resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: args })).items);
+    ids(resultPage(await h.client.callTool({ name: "whatsapp_messages_list", arguments: args })).items);
   const search = async (args: Record<string, unknown>): Promise<string[]> =>
-    ids(resultPage(await h.client.callTool({ name: "wa_messages_search", arguments: args })).items).sort();
+    ids(resultPage(await h.client.callTool({ name: "whatsapp_messages_search", arguments: args })).items).sort();
 
   assert.deepEqual(await list({ chat: GROUP, kind: "image" }), ["P1"]);
   assert.deepEqual(await list({ chat: GROUP, has_media: true }), ["V1", "P1"]);
@@ -356,21 +361,21 @@ void test("a kind that contradicts has_media is refused rather than answered wit
       seedChat(ctx, ALICE, false, [{ id: "M1", ts: 10, text: "orange" }]);
     },
   });
-  for (const name of ["wa_messages_list", "wa_messages_search"]) {
-    const args = { kind: "text", has_media: true, ...(name === "wa_messages_search" && { query: "orange" }) };
+  for (const name of ["whatsapp_messages_list", "whatsapp_messages_search"]) {
+    const args = { kind: "text", has_media: true, ...(name === "whatsapp_messages_search" && { query: "orange" }) };
     const res = await h.client.callTool({ name, arguments: args });
     assert.equal(res.isError, true, `${name} must refuse a contradictory filter`);
     assert.match(resultText(res), /contradicts kind="text"/);
   }
   // And a consistent pair is not refused, which is what makes the check about the contradiction
   // rather than about the two arguments ever appearing together.
-  const ok = await h.client.callTool({ name: "wa_messages_list", arguments: { kind: "text", has_media: false } });
+  const ok = await h.client.callTool({ name: "whatsapp_messages_list", arguments: { kind: "text", has_media: false } });
   assert.notEqual(ok.isError, true);
   assert.deepEqual(ids(resultPage(ok).items), ["M1"]);
   await h.close();
 });
 
-void test("wa_messages_list resolves a chat named by its LID to the folded phone chat", async () => {
+void test("whatsapp_messages_list resolves a chat named by its LID to the folded phone chat", async () => {
   const lid = "5551234@lid";
   const h = await harness({
     seed: (ctx) => {
@@ -378,12 +383,12 @@ void test("wa_messages_list resolves a chat named by its LID to the folded phone
       ctx.contacts.upsert({ id: ALICE, name: "Alice", phoneNumber: "33611111111", lid: "5551234" });
     },
   });
-  const { items } = resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: lid } }));
+  const { items } = resultPage(await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: lid } }));
   assert.deepEqual(ids(items), ["M1"], "a LID argument must reach the same rows the phone jid does");
   await h.close();
 });
 
-void test("wa_messages_list carries a reaction count, not the reactions themselves", async () => {
+void test("whatsapp_messages_list carries a reaction count, not the reactions themselves", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, GROUP, true, [
@@ -394,7 +399,7 @@ void test("wa_messages_list carries a reaction count, not the reactions themselv
       ctx.reactions.set({ chatId: GROUP, messageId: "M1", senderId: BOB, emoji: "❤️", ts: 12 });
     },
   });
-  const { items } = resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: GROUP } }));
+  const { items } = resultPage(await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: GROUP } }));
 
   assert.equal(at(items, 0)["reaction_count"], 0, "M2 has none");
   assert.equal(at(items, 1)["reaction_count"], 2);
@@ -402,7 +407,7 @@ void test("wa_messages_list carries a reaction count, not the reactions themselv
   await h.close();
 });
 
-void test("wa_messages_list flags media without pretending it is downloaded", async () => {
+void test("whatsapp_messages_list flags media without pretending it is downloaded", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, ALICE, false, [
@@ -420,7 +425,7 @@ void test("wa_messages_list flags media without pretending it is downloaded", as
       });
     },
   });
-  const { items } = resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: ALICE } }));
+  const { items } = resultPage(await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: ALICE } }));
 
   assert.deepEqual(at(items, 0)["media"], { type: "image/jpeg", cached: false });
   assert.equal(at(items, 1)["media"], null, "a text message carries no media object at all");
@@ -440,7 +445,7 @@ void test("a page of reaction counts is one grouped query, not one per row", asy
   });
 
   const calls = countReactionQueries(h.ctx);
-  const { items } = resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: GROUP } }));
+  const { items } = resultPage(await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: GROUP } }));
   assert.equal(items.length, 3);
   assert.equal(calls.countsFor, 1, "one grouped query covers the whole page");
   assert.equal(calls.forMessage, 0, "a list view must never fetch reaction rows one message at a time");
@@ -448,7 +453,7 @@ void test("a page of reaction counts is one grouped query, not one per row", asy
 });
 
 void test("a search page spanning many chats is still one grouped query", async () => {
-  // The case the per-chat shape got wrong: `wa_messages_search` pages span as many chats as they
+  // The case the per-chat shape got wrong: `whatsapp_messages_search` pages span as many chats as they
   // have hits, so a query scoped to one chat is one query per chat — the same order of cost as
   // asking per row, which is what the requirement exists to rule out.
   const chats = Array.from({ length: 12 }, (_, i) => `1203630000000000${i.toString().padStart(2, "0")}@g.us`);
@@ -463,7 +468,7 @@ void test("a search page spanning many chats is still one grouped query", async 
 
   const calls = countReactionQueries(h.ctx);
   const { items } = resultPage(
-    await h.client.callTool({ name: "wa_messages_search", arguments: { query: "keyword" } }),
+    await h.client.callTool({ name: "whatsapp_messages_search", arguments: { query: "keyword" } }),
   );
   assert.equal(items.length, chats.length);
   assert.deepEqual(
@@ -478,7 +483,7 @@ void test("a search page spanning many chats is still one grouped query", async 
 
 // ── Search ────────────────────────────────────────────────────────────────
 
-void test("wa_messages_search returns transcript hits labelled as such", async () => {
+void test("whatsapp_messages_search returns transcript hits labelled as such", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, ALICE, false, [
@@ -490,7 +495,7 @@ void test("wa_messages_search returns transcript hits labelled as such", async (
   });
 
   const { items } = resultPage(
-    await h.client.callTool({ name: "wa_messages_search", arguments: { query: "bonjour" } }),
+    await h.client.callTool({ name: "whatsapp_messages_search", arguments: { query: "bonjour" } }),
   );
   assert.equal(items.length, 2);
 
@@ -528,7 +533,7 @@ void test("a transcript hit is labelled as one even when the message carries tex
   });
 
   const { items } = resultPage(
-    await h.client.callTool({ name: "wa_messages_search", arguments: { query: "bonjour" } }),
+    await h.client.callTool({ name: "whatsapp_messages_search", arguments: { query: "bonjour" } }),
   );
   const byId = new Map(items.map((i) => [i["id"] as string, i]));
   const captioned = byId.get("C1");
@@ -544,7 +549,7 @@ void test("a transcript hit is labelled as one even when the message carries tex
   await h.close();
 });
 
-void test("wa_messages_search scopes to one chat, counts reactions and never explodes on operators", async () => {
+void test("whatsapp_messages_search scopes to one chat, counts reactions and never explodes on operators", async () => {
   const h = await harness({
     seed: (ctx) => {
       seedChat(ctx, ALICE, false, [{ id: "A1", ts: 10, text: "shared keyword here" }]);
@@ -553,23 +558,28 @@ void test("wa_messages_search scopes to one chat, counts reactions and never exp
     },
   });
 
-  const all = resultPage(await h.client.callTool({ name: "wa_messages_search", arguments: { query: "keyword" } }));
+  const all = resultPage(
+    await h.client.callTool({ name: "whatsapp_messages_search", arguments: { query: "keyword" } }),
+  );
   assert.deepEqual(ids(all.items).sort(), ["A1", "G1"]);
   assert.equal(all.items.find((i) => i["id"] === "G1")?.["reaction_count"], 1, "counts are grouped per chat");
 
   const scoped = resultPage(
-    await h.client.callTool({ name: "wa_messages_search", arguments: { query: "keyword", chat: GROUP } }),
+    await h.client.callTool({ name: "whatsapp_messages_search", arguments: { query: "keyword", chat: GROUP } }),
   );
   assert.deepEqual(ids(scoped.items), ["G1"]);
 
-  const operators = await h.client.callTool({ name: "wa_messages_search", arguments: { query: 'keyword OR "x' } });
+  const operators = await h.client.callTool({
+    name: "whatsapp_messages_search",
+    arguments: { query: 'keyword OR "x' },
+  });
   assert.notEqual(operators.isError, true, "a raw query is quoted, so FTS operator characters cannot throw");
   await h.close();
 });
 
 // ── Contacts ──────────────────────────────────────────────────────────────
 
-void test("wa_contacts_search matches name, notify and phone number", async () => {
+void test("whatsapp_contacts_search matches name, notify and phone number", async () => {
   const h = await harness({
     seed: (ctx) => {
       ctx.contacts.upsert({ id: ALICE, name: "Alice Martin", phoneNumber: "33611111111" });
@@ -577,7 +587,7 @@ void test("wa_contacts_search matches name, notify and phone number", async () =
     },
   });
   const call = async (query: string): Promise<string[]> =>
-    ids(resultPage(await h.client.callTool({ name: "wa_contacts_search", arguments: { query } })).items);
+    ids(resultPage(await h.client.callTool({ name: "whatsapp_contacts_search", arguments: { query } })).items);
 
   assert.deepEqual(await call("martin"), [ALICE]);
   assert.deepEqual(await call("bobby"), [BOB]);
@@ -585,7 +595,9 @@ void test("wa_contacts_search matches name, notify and phone number", async () =
   assert.deepEqual((await call("336")).sort(), [ALICE, BOB].sort());
   assert.deepEqual(await call("nobody"), []);
 
-  const { items } = resultPage(await h.client.callTool({ name: "wa_contacts_search", arguments: { query: "martin" } }));
+  const { items } = resultPage(
+    await h.client.callTool({ name: "whatsapp_contacts_search", arguments: { query: "martin" } }),
+  );
   assert.deepEqual(items[0], { id: ALICE, name: "Alice Martin", notify: null, phone_number: "33611111111", lid: null });
   await h.close();
 });
@@ -611,7 +623,7 @@ void test("cursor pagination is stable across pages", async () => {
     const args: Record<string, unknown> = { chat: ALICE, limit: 2 };
     if (cursor !== null) args["cursor"] = cursor;
     const page: { items: Record<string, unknown>[]; nextCursor: string | null } = resultPage(
-      await h.client.callTool({ name: "wa_messages_list", arguments: args }),
+      await h.client.callTool({ name: "whatsapp_messages_list", arguments: args }),
     );
     assert.ok(page.items.length > 0, "a cursor must never hand back an empty page");
     seen.push(...ids(page.items));
@@ -640,11 +652,13 @@ void test("the last full page reports no next cursor, so no cursor ever yields n
     },
   });
 
-  const first = resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: ALICE, limit: 2 } }));
+  const first = resultPage(
+    await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: ALICE, limit: 2 } }),
+  );
   assert.equal(typeof first.nextCursor, "string");
   const second = resultPage(
     await h.client.callTool({
-      name: "wa_messages_list",
+      name: "whatsapp_messages_list",
       arguments: { chat: ALICE, limit: 2, cursor: first.nextCursor },
     }),
   );
@@ -668,14 +682,16 @@ void test("a row inserted mid-walk is re-shown, never skipped", async () => {
     },
   });
 
-  const first = resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: ALICE, limit: 2 } }));
+  const first = resultPage(
+    await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: ALICE, limit: 2 } }),
+  );
   assert.deepEqual(ids(first.items), ["M4", "M3"]);
 
   h.ctx.messages.upsert({ chatId: ALICE, id: "M5", senderId: ALICE, ts: 50, fromMe: false, kind: "text", text: "new" });
 
   const second = resultPage(
     await h.client.callTool({
-      name: "wa_messages_list",
+      name: "whatsapp_messages_list",
       arguments: { chat: ALICE, limit: 2, cursor: first.nextCursor },
     }),
   );
@@ -695,7 +711,7 @@ void test("the default page size is 50", async () => {
     },
   });
   const { items, nextCursor } = resultPage(
-    await h.client.callTool({ name: "wa_messages_list", arguments: { chat: ALICE } }),
+    await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: ALICE } }),
   );
   assert.equal(items.length, 50);
   assert.equal(typeof nextCursor, "string");
@@ -713,15 +729,20 @@ void test("a limit above the cap is rejected by the schema", async () => {
     return resultText(res);
   };
 
-  for (const name of ["wa_chats_list", "wa_messages_list", "wa_groups_list", "wa_contacts_search"]) {
-    const args = name === "wa_contacts_search" ? { query: "a", limit: 201 } : { limit: 201 };
+  for (const name of [
+    "whatsapp_chats_list",
+    "whatsapp_messages_list",
+    "whatsapp_groups_list",
+    "whatsapp_contacts_search",
+  ]) {
+    const args = name === "whatsapp_contacts_search" ? { query: "a", limit: 201 } : { limit: 201 };
     assert.match(await refused(name, args), /Input validation error/, `${name} must cap limit at 200`);
   }
-  assert.match(await refused("wa_messages_list", { limit: 0 }), /Input validation error/);
-  assert.match(await refused("wa_messages_list", { limit: -1 }), /Input validation error/);
-  assert.match(await refused("wa_messages_list", { limit: 1.5 }), /Input validation error/);
+  assert.match(await refused("whatsapp_messages_list", { limit: 0 }), /Input validation error/);
+  assert.match(await refused("whatsapp_messages_list", { limit: -1 }), /Input validation error/);
+  assert.match(await refused("whatsapp_messages_list", { limit: 1.5 }), /Input validation error/);
 
-  const ok = await h.client.callTool({ name: "wa_messages_list", arguments: { limit: 200 } });
+  const ok = await h.client.callTool({ name: "whatsapp_messages_list", arguments: { limit: 200 } });
   assert.notEqual(ok.isError, true, "200 is the cap, not one past it");
   await h.close();
 });
@@ -731,7 +752,7 @@ void test("the advertised schema is what enforces the cap", async () => {
   // visible to a client here — and its absence would be a silent regression otherwise.
   const h = await harness();
   for (const tool of (await h.client.listTools()).tools) {
-    if (tool.name === "wa_health") continue;
+    if (tool.name === "whatsapp_health") continue;
     const limit = (tool.inputSchema.properties as Record<string, Record<string, unknown>>)["limit"];
     assert.ok(limit, `${tool.name} must take a limit`);
     assert.equal(limit["maximum"], 200, `${tool.name} must advertise the cap`);
@@ -747,16 +768,21 @@ void test("a malformed cursor is an error, not a silent restart from the first p
       seedChat(ctx, ALICE, false, [{ id: "M1", ts: 10 }]);
     },
   });
-  for (const name of ["wa_chats_list", "wa_messages_list", "wa_groups_list", "wa_messages_search"]) {
+  for (const name of [
+    "whatsapp_chats_list",
+    "whatsapp_messages_list",
+    "whatsapp_groups_list",
+    "whatsapp_messages_search",
+  ]) {
     const args: Record<string, unknown> = { cursor: "not-a-real-cursor!!" };
-    if (name === "wa_messages_search") args["query"] = "message";
+    if (name === "whatsapp_messages_search") args["query"] = "message";
     const res = await h.client.callTool({ name, arguments: args });
     assert.equal(res.isError, true, `${name} must refuse a malformed cursor`);
     assert.match(resultText(res), /cursor/i);
     assert.doesNotMatch(resultText(res), /"items"/, "it must not quietly answer with page 1");
   }
   const contacts = await h.client.callTool({
-    name: "wa_contacts_search",
+    name: "whatsapp_contacts_search",
     arguments: { query: "a", cursor: "not-a-real-cursor!!" },
   });
   assert.equal(contacts.isError, true);
@@ -769,7 +795,7 @@ void test("an empty query is rejected rather than matching everything", async ()
       seedChat(ctx, ALICE, false, [{ id: "M1", ts: 10 }]);
     },
   });
-  for (const name of ["wa_contacts_search", "wa_messages_search"]) {
+  for (const name of ["whatsapp_contacts_search", "whatsapp_messages_search"]) {
     const res = await h.client.callTool({ name, arguments: { query: "" } });
     assert.equal(res.isError, true, `${name} must refuse an empty query`);
     assert.match(resultText(res), /Input validation error/);
@@ -778,7 +804,7 @@ void test("an empty query is rejected rather than matching everything", async ()
 });
 
 void test("an oversized payload is truncated with the true length named", async () => {
-  const config = { ...loadConfig({ WA_DATA_DIR: "/tmp/wa-trunc" }), maxResultChars: 1000 };
+  const config = { ...loadConfig({ WHATSAPP_DATA_DIR: "/tmp/whatsapp-trunc" }), maxResultChars: 1000 };
   const h = await harness({
     overrides: { config },
     seed: (ctx) => {
@@ -790,7 +816,7 @@ void test("an oversized payload is truncated with the true length named", async 
       );
     },
   });
-  const text = resultText(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: ALICE } }));
+  const text = resultText(await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: ALICE } }));
   assert.ok(text.length < 1400, `expected a capped payload, got ${text.length} chars`);
   assert.match(text, /truncated: \d{4,} chars total/);
   assert.match(text, /will not parse/, "the note must say the JSON above is incomplete, not merely shortened");
@@ -801,7 +827,7 @@ void test("a truncated page still carries its next_cursor, so the round trip sur
   // `jsonResult` cuts from the end, so field order decides what a page over the cap loses. With
   // `items` first, the casualty is always the cursor — and a caller that cannot read the cursor
   // cannot narrow its request by paging either, which is the remedy the note recommends.
-  const config = { ...loadConfig({ WA_DATA_DIR: "/tmp/wa-trunc-cursor" }), maxResultChars: 500 };
+  const config = { ...loadConfig({ WHATSAPP_DATA_DIR: "/tmp/whatsapp-trunc-cursor" }), maxResultChars: 500 };
   const h = await harness({
     overrides: { config },
     seed: (ctx) => {
@@ -814,7 +840,9 @@ void test("a truncated page still carries its next_cursor, so the round trip sur
     },
   });
 
-  const text = resultText(await h.client.callTool({ name: "wa_messages_list", arguments: { chat: ALICE, limit: 2 } }));
+  const text = resultText(
+    await h.client.callTool({ name: "whatsapp_messages_list", arguments: { chat: ALICE, limit: 2 } }),
+  );
   assert.match(text, /truncated/, "the seed must be big enough to be cut, or this proves nothing");
   const cursor = /"next_cursor": "([^"]+)"/.exec(text)?.[1];
   assert.ok(cursor, "the cursor must survive a payload the tool had to cut");

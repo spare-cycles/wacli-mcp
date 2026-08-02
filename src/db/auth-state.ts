@@ -96,7 +96,7 @@ export function makeAuthStore(db: Db): AuthStore {
   /**
    * Reset the live creds object in place, to a brand-new identity.
    *
-   * **In place, on the same object**, because `wa/connection.ts` hands `state.creds` straight to
+   * **In place, on the same object**, because `whatsapp/connection.ts` hands `state.creds` straight to
    * `makeSocket` and Baileys goes on mutating whatever it was given: rebinding here would leave the
    * socket writing into an orphan while this module read a different object.
    *
@@ -121,7 +121,7 @@ export function makeAuthStore(db: Db): AuthStore {
    *
    * The two halves are one operation, which is why they share a transaction. `state.creds` is the
    * object the socket was built from, so deleting the rows and leaving it untouched would leave a
-   * `start()` after `logged_out` — a transition `wa/connection.ts` documents and allows — trying to
+   * `start()` after `logged_out` — a transition `whatsapp/connection.ts` documents and allows — trying to
    * re-authenticate with precisely the credentials WhatsApp has just rejected. And because
    * `attachListeners` never detaches, one late `creds.update` from the dead socket would call
    * `saveCreds()` and write that identity straight back over the wipe. Regenerating in place closes

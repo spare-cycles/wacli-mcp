@@ -27,11 +27,15 @@ import type { Logger } from "pino";
 import { makeChatsRepo } from "../db/chats.js";
 import { closeDb, openDb, type Db } from "../db/client.js";
 import { makeMessagesRepo, type MessageKind, type MessagesRepo } from "../db/messages.js";
-import { ConnectionUnavailableError, type ConnectionSnapshot, type WaConnection } from "../wa/connection.js";
-import * as fx from "../wa/fixtures.js";
+import {
+  ConnectionUnavailableError,
+  type ConnectionSnapshot,
+  type WhatsAppConnection,
+} from "../whatsapp/connection.js";
+import * as fx from "../whatsapp/fixtures.js";
 import { makeMediaStore, MediaUnavailableError, MessageNotFoundError, type MediaDownloader } from "./store.js";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-store-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-store-"));
 const opened: Db[] = [];
 after(() => {
   for (const db of opened) closeDb(db);
@@ -82,7 +86,7 @@ let harnessCount = 0;
 function harness(o: HarnessOptions = {}) {
   harnessCount += 1;
   const root = join(dir, `h${harnessCount}`);
-  const db = openDb(join(root, "wa.db"));
+  const db = openDb(join(root, "whatsapp.db"));
   opened.push(db);
   const messages = makeMessagesRepo(db);
   makeChatsRepo(db).ensure(fx.FIXTURE_DM, false);
@@ -97,7 +101,7 @@ function harness(o: HarnessOptions = {}) {
     },
   } as unknown as WASocket;
 
-  const conn: WaConnection = {
+  const conn: WhatsAppConnection = {
     snapshot: (): ConnectionSnapshot => ({
       state: offline ? "disconnected" : "connected",
       lastEventAt: 0,

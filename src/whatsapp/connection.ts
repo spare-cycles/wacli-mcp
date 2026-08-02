@@ -34,7 +34,7 @@ export type ConnectionDeps = {
   makeSocket?: typeof import("baileys").makeWASocket | undefined;
 };
 
-export type WaConnection = {
+export type WhatsAppConnection = {
   snapshot: () => ConnectionSnapshot;
   /** The live socket, or throws a ConnectionUnavailableError naming the current state. */
   requireSocket: () => WASocket;
@@ -71,7 +71,7 @@ function nowSec(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-export function makeConnection(deps: ConnectionDeps): WaConnection {
+export function makeConnection(deps: ConnectionDeps): WhatsAppConnection {
   const { config, logger, auth, loadMessage, onSocket } = deps;
   const makeSocket = deps.makeSocket ?? defaultMakeSocket;
 
@@ -154,7 +154,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
   function discardUnregisteredIdentity(): void {
     if (auth.state.creds.registered) return;
     if (auth.state.creds.me === undefined) return;
-    logger.info("wa: discarding the unregistered identity left behind by an unclaimed pairing code");
+    logger.info("whatsapp: discarding the unregistered identity left behind by an unclaimed pairing code");
     auth.clear();
   }
 
@@ -204,7 +204,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
     } catch (err) {
       // makeSocket threw synchronously (bad auth blob, unusable config): treat as an ordinary
       // failed attempt. Must not reject start() and take the process down.
-      logger.error({ err }, "wa: makeSocket threw synchronously");
+      logger.error({ err }, "whatsapp: makeSocket threw synchronously");
       touch();
       setState("disconnected");
       attempts += 1;
@@ -247,7 +247,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
    */
   function handleQr(activeSock: WASocket): void {
     if (config.phoneNumber === undefined) {
-      // Pairing is by code only (no rendered QR): without WA_PHONE_NUMBER this deployment sits in
+      // Pairing is by code only (no rendered QR): without WHATSAPP_PHONE_NUMBER this deployment sits in
       // `pairing` forever with nothing to act on. Say so loudly, but only once per socket — the QR
       // itself rotates and re-emits every ~20s, so an unguarded log here would spam. Never log the
       // `qr` payload: it is a live credential, and anyone reading the logs could link their own
@@ -255,7 +255,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
       if (!missingPhoneNumberLoggedForSocket) {
         missingPhoneNumberLoggedForSocket = true;
         logger.error(
-          'wa: WA_PHONE_NUMBER is not set; pairing requires it (E.164 digits, no leading "+"). The server will keep waiting in the pairing state until it is configured.',
+          'whatsapp: WHATSAPP_PHONE_NUMBER is not set; pairing requires it (E.164 digits, no leading "+"). The server will keep waiting in the pairing state until it is configured.',
         );
       }
       setState("pairing");
@@ -276,7 +276,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
   async function requestPairingCode(activeSock: WASocket, phoneNumber: string): Promise<void> {
     try {
       const pairingCode = await activeSock.requestPairingCode(phoneNumber);
-      logger.info({ pairingCode }, "wa: pairing code issued");
+      logger.info({ pairingCode }, "whatsapp: pairing code issued");
       // Deliberately unmissable in a Portainer log tail, on top of the structured log line above.
       console.log(`\n=== WhatsApp pairing code: ${pairingCode} ===\n`);
     } catch (err) {
@@ -285,7 +285,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
       // request is precisely when someone goes reading the logs. The error and the fact that the
       // request failed are the whole of the diagnostic value here; the QR adds none of it, and the
       // function no longer takes one so there is nothing to reach for.
-      logger.error({ err }, "wa: requestPairingCode failed");
+      logger.error({ err }, "whatsapp: requestPairingCode failed");
     }
   }
 
@@ -343,7 +343,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
       try {
         await current.end(undefined);
       } catch (err) {
-        logger.warn({ err }, "wa: error ending socket on stop");
+        logger.warn({ err }, "whatsapp: error ending socket on stop");
       }
     }
     if (state !== "logged_out") setState("disconnected");

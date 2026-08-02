@@ -5,7 +5,7 @@
  * Everything here goes through the linked in-memory client, so a call is parsed by the SDK's own
  * schema validation before a handler ever sees it — which is the only way to see the tool list, and
  * the advertised argument schemas, that a real client would see. That matters more than it sounds:
- * the `wa_send_file` schema test below catches a failure mode in which every tool call still behaves
+ * the `whatsapp_send_file` schema test below catches a failure mode in which every tool call still behaves
  * correctly and the advertised schema is empty.
  *
  * Two things are deliberately **not** stubbed. The image and video branches run jimp, ffmpeg and
@@ -29,7 +29,7 @@ import { promisify } from "node:util";
 import type { MessageKind } from "../db/messages.js";
 import { MediaUnavailableError, type MediaFile, type MediaStore } from "../media/store.js";
 import { TranscriptionError, type Transcriber } from "../media/transcribe.js";
-import { ConnectionUnavailableError } from "../wa/connection.js";
+import { ConnectionUnavailableError } from "../whatsapp/connection.js";
 import {
   MessageRevokedError,
   NotFoundError,
@@ -39,7 +39,7 @@ import {
   type Sender,
   type SendFileOptions,
   type SendTextOptions,
-} from "../wa/send.js";
+} from "../whatsapp/send.js";
 import type { ToolContext } from "./context.js";
 import { buildMcpServer } from "./server.js";
 import { harness, resultText, type Harness, type HarnessOptions, type RawToolResult } from "./tools/harness.js";
@@ -50,33 +50,33 @@ const CHAT = "33611111111@s.whatsapp.net";
 const MSG = "M1";
 
 const WRITE_TOOLS = [
-  "wa_send_text",
-  "wa_send_file",
-  "wa_react",
-  "wa_mark_read",
-  "wa_edit_message",
-  "wa_delete_message",
+  "whatsapp_send_text",
+  "whatsapp_send_file",
+  "whatsapp_react",
+  "whatsapp_mark_read",
+  "whatsapp_edit_message",
+  "whatsapp_delete_message",
 ] as const;
 
 const ALL_TOOLS = [
-  "wa_chats_list",
-  "wa_contacts_search",
-  "wa_delete_message",
-  "wa_download_media",
-  "wa_edit_message",
-  "wa_groups_list",
-  "wa_health",
-  "wa_mark_read",
-  "wa_messages_list",
-  "wa_messages_search",
-  "wa_react",
-  "wa_send_file",
-  "wa_send_text",
-  "wa_transcribe",
+  "whatsapp_chats_list",
+  "whatsapp_contacts_search",
+  "whatsapp_delete_message",
+  "whatsapp_download_media",
+  "whatsapp_edit_message",
+  "whatsapp_groups_list",
+  "whatsapp_health",
+  "whatsapp_mark_read",
+  "whatsapp_messages_list",
+  "whatsapp_messages_search",
+  "whatsapp_react",
+  "whatsapp_send_file",
+  "whatsapp_send_text",
+  "whatsapp_transcribe",
 ];
 
 /** Fixtures are built once: ffmpeg is not free, and nothing here mutates them. */
-const dir = mkdtempSync(join(tmpdir(), "wa-mcp-server-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-mcp-server-"));
 const pngPath = join(dir, "photo.png");
 const webpPath = join(dir, "sticker.webp");
 const mp4Path = join(dir, "clip.mp4");
@@ -145,11 +145,11 @@ void test("read-only mode hides every write tool and keeps the rest", async () =
   try {
     const names = await toolNames(h);
     for (const n of WRITE_TOOLS) assert.ok(!names.includes(n), `${n} must not be advertised in read-only mode`);
-    assert.ok(names.includes("wa_chats_list"));
+    assert.ok(names.includes("whatsapp_chats_list"));
     // The media tools are not write tools: neither one changes anything on WhatsApp, and a read-only
     // deployment that could not look at an attachment would be crippled for no gain.
-    assert.ok(names.includes("wa_download_media"));
-    assert.ok(names.includes("wa_transcribe"));
+    assert.ok(names.includes("whatsapp_download_media"));
+    assert.ok(names.includes("whatsapp_transcribe"));
   } finally {
     await h.close();
   }
@@ -164,10 +164,10 @@ void test("all fourteen tools are advertised in normal mode", async () => {
   }
 });
 
-void test("every tool name is wa_-prefixed", async () => {
+void test("every tool name is whatsapp_-prefixed", async () => {
   const h = await serverHarness({});
   try {
-    for (const name of await toolNames(h)) assert.match(name, /^wa_/);
+    for (const name of await toolNames(h)) assert.match(name, /^whatsapp_/);
   } finally {
     await h.close();
   }
@@ -180,7 +180,7 @@ void test("the advertised version is the one in package.json", async () => {
   const h = await serverHarness({});
   try {
     assert.equal(h.client.getServerVersion()?.version, pkg.version);
-    assert.equal(h.client.getServerVersion()?.name, "wa-mcp");
+    assert.equal(h.client.getServerVersion()?.name, "whatsapp-mcp");
   } finally {
     await h.close();
   }
@@ -191,7 +191,7 @@ void test("the advertised version is the one in package.json", async () => {
 void test("a write tool fails with the connection state named when the socket is down", async () => {
   const h = await serverHarness({ state: "disconnected" });
   try {
-    const res = await h.client.callTool({ name: "wa_send_text", arguments: { chat: CHAT, text: "hi" } });
+    const res = await h.client.callTool({ name: "whatsapp_send_text", arguments: { chat: CHAT, text: "hi" } });
     assert.equal(res.isError, true);
     assert.match(resultText(res), /disconnected/);
   } finally {
@@ -199,10 +199,10 @@ void test("a write tool fails with the connection state named when the socket is
   }
 });
 
-void test("wa_send_text answers with the reference WhatsApp gave back", async () => {
+void test("whatsapp_send_text answers with the reference WhatsApp gave back", async () => {
   const h = await serverHarness({});
   try {
-    const res = await h.client.callTool({ name: "wa_send_text", arguments: { chat: CHAT, text: "hi" } });
+    const res = await h.client.callTool({ name: "whatsapp_send_text", arguments: { chat: CHAT, text: "hi" } });
     assert.notEqual(res.isError, true, resultText(res));
     assert.deepEqual(JSON.parse(resultText(res)), { chat: "c", message_id: "S1" });
   } finally {
@@ -210,7 +210,7 @@ void test("wa_send_text answers with the reference WhatsApp gave back", async ()
   }
 });
 
-void test("wa_send_file passes every argument through to the sender under the right name", async () => {
+void test("whatsapp_send_file passes every argument through to the sender under the right name", async () => {
   const files: { chat: string; src: FileSource; opts: SendFileOptions }[] = [];
   const texts: { chat: string; text: string; opts: SendTextOptions | undefined }[] = [];
   const sender: Sender = {
@@ -229,7 +229,7 @@ void test("wa_send_file passes every argument through to the sender under the ri
     // Snake_case in, camelCase out: this is the only place that renaming happens, and a swap between
     // two adjacent string options would be invisible to every other test in this file.
     await h.client.callTool({
-      name: "wa_send_file",
+      name: "whatsapp_send_file",
       arguments: {
         chat: CHAT,
         data: "aGk=",
@@ -253,12 +253,12 @@ void test("wa_send_file passes every argument through to the sender under the ri
       pick: undefined,
     });
 
-    await h.client.callTool({ name: "wa_send_file", arguments: { chat: CHAT, path: "/data/uploads/a.png" } });
+    await h.client.callTool({ name: "whatsapp_send_file", arguments: { chat: CHAT, path: "/data/uploads/a.png" } });
     const byPath = files[1];
     assert.ok(byPath !== undefined);
     assert.deepEqual(byPath.src, { kind: "path", path: "/data/uploads/a.png" });
 
-    await h.client.callTool({ name: "wa_send_text", arguments: { chat: CHAT, text: "hi", reply_to: "M7" } });
+    await h.client.callTool({ name: "whatsapp_send_text", arguments: { chat: CHAT, text: "hi", reply_to: "M7" } });
     assert.deepEqual(texts[0], {
       chat: CHAT,
       text: "hi",
@@ -268,7 +268,7 @@ void test("wa_send_file passes every argument through to the sender under the ri
     // `mention` and `pick` reach the sender under their own names too — the two arguments the old
     // server had and this one had lost.
     await h.client.callTool({
-      name: "wa_send_text",
+      name: "whatsapp_send_text",
       arguments: { chat: "Marie", text: "@33611111111 coucou", pick: 2, mention: ["33611111111"] },
     });
     assert.deepEqual(texts[1], {
@@ -281,7 +281,7 @@ void test("wa_send_file passes every argument through to the sender under the ri
   }
 });
 
-void test("wa_react accepts an empty emoji, which is how WhatsApp removes a reaction", async () => {
+void test("whatsapp_react accepts an empty emoji, which is how WhatsApp removes a reaction", async () => {
   const calls: string[] = [];
   const sender: Sender = {
     ...failingSender(new Error("not part of this test")),
@@ -292,7 +292,10 @@ void test("wa_react accepts an empty emoji, which is how WhatsApp removes a reac
   };
   const h = await serverHarness({ overrides: { sender } });
   try {
-    const res = await h.client.callTool({ name: "wa_react", arguments: { chat: CHAT, message_id: MSG, emoji: "" } });
+    const res = await h.client.callTool({
+      name: "whatsapp_react",
+      arguments: { chat: CHAT, message_id: MSG, emoji: "" },
+    });
     assert.notEqual(res.isError, true, resultText(res));
     assert.deepEqual(calls, [""], "a `min(1)` on the emoji would make removal impossible");
   } finally {
@@ -300,21 +303,21 @@ void test("wa_react accepts an empty emoji, which is how WhatsApp removes a reac
   }
 });
 
-void test("wa_send_file rejects a request carrying neither path nor data", async () => {
+void test("whatsapp_send_file rejects a request carrying neither path nor data", async () => {
   const h = await serverHarness({});
   try {
-    const res = await h.client.callTool({ name: "wa_send_file", arguments: { chat: CHAT } });
+    const res = await h.client.callTool({ name: "whatsapp_send_file", arguments: { chat: CHAT } });
     assert.equal(res.isError, true);
   } finally {
     await h.close();
   }
 });
 
-void test("wa_send_file rejects a request carrying both path and data", async () => {
+void test("whatsapp_send_file rejects a request carrying both path and data", async () => {
   const h = await serverHarness({});
   try {
     const args = { chat: CHAT, path: "/data/uploads/a.png", data: "aGk=" };
-    const res = await h.client.callTool({ name: "wa_send_file", arguments: args });
+    const res = await h.client.callTool({ name: "whatsapp_send_file", arguments: args });
     assert.equal(res.isError, true);
   } finally {
     await h.close();
@@ -325,7 +328,7 @@ void test("every tool advertises its arguments, flat and not as a union", async 
   const h = await serverHarness({});
   try {
     const tools = (await h.client.listTools()).tools;
-    // Regression guard with teeth. `wa_send_file` was specified as a `.refine()`d Zod object, which
+    // Regression guard with teeth. `whatsapp_send_file` was specified as a `.refine()`d Zod object, which
     // sdk 1.30 cannot describe: `normalizeObjectSchema` looks for `.shape`, a `ZodEffects` has none,
     // and the tool ends up advertised as `{"type":"object","properties":{}}` — every argument
     // invisible to every client — while still validating server-side, so nothing else notices.
@@ -333,14 +336,14 @@ void test("every tool advertises its arguments, flat and not as a union", async 
       const schema = tool.inputSchema as { type?: string; properties?: Record<string, unknown> };
       assert.equal(schema.type, "object", `${tool.name}: input schema must be an object`);
       assert.ok(!("anyOf" in schema) && !("oneOf" in schema), `${tool.name}: the top level must not be a union`);
-      if (tool.name === "wa_health") continue; // the one tool that really takes no arguments
+      if (tool.name === "whatsapp_health") continue; // the one tool that really takes no arguments
       assert.ok(Object.keys(schema.properties ?? {}).length > 0, `${tool.name}: arguments must be advertised`);
     }
 
-    const sendFile = tools.find((t) => t.name === "wa_send_file")?.inputSchema as
+    const sendFile = tools.find((t) => t.name === "whatsapp_send_file")?.inputSchema as
       { properties?: Record<string, unknown>; required?: string[] } | undefined;
     for (const key of ["chat", "path", "data", "filename", "mimetype", "caption", "reply_to", "as_voice_note"]) {
-      assert.ok(sendFile?.properties?.[key] !== undefined, `${key} must be a top-level property of wa_send_file`);
+      assert.ok(sendFile?.properties?.[key] !== undefined, `${key} must be a top-level property of whatsapp_send_file`);
     }
     assert.deepEqual(sendFile?.required, ["chat"], "only the chat is unconditionally required");
   } finally {
@@ -352,23 +355,23 @@ void test("a sender failure comes back as a tool error, never as a thrown protoc
   const cases = [
     {
       err: new NotFoundError("no message M9 in chat c"),
-      tool: "wa_react",
+      tool: "whatsapp_react",
       args: { chat: CHAT, message_id: "M9", emoji: "👍" },
     },
     {
       err: new NotOwnMessageError("message M1 was not sent by this account"),
-      tool: "wa_edit_message",
+      tool: "whatsapp_edit_message",
       args: { chat: CHAT, message_id: MSG, text: "x" },
     },
     {
       err: new MessageRevokedError("message M1 in chat c was revoked"),
-      tool: "wa_send_text",
+      tool: "whatsapp_send_text",
       args: { chat: CHAT, text: "re", reply_to: MSG },
     },
     {
       // `send.ts` never echoes the offending path, and neither may the tool that reports it.
-      err: new SendPathError("sending a file by path is disabled; set WA_SEND_FILE_DIR"),
-      tool: "wa_send_file",
+      err: new SendPathError("sending a file by path is disabled; set WHATSAPP_SEND_FILE_DIR"),
+      tool: "whatsapp_send_file",
       args: { chat: CHAT, path: "/etc/passwd" },
     },
   ];
@@ -384,16 +387,16 @@ void test("a sender failure comes back as a tool error, never as a thrown protoc
   }
 });
 
-void test("wa_mark_read and wa_delete_message report success without inventing a message id", async () => {
+void test("whatsapp_mark_read and whatsapp_delete_message report success without inventing a message id", async () => {
   const h = await serverHarness({});
   try {
-    for (const tool of ["wa_mark_read", "wa_delete_message"]) {
+    for (const tool of ["whatsapp_mark_read", "whatsapp_delete_message"]) {
       const res = await h.client.callTool({ name: tool, arguments: { chat: CHAT, message_id: MSG } });
       assert.notEqual(res.isError, true, resultText(res));
       // `chat` is the id the sender resolved the call against — the stub answers "c" for every
       // method — and not the string that went in. One field name cannot mean the canonical chat in
-      // `wa_send_text` and "whatever you typed" here: a caller naming a chat by its LID would get
-      // its own LID back and read an empty conversation when it fed that to wa_messages_list.
+      // `whatsapp_send_text` and "whatever you typed" here: a caller naming a chat by its LID would get
+      // its own LID back and read an empty conversation when it fed that to whatsapp_messages_list.
       assert.deepEqual(JSON.parse(resultText(res)), { status: "ok", chat: "c", message_id: MSG });
     }
   } finally {
@@ -406,7 +409,7 @@ void test("wa_mark_read and wa_delete_message report success without inventing a
  *
  * `markRead`, `deleteMessage`, `editMessage` and `react` all take `(chat, messageId, …)` as strings,
  * so a transposed pair type-checks, and two of the six tools are otherwise asserted identically —
- * which means calling `markRead` inside `wa_delete_message` passes every other test in this file.
+ * which means calling `markRead` inside `whatsapp_delete_message` passes every other test in this file.
  * Distinct values for the chat and the id are what make a swap visible; recording the method name is
  * what makes the wrong-method-entirely case visible.
  */
@@ -428,7 +431,7 @@ void test("each write tool calls its own sender method, with the chat and the me
   const h = await serverHarness({ overrides: { sender } });
   try {
     const args = { chat: CHAT, message_id: MSG, emoji: "\u{1F44D}", text: "corrigé" };
-    for (const tool of ["wa_react", "wa_mark_read", "wa_edit_message", "wa_delete_message"]) {
+    for (const tool of ["whatsapp_react", "whatsapp_mark_read", "whatsapp_edit_message", "whatsapp_delete_message"]) {
       const res = await h.client.callTool({ name: tool, arguments: args });
       assert.notEqual(res.isError, true, `${tool}: ${resultText(res)}`);
     }
@@ -443,9 +446,9 @@ void test("each write tool calls its own sender method, with the chat and the me
   }
 });
 
-// --- wa_download_media ------------------------------------------------------------------------
+// --- whatsapp_download_media ------------------------------------------------------------------------
 
-void test("wa_download_media returns image blocks for an image message", async () => {
+void test("whatsapp_download_media returns image blocks for an image message", async () => {
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "image", "image/png");
@@ -454,7 +457,10 @@ void test("wa_download_media returns image blocks for an image message", async (
     overrides: { media: mediaAt(pngPath, "image/png") },
   });
   try {
-    const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
+    const res = await h.client.callTool({
+      name: "whatsapp_download_media",
+      arguments: { chat: CHAT, message_id: MSG },
+    });
     assert.notEqual(res.isError, true, resultText(res));
 
     const images = imageBlocks(res);
@@ -478,7 +484,7 @@ void test("wa_download_media returns image blocks for an image message", async (
   }
 });
 
-void test("wa_download_media decodes a sticker, which is always WebP", async () => {
+void test("whatsapp_download_media decodes a sticker, which is always WebP", async () => {
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "sticker", "image/webp");
@@ -486,7 +492,10 @@ void test("wa_download_media decodes a sticker, which is always WebP", async () 
     overrides: { media: mediaAt(webpPath, "image/webp") },
   });
   try {
-    const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
+    const res = await h.client.callTool({
+      name: "whatsapp_download_media",
+      arguments: { chat: CHAT, message_id: MSG },
+    });
     assert.notEqual(res.isError, true, resultText(res));
     assert.equal(imageBlocks(res).length, 1);
     assert.equal(summaryOf(res)["width"], 128);
@@ -495,7 +504,7 @@ void test("wa_download_media decodes a sticker, which is always WebP", async () 
   }
 });
 
-void test("wa_download_media samples a video and never exceeds the keyframe budget", async () => {
+void test("whatsapp_download_media samples a video and never exceeds the keyframe budget", async () => {
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "video", "video/mp4");
@@ -503,7 +512,10 @@ void test("wa_download_media samples a video and never exceeds the keyframe budg
     overrides: { media: mediaAt(mp4Path, "video/mp4") },
   });
   try {
-    const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
+    const res = await h.client.callTool({
+      name: "whatsapp_download_media",
+      arguments: { chat: CHAT, message_id: MSG },
+    });
     assert.notEqual(res.isError, true, resultText(res));
 
     // The `videoKeyframes + 1` cap in `compose` is deliberately *not* asserted here. No branch can
@@ -521,7 +533,7 @@ void test("wa_download_media samples a video and never exceeds the keyframe budg
   }
 });
 
-void test("wa_download_media returns the cached transcript for an audio message", async () => {
+void test("whatsapp_download_media returns the cached transcript for an audio message", async () => {
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "audio", "audio/ogg");
@@ -530,7 +542,10 @@ void test("wa_download_media returns the cached transcript for an audio message"
     overrides: { media: mediaAt(docPath, "audio/ogg") },
   });
   try {
-    const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
+    const res = await h.client.callTool({
+      name: "whatsapp_download_media",
+      arguments: { chat: CHAT, message_id: MSG },
+    });
     assert.notEqual(res.isError, true, resultText(res));
     assert.equal(imageBlocks(res).length, 0, "audio carries no picture");
     assert.match(resultText(res), /bonjour, c'est un message vocal/);
@@ -541,7 +556,7 @@ void test("wa_download_media returns the cached transcript for an audio message"
   }
 });
 
-void test("wa_download_media tells the model to transcribe an untranscribed voice note", async () => {
+void test("whatsapp_download_media tells the model to transcribe an untranscribed voice note", async () => {
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "audio", "audio/ogg");
@@ -549,9 +564,12 @@ void test("wa_download_media tells the model to transcribe an untranscribed voic
     overrides: { media: mediaAt(mp4Path, "audio/ogg") },
   });
   try {
-    const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
+    const res = await h.client.callTool({
+      name: "whatsapp_download_media",
+      arguments: { chat: CHAT, message_id: MSG },
+    });
     assert.notEqual(res.isError, true, resultText(res));
-    assert.match(resultText(res), /wa_transcribe/);
+    assert.match(resultText(res), /whatsapp_transcribe/);
     assert.equal(summaryOf(res)["duration_sec"], 2, "the duration is what tells the model whether it is worth it");
     assert.equal(h.transcribeCalls.n, 0);
   } finally {
@@ -559,7 +577,7 @@ void test("wa_download_media tells the model to transcribe an untranscribed voic
   }
 });
 
-void test("wa_download_media hands back the cache path for a document it cannot render", async () => {
+void test("whatsapp_download_media hands back the cache path for a document it cannot render", async () => {
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "document", "application/octet-stream");
@@ -567,7 +585,10 @@ void test("wa_download_media hands back the cache path for a document it cannot 
     overrides: { media: mediaAt(docPath, "application/octet-stream") },
   });
   try {
-    const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
+    const res = await h.client.callTool({
+      name: "whatsapp_download_media",
+      arguments: { chat: CHAT, message_id: MSG },
+    });
     assert.notEqual(res.isError, true, resultText(res));
     const summary = summaryOf(res);
     assert.equal(summary["path"], docPath);
@@ -590,7 +611,10 @@ void test("a PDF whose text cannot be extracted degrades to the summary rather t
     overrides: { media: mediaAt(docPath, "application/pdf") },
   });
   try {
-    const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
+    const res = await h.client.callTool({
+      name: "whatsapp_download_media",
+      arguments: { chat: CHAT, message_id: MSG },
+    });
     assert.notEqual(res.isError, true, "one failed extraction must not throw away the whole answer");
     assert.match(resultText(res), /pdftotext/, "and it says why the text is missing");
     const summary = summaryOf(res);
@@ -602,10 +626,13 @@ void test("a PDF whose text cannot be extracted degrades to the summary rather t
   }
 });
 
-void test("wa_download_media refuses a message the store has never seen", async () => {
+void test("whatsapp_download_media refuses a message the store has never seen", async () => {
   const h = await serverHarness({});
   try {
-    const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: "M404" } });
+    const res = await h.client.callTool({
+      name: "whatsapp_download_media",
+      arguments: { chat: CHAT, message_id: "M404" },
+    });
     assert.equal(res.isError, true);
     assert.match(resultText(res), /M404/);
   } finally {
@@ -613,7 +640,7 @@ void test("wa_download_media refuses a message the store has never seen", async 
   }
 });
 
-void test("wa_download_media distinguishes a downed connection from media that is gone", async () => {
+void test("whatsapp_download_media distinguishes a downed connection from media that is gone", async () => {
   const gone = new MediaUnavailableError("WhatsApp media URLs expire, so a message this old is no longer downloadable");
   const down = new ConnectionUnavailableError("connecting");
   for (const err of [gone, down]) {
@@ -626,7 +653,10 @@ void test("wa_download_media distinguishes a downed connection from media that i
       },
     });
     try {
-      const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
+      const res = await h.client.callTool({
+        name: "whatsapp_download_media",
+        arguments: { chat: CHAT, message_id: MSG },
+      });
       assert.equal(res.isError, true);
       assert.ok(resultText(res).includes(err.name), `the two failures must stay distinguishable: ${resultText(res)}`);
     } finally {
@@ -635,9 +665,9 @@ void test("wa_download_media distinguishes a downed connection from media that i
   }
 });
 
-// --- wa_transcribe ----------------------------------------------------------------------------
+// --- whatsapp_transcribe ----------------------------------------------------------------------------
 
-void test("wa_transcribe caches: a second call does not re-run whisper", async () => {
+void test("whatsapp_transcribe caches: a second call does not re-run whisper", async () => {
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "audio", "audio/ogg");
@@ -645,14 +675,14 @@ void test("wa_transcribe caches: a second call does not re-run whisper", async (
     overrides: { media: mediaAt(docPath, "audio/ogg") },
   });
   try {
-    const first = await h.client.callTool({ name: "wa_transcribe", arguments: { chat: CHAT, message_id: MSG } });
+    const first = await h.client.callTool({ name: "whatsapp_transcribe", arguments: { chat: CHAT, message_id: MSG } });
     assert.notEqual(first.isError, true, resultText(first));
     assert.equal(resultText(first), "transcrit");
     assert.equal(h.transcribeCalls.n, 1);
-    // Written through, so wa_messages_search finds it: setTranscript re-indexes into FTS.
+    // Written through, so whatsapp_messages_search finds it: setTranscript re-indexes into FTS.
     assert.equal(h.ctx.messages.get(CHAT, MSG)?.transcript, "transcrit");
 
-    const second = await h.client.callTool({ name: "wa_transcribe", arguments: { chat: CHAT, message_id: MSG } });
+    const second = await h.client.callTool({ name: "whatsapp_transcribe", arguments: { chat: CHAT, message_id: MSG } });
     assert.equal(resultText(second), "transcrit");
     assert.equal(h.transcribeCalls.n, 1, "the second call must be served from the cache");
   } finally {
@@ -660,7 +690,7 @@ void test("wa_transcribe caches: a second call does not re-run whisper", async (
   }
 });
 
-void test("wa_transcribe reports why transcription failed, verbatim", async () => {
+void test("whatsapp_transcribe reports why transcription failed, verbatim", async () => {
   const reason = "no speech was detected in this recording";
   const transcriber: Transcriber = {
     ensureModel: () => Promise.resolve("/models/x.bin"),
@@ -674,7 +704,7 @@ void test("wa_transcribe reports why transcription failed, verbatim", async () =
     overrides: { media: mediaAt(docPath, "audio/ogg"), transcriber },
   });
   try {
-    const res = await h.client.callTool({ name: "wa_transcribe", arguments: { chat: CHAT, message_id: MSG } });
+    const res = await h.client.callTool({ name: "whatsapp_transcribe", arguments: { chat: CHAT, message_id: MSG } });
     assert.equal(res.isError, true);
     assert.ok(resultText(res).includes(reason), resultText(res));
     assert.equal(h.ctx.messages.get(CHAT, MSG)?.transcript, null, "a failed run must not cache anything");
@@ -683,10 +713,10 @@ void test("wa_transcribe reports why transcription failed, verbatim", async () =
   }
 });
 
-void test("wa_transcribe refuses a message the store has never seen", async () => {
+void test("whatsapp_transcribe refuses a message the store has never seen", async () => {
   const h = await serverHarness({});
   try {
-    const res = await h.client.callTool({ name: "wa_transcribe", arguments: { chat: CHAT, message_id: "M404" } });
+    const res = await h.client.callTool({ name: "whatsapp_transcribe", arguments: { chat: CHAT, message_id: "M404" } });
     assert.equal(res.isError, true);
     assert.equal(h.transcribeCalls.n, 0);
   } finally {

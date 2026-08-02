@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 import { openDb } from "./client.js";
 import { makeReactionsRepo, type ReactionCount } from "./reactions.js";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-react-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-react-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });

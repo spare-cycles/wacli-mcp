@@ -22,7 +22,7 @@ import { join } from "node:path";
 import type { Logger } from "pino";
 import { MEDIA_KINDS, type MessagesRepo } from "../db/messages.js";
 import { errorFields } from "../logger.js";
-import type { WaConnection } from "../wa/connection.js";
+import type { WhatsAppConnection } from "../whatsapp/connection.js";
 
 export type MediaFile = { path: string; sha256: string; bytes: number; mimetype: string };
 
@@ -44,7 +44,7 @@ export type MediaDownloader = (message: WAMessage, ctx: DownloadContext) => Prom
 export type MediaStoreDeps = {
   dir: string;
   messages: MessagesRepo;
-  conn: WaConnection;
+  conn: WhatsAppConnection;
   logger: Logger;
   download?: MediaDownloader | undefined;
 };
@@ -69,7 +69,7 @@ export class MessageNotFoundError extends Error {
 }
 
 /**
- * The same list `wa_messages_search`'s `has_media` selects on, as a set for the membership test
+ * The same list `whatsapp_messages_search`'s `has_media` selects on, as a set for the membership test
  * here. Derived from the one constant rather than restated, so a search that says a message has an
  * attachment and a fetch that says it has none cannot disagree.
  */

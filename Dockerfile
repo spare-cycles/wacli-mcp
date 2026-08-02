@@ -1,4 +1,4 @@
-# wa-mcp container image — one Node 24 process, ffmpeg, pdftotext, and a prebuilt whisper.cpp.
+# whatsapp-mcp container image — one Node 24 process, ffmpeg, pdftotext, and a prebuilt whisper.cpp.
 #
 # There is no compiler in this file. The server is TypeScript, storage is `node:sqlite` (built in),
 # and whisper.cpp arrives as binaries copied out of an upstream image — so the whole build is
@@ -8,9 +8,9 @@
 # amd64 only, because the whisper.cpp image is amd64 only. That is the deployment target.
 #
 # Build and run (mount a volume for the store; the first run pairs — see README.md):
-#   docker build -t wa-mcp:latest .
-#   docker run --rm -p 8080:8080 -v wa-data:/data/wa \
-#     -e WA_MCP_TOKEN=… -e WA_PHONE_NUMBER=… wa-mcp:latest
+#   docker build -t whatsapp-mcp:latest .
+#   docker run --rm -p 8080:8080 -v whatsapp-data:/data/whatsapp \
+#     -e WHATSAPP_MCP_TOKEN=… -e WHATSAPP_PHONE_NUMBER=… whatsapp-mcp:latest
 
 # ── 1) whisper.cpp binaries (prebuilt, amd64) ────────────────────────────────
 # Pinned by digest: the :main tag moves. Ubuntu 22.04/glibc 2.35 -> bookworm/2.36 is forward-compatible.
@@ -40,10 +40,10 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
-RUN mkdir -p /data/wa && chown -R node:node /data/wa
+RUN mkdir -p /data/whatsapp && chown -R node:node /data/whatsapp
 ENV NODE_ENV=production \
-    WA_DATA_DIR=/data/wa \
-    WA_WHISPER_BIN=/opt/whisper/bin/whisper-cli \
+    WHATSAPP_DATA_DIR=/data/whatsapp \
+    WHATSAPP_WHISPER_BIN=/opt/whisper/bin/whisper-cli \
     PORT=8080
 USER node
 EXPOSE 8080

@@ -138,7 +138,7 @@ async function encodeJpeg(img: Image, quality: number): Promise<Buffer> {
  * Decode an image, falling back to ffmpeg for anything jimp cannot read.
  *
  * jimp 1.6 ships BMP, GIF, JPEG, PNG and TIFF — and **not WebP**, which is the format every single
- * WhatsApp sticker arrives in. Without this fallback `wa_download_media` would fail on every
+ * WhatsApp sticker arrives in. Without this fallback `whatsapp_download_media` would fail on every
  * sticker, so the one extra process is worth paying on the formats that need it.
  */
 async function decodeImage(source: string | Buffer): Promise<Image> {
@@ -294,7 +294,7 @@ export async function probeDuration(path: string): Promise<number | undefined> {
 /**
  * The pixel size of an image or of a video's first video stream, or undefined when it declares none.
  *
- * Added for `wa_download_media`, which reports what the model is looking at. ffprobe rather than
+ * Added for `whatsapp_download_media`, which reports what the model is looking at. ffprobe rather than
  * jimp because it answers for every format in one place — a WebP sticker included, which jimp cannot
  * decode at all — and because the video branch needs exactly the same answer, where there is no
  * decoded image to ask.

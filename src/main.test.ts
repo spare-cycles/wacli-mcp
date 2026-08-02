@@ -13,7 +13,7 @@
  * is built; observing it means observing `bootstrap`, which is the case above. What a test *can*
  * cover is that importing this module does not start anything — which is exactly what this file
  * does by existing: if the entrypoint guard were wrong, importing `main.ts` would run `bootstrap()`,
- * fail on `/data/wa`, and take the test process down with `process.exit(1)`.
+ * fail on `/data/whatsapp`, and take the test process down with `process.exit(1)`.
  *
  * **`shutdown()` is tested, because it has a real failure mode.** It runs on the way out with things
  * already breaking, and the property that matters is that one broken step does not skip the ones
@@ -39,9 +39,9 @@ import type { Alerter } from "./alerts.js";
 import { openDb, type Db } from "./db/client.js";
 import type { HttpHandle } from "./http.js";
 import { installProcessHandlers, shutdown, type ProcessEvents, type ShutdownDeps } from "./main.js";
-import type { WaConnection } from "./wa/connection.js";
+import type { WhatsAppConnection } from "./whatsapp/connection.js";
 
-const root = mkdtempSync(join(tmpdir(), "wa-main-"));
+const root = mkdtempSync(join(tmpdir(), "whatsapp-main-"));
 after(() => {
   rmSync(root, { recursive: true, force: true });
 });
@@ -107,7 +107,7 @@ function rig(broken: { http?: boolean; conn?: boolean } = {}): Rig {
       return broken.conn === true ? Promise.reject(new Error("socket wedged")) : Promise.resolve();
     },
     onStateChange: () => undefined,
-  } satisfies WaConnection;
+  } satisfies WhatsAppConnection;
   const alerter: Alerter = {
     onState: () => undefined,
     selfTest: () => Promise.resolve(),

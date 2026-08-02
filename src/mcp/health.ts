@@ -1,13 +1,13 @@
 /**
- * The one health payload. `wa_health` returns it and Task 14's `/health` route returns it, because
+ * The one health payload. `whatsapp_health` returns it and Task 14's `/health` route returns it, because
  * two hand-written health payloads drift within a week.
  *
  * `HealthReport` is a **closed record**, never a spread of `Config`. That is what keeps
- * `WA_MCP_TOKEN` and `NTFY_TOKEN` out of an endpoint that is, by design, reachable without them
+ * `WHATSAPP_MCP_TOKEN` and `NTFY_TOKEN` out of an endpoint that is, by design, reachable without them
  * (Global Constraint 9): adding a config field can never widen this response by accident.
  */
 
-import type { ConnectionState } from "../wa/connection.js";
+import type { ConnectionState } from "../whatsapp/connection.js";
 import type { ToolContext } from "./context.js";
 
 export type HealthReport = {

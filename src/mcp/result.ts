@@ -4,12 +4,12 @@
  *
  * Three rules, each of which exists because the alternative is expensive in a model's context.
  *
- * 1. **Every payload is capped.** A chat with a decade of history is one `wa_messages_list` away
+ * 1. **Every payload is capped.** A chat with a decade of history is one `whatsapp_messages_list` away
  *    from filling a context window; `jsonResult` truncates and says how much it cut, so the model
  *    can narrow the request instead of silently reading a prefix it believes is the whole answer.
  * 2. **An error is one line, never a stack.** Stack frames name files the model cannot open and
  *    push out the part of the conversation that mattered.
- * 3. **Row shaping happens here and nowhere else,** so `wa_messages_list` and `wa_messages_search`
+ * 3. **Row shaping happens here and nowhere else,** so `whatsapp_messages_list` and `whatsapp_messages_search`
  *    cannot drift into two different message shapes.
  */
 
@@ -80,7 +80,7 @@ function truncateToCodepoint(s: string, maxChars: number): string {
  * `maxChars` is required rather than defaulted, because rule 1 above is "every payload is capped" and
  * an optional cap is one a caller forgets. A voice note is minutes of speech and a PDF is a document:
  * both are exactly as capable of filling a context window as a page of messages is, and the transcript
- * blocks used to be the one payload that escaped `WA_MCP_MAX_RESULT_CHARS` entirely.
+ * blocks used to be the one payload that escaped `WHATSAPP_MCP_MAX_RESULT_CHARS` entirely.
  */
 export function textResult(text: string, maxChars: number): ToolResult {
   if (text.length <= maxChars) return { content: [{ type: "text", text }] };

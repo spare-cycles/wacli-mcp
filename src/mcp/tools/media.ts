@@ -34,7 +34,7 @@ import {
 } from "../../media/convert.js";
 import { MediaUnavailableError, MessageNotFoundError, type MediaFile } from "../../media/store.js";
 import { errorFields } from "../../logger.js";
-import { canonicalId } from "../../wa/jid.js";
+import { canonicalId } from "../../whatsapp/jid.js";
 import type { ToolContext } from "../context.js";
 import {
   describeError,
@@ -46,11 +46,11 @@ import {
   type ToolResult,
 } from "../result.js";
 
-const chatSchema = z.string().min(1).describe("Chat JID, exactly as `wa_chats_list` returns it.");
+const chatSchema = z.string().min(1).describe("Chat JID, exactly as `whatsapp_chats_list` returns it.");
 const messageIdSchema = z
   .string()
   .min(1)
-  .describe("Message id, as returned by wa_messages_list or wa_messages_search.");
+  .describe("Message id, as returned by whatsapp_messages_list or whatsapp_messages_search.");
 
 const PDF_MIMETYPE = "application/pdf";
 
@@ -152,7 +152,7 @@ async function videoAnswer(subject: Subject, ctx: ToolContext): Promise<ToolResu
  *
  * Transcribing here instead would make every download of a voice note spend a whisper run — minutes
  * of CPU on the machine this deploys to — for a model that may only have wanted to know how long it
- * is. `wa_transcribe` is the tool that decides to pay that, and it writes its answer back here.
+ * is. `whatsapp_transcribe` is the tool that decides to pay that, and it writes its answer back here.
  */
 async function audioAnswer(subject: Subject, ctx: ToolContext): Promise<ToolResult> {
   const transcript = subject.row.transcript;
@@ -162,7 +162,7 @@ async function audioAnswer(subject: Subject, ctx: ToolContext): Promise<ToolResu
   const duration = await probed("duration", ctx, () => probeDuration(subject.file.path));
   const summary = summaryOf(subject, ctx, { ...durationField(duration), transcribed: false });
   const note =
-    "This voice note has not been transcribed yet. Call wa_transcribe with the same chat and message_id " +
+    "This voice note has not been transcribed yet. Call whatsapp_transcribe with the same chat and message_id " +
     "to get its text; the result is cached, so asking twice costs nothing extra.";
   return compose([], summary, note, ctx);
 }
@@ -203,23 +203,23 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
     const row = ctx.messages.get(chatId, messageId);
     // `MessageNotFoundError`, not `MediaUnavailableError`: a bad id and an expired attachment are
     // different answers, and the class name is what a model reads first. `MediaStore.fetch` raises
-    // the same class for the same reason — this check is ahead of it because `wa_transcribe` answers
+    // the same class for the same reason — this check is ahead of it because `whatsapp_transcribe` answers
     // from `row.transcript` without fetching anything at all.
     if (row === undefined) throw new MessageNotFoundError(`no message ${messageId} in chat ${chatId}`);
     return row;
   }
 
   server.registerTool(
-    "wa_download_media",
+    "whatsapp_download_media",
     {
       description:
         "Fetch a message's attachment and return it in a form a model can read: a photo or sticker as " +
         "an image, a video as evenly spaced keyframes with its duration, a voice note as its cached " +
-        "transcript (or the duration and a pointer to wa_transcribe), a PDF as extracted text, and any " +
+        "transcript (or the duration and a pointer to whatsapp_transcribe), a PDF as extracted text, and any " +
         "other document as the path it was cached at. Downloads once and reuses the cached copy after " +
         "that; a first download needs a live connection, while a cached one does not.",
       inputSchema: { chat: chatSchema, message_id: messageIdSchema },
-      // Not `readOnlyHint`, for the same reason `wa_transcribe` is not: a first fetch writes the
+      // Not `readOnlyHint`, for the same reason `whatsapp_transcribe` is not: a first fetch writes the
       // attachment into the media cache and stamps `media_sha` on the row. Idempotent, though —
       // content-addressed, so calling it twice writes the same bytes to the same path, and a second
       // call reads the cache without touching the socket at all.
@@ -244,23 +244,23 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
             // Unreachable in practice: `MediaStore.fetch` refuses a non-media kind before this runs.
             // Kept because `MessageKind` is a closed union and a new member must land somewhere.
             return failedResult(
-              "wa_download_media",
+              "whatsapp_download_media",
               new MediaUnavailableError(`message ${row.id} is a ${row.kind} message and carries no media`),
               ctx,
             );
         }
       } catch (err) {
-        return failedResult("wa_download_media", err, ctx);
+        return failedResult("whatsapp_download_media", err, ctx);
       }
     },
   );
 
   server.registerTool(
-    "wa_transcribe",
+    "whatsapp_transcribe",
     {
       description:
         "Transcribe a voice note or a video's audio track with whisper, and store the result so that " +
-        "wa_messages_search can find the message by what was said in it. Answers instantly from the " +
+        "whatsapp_messages_search can find the message by what was said in it. Answers instantly from the " +
         "stored transcript when there is one; otherwise this is minutes of CPU, so call it on one " +
         "message at a time rather than over a whole chat.",
       inputSchema: { chat: chatSchema, message_id: messageIdSchema },
@@ -280,10 +280,10 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
         // trigger, which is what puts the speech into the search index.
         ctx.messages.setTranscript(row.chatId, row.id, text);
         // The whole transcript is stored; what comes back is capped like every other payload, and
-        // `wa_messages_search` still finds the message by anything said past the cut.
+        // `whatsapp_messages_search` still finds the message by anything said past the cut.
         return textResult(text, ctx.config.maxResultChars);
       } catch (err) {
-        return failedResult("wa_transcribe", err, ctx);
+        return failedResult("whatsapp_transcribe", err, ctx);
       }
     },
   );

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Manual end-to-end smoke test against a *running* wa-mcp server.
+ * Manual end-to-end smoke test against a *running* whatsapp-mcp server.
  *
  * This is not part of `pnpm test` and never will be: it needs a paired WhatsApp store — a real
  * account, real chats, real media — which no CI runner has and no fixture can fake. It is `.mjs`
@@ -18,7 +18,7 @@
  *
  * Usage:
  *
- *   node smoke.mjs                                    # health + tool list + wa_chats_list
+ *   node smoke.mjs                                    # health + tool list + whatsapp_chats_list
  *   node smoke.mjs --transcribe <chatJid> <messageId> # ... and transcribe one voice note
  *
  * Exit codes:
@@ -26,29 +26,29 @@
  *   0  every step passed against a live, paired store
  *   1  a step failed
  *   2  every step passed, but the store is **not paired** — which makes the run prove almost nothing.
- *      An unpaired server answers `wa_chats_list` with a perfectly valid empty page, so the reads
+ *      An unpaired server answers `whatsapp_chats_list` with a perfectly valid empty page, so the reads
  *      here cannot tell "the wiring works" from "there is nothing behind it", and every write and
  *      every media fetch would fail. A green line for that is a green line for the case this script
  *      exists to catch, so it gets a colour and a code of its own.
  *
  * Environment:
  *
- *   WA_MCP_URL     base URL of the running server        (default http://127.0.0.1:8080)
+ *   WHATSAPP_MCP_URL     base URL of the running server        (default http://127.0.0.1:8080)
  *   MCP_HTTP_PATH  the MCP path, if the server moved it  (default /mcp)
- *   WA_MCP_TOKEN   the bearer token, if the server has one configured
+ *   WHATSAPP_MCP_TOKEN   the bearer token, if the server has one configured
  *
  * Find a voice note to pass to `--transcribe` from the tool output itself:
  *   node smoke.mjs                       -> pick a chat JID
- *   then call wa_messages_list on it and look for kind "audio".
+ *   then call whatsapp_messages_list on it and look for kind "audio".
  */
 
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const BASE = (process.env.WA_MCP_URL || "http://127.0.0.1:8080").replace(/\/+$/, "");
+const BASE = (process.env.WHATSAPP_MCP_URL || "http://127.0.0.1:8080").replace(/\/+$/, "");
 const MCP_PATH = process.env.MCP_HTTP_PATH || "/mcp";
-const TOKEN = process.env.WA_MCP_TOKEN || "";
+const TOKEN = process.env.WHATSAPP_MCP_TOKEN || "";
 
 /** Every tool this server is supposed to advertise, and how many of them a read-only one drops. */
 const EXPECTED_TOOLS = 14;
@@ -95,7 +95,7 @@ async function main() {
   }
 
   // 2. Open a real MCP session over Streamable HTTP.
-  const client = new Client({ name: "wa-mcp-smoke", version: "1.0.0" });
+  const client = new Client({ name: "whatsapp-mcp-smoke", version: "1.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(`${BASE}${MCP_PATH}`), {
     requestInit: TOKEN === "" ? {} : { headers: { Authorization: `Bearer ${TOKEN}` } },
   });
@@ -112,24 +112,24 @@ async function main() {
     assert.equal(
       names.length,
       expected,
-      `expected ${expected} tools${health.read_only ? " (WA_MCP_READONLY is set)" : ""}, got ${names.length}`,
+      `expected ${expected} tools${health.read_only ? " (WHATSAPP_MCP_READONLY is set)" : ""}, got ${names.length}`,
     );
-    for (const name of names) assert.match(name, /^wa_/, `${name} is not wa_-prefixed`);
+    for (const name of names) assert.match(name, /^whatsapp_/, `${name} is not whatsapp_-prefixed`);
 
     // 4. A real read, against the real store.
-    const chats = await callTool(client, "wa_chats_list", { limit: 5 });
-    log("wa_chats_list", "\n" + resultText(chats));
+    const chats = await callTool(client, "whatsapp_chats_list", { limit: 5 });
+    log("whatsapp_chats_list", "\n" + resultText(chats));
 
     // 5. whisper, if asked. Minutes of CPU on a cold model — that is the point of it being opt-in.
     if (transcribe) {
-      log("wa_transcribe", `${transcribe.chat} / ${transcribe.messageId} — this can take minutes`);
+      log("whatsapp_transcribe", `${transcribe.chat} / ${transcribe.messageId} — this can take minutes`);
       const started = Date.now();
-      const res = await callTool(client, "wa_transcribe", {
+      const res = await callTool(client, "whatsapp_transcribe", {
         chat: transcribe.chat,
         message_id: transcribe.messageId,
       });
       const text = resultText(res);
-      log("wa_transcribe", `${Math.round((Date.now() - started) / 1000)}s, ${text.length} chars`);
+      log("whatsapp_transcribe", `${Math.round((Date.now() - started) / 1000)}s, ${text.length} chars`);
       console.log(text);
       assert.ok(text.trim().length > 0, "whisper returned an empty transcript");
     }
@@ -140,7 +140,7 @@ async function main() {
   if (unpaired) {
     console.log(
       "\n\x1b[33mincomplete\x1b[0m — every step ran, but against an unpaired store: an empty " +
-        "wa_chats_list proves nothing, and neither writes nor media were reachable. Pair the server and run again.",
+        "whatsapp_chats_list proves nothing, and neither writes nor media were reachable. Pair the server and run again.",
     );
     process.exit(2);
   }
