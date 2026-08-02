@@ -20,5 +20,8 @@ jobs:
       - run: pnpm check
       # ffmpeg is a real dependency of the media tests: they build fixtures with it and convert
       # them back. Installed after `pnpm check` so the fast gate fails first when it is going to.
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # ffmpeg for the conversion tests, poppler-utils for `pdftotext` — the suite exercises both
+      # for real rather than stubbing them, so a runner without either goes red on 2 tests that
+      # pass on any developer machine that happens to have them. The image installs both too.
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg poppler-utils
       - run: pnpm test
