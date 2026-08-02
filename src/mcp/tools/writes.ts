@@ -11,9 +11,9 @@
  * Three conventions:
  *
  * 1. **A handler never throws.** Every failure `send.ts` documents — `ConnectionUnavailableError`,
- *    `NotFoundError`, `NotOwnMessageError`, `SendPathError` — comes back as an `errorResult` with its
- *    one readable line. An exception escaping into the SDK becomes a protocol error the model cannot
- *    read, and it would take the tool call's identity with it.
+ *    `NotFoundError`, `MessageRevokedError`, `NotOwnMessageError`, `SendPathError` — comes back as an
+ *    `errorResult` with its one readable line. An exception escaping into the SDK becomes a protocol
+ *    error the model cannot read, and it would take the tool call's identity with it.
  * 2. **This module is gated, not conditional.** It is registered only when `config.readOnly` is
  *    false (`buildMcpServer`), so a read-only server does not advertise these tools at all rather
  *    than advertising them and refusing every call.

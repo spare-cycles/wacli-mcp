@@ -5,10 +5,25 @@
  * Two rules shape it. Every raw JID goes through `jid.ts` (Global Constraint 11) — there is no
  * `@`-splitting, no server matching and no suffix stripping here. And every call that produces a
  * message hands that message straight back to `ingest.ingestMessage` (Invariant 2), which is why a
- * sent message needs no separate mapping: it takes the same path an inbound one does. Baileys also
- * feeds its own copy through `messages.upsert` (`emitOwnEvents` defaults to true), and both writes
- * are the same idempotent upsert, so the duplication is deliberate rather than a hazard — it keeps
- * the store correct even if that event is ever turned off.
+ * sent message needs no separate mapping: it takes the same path an inbound one does.
+ *
+ * Baileys feeds its own copy of the same message through `messages.upsert` (`emitOwnEvents` defaults
+ * to true). For `sendText` and `sendFile` the two writes are the same idempotent upsert, so the
+ * duplication is deliberate rather than a hazard, and either one alone would leave the row correct.
+ *
+ * **That is not true of `react`, `editMessage` and `deleteMessage`,** and the symmetry here should
+ * not be read as saying it is. Each of those three produces a *control stanza* — a `reactionMessage`
+ * or a `protocolMessage` — which `ingest.ingestMessage` drops on sight (`ingest.ts`'s
+ * `CONTROL_CONTENT`), so the re-ingest below is a no-op for them. What actually records the emoji,
+ * the new text or the tombstone is Baileys' own `upsertMessage` → `processMessage`, which turns that
+ * stanza into `messages.update` / `messages.reaction`. Turn `emitOwnEvents` off and those three stop
+ * updating the store entirely; only the text and file sends would survive it.
+ *
+ * The three `reingest()` calls stay anyway, deliberately. What is storable is `ingest.ts`'s decision,
+ * not this module's — that is why `CONTROL_CONTENT` lives there and why the drop happens there — and
+ * omitting the call at three sites would quietly move that policy here, so a later change to what
+ * counts as control would have to be made in two files instead of one. The cost is one dropped call
+ * per control send.
  */
 
 import { proto, type AnyMessageContent, type WAMessage, type WAMessageKey } from "baileys";
@@ -33,6 +48,11 @@ export type SendFileOptions = {
   asVoiceNote?: boolean | undefined;
 };
 
+/**
+ * Note for `react`, `editMessage` and `deleteMessage`: each resolves once WhatsApp has accepted the
+ * operation, which is *before* the store reflects it — the row is written a tick later, off Baileys'
+ * own event. Each method documents the mechanism where it is implemented.
+ */
 export type Sender = {
   sendText: (chat: string, text: string, replyTo?: string) => Promise<SendRef>;
   sendFile: (chat: string, src: FileSource, opts: SendFileOptions) => Promise<SendRef>;
@@ -61,6 +81,19 @@ export type SendDeps = {
 /** The caller named a message that is not in the store, or is not usable for what was asked. */
 export class NotFoundError extends Error {
   override name = "NotFoundError";
+}
+
+/**
+ * The caller named a message that has been revoked. Its row is a tombstone, not a message.
+ *
+ * A sibling of `NotFoundError` rather than a reuse of it, because the two ask the caller for
+ * different corrections and `errorResult` puts the class name in front of the model
+ * (`mcp/result.ts`'s `describeError` renders `name: message`). "Not found" says *try another id*;
+ * this says *that id is right and the operation is refused for good*. Calling a row that is
+ * demonstrably in the store "not found" would send a model looking for a typo it will not find.
+ */
+export class MessageRevokedError extends Error {
+  override name = "MessageRevokedError";
 }
 
 /** WhatsApp only lets an account edit or revoke its own messages. */
@@ -169,9 +202,28 @@ export function makeSender(deps: SendDeps): Sender {
     return canonicalId(chat, { pnForLid: contacts.pnForLid });
   }
 
+  /**
+   * The stored row a caller named — and the one place the revoke tombstone is enforced for sends.
+   *
+   * `markDeleted` (`db/messages.ts`) clears `text` and `transcript` but deliberately *keeps* `raw`,
+   * because the socket's `getMessage` contract is served from those bytes and Baileys needs them for
+   * its retry and decrypt path. That makes every read site here responsible for the tombstone: the
+   * bytes are still there to be handed to WhatsApp by anything that does not check.
+   *
+   * `quotedFor` is the sharp edge — Baileys embeds the decoded envelope as
+   * `contextInfo.quotedMessage` (`lib/Utils/messages.js`), so a reply quoting a revoked message
+   * re-publishes to the chat exactly the content its sender took back. Reacting to one, editing it
+   * or revoking it again are refused for the same reason it is not listed: the row is a record that
+   * a message *was* there, not a message.
+   *
+   * `markRead` reaches this too, so marking a chat read *up to* a revoked message is refused as
+   * well. That is deliberate uniformity, not an oversight: `messages.list` filters tombstoned rows,
+   * so a caller is never handed such an id to aim at, and `unreadKeysUpTo` already skips them.
+   */
   function requireRow(chatId: string, id: string): MessageRow {
     const row = messages.get(chatId, id);
     if (row === undefined) throw new NotFoundError(`no message ${id} in chat ${chatId}`);
+    if (row.deletedTs !== null) throw new MessageRevokedError(`message ${id} in chat ${chatId} was revoked`);
     return row;
   }
 
@@ -202,7 +254,9 @@ export function makeSender(deps: SendDeps): Sender {
    * So a row stored without its raw bytes is refused rather than quoted half-way.
    */
   function quotedFor(chatId: string, id: string): WAMessage {
-    requireRow(chatId, id); // so an unknown message is named as such, not as an unquotable one
+    // First, so an unknown message is named as such rather than as an unquotable one — and so a
+    // revoked one is refused before its retained envelope is ever decoded. See `requireRow`.
+    requireRow(chatId, id);
     const bytes = messages.getRaw(chatId, id);
     const decoded = bytes === undefined ? undefined : (proto.WebMessageInfo.decode(bytes) as WAMessage);
     if (decoded?.key.id == null || decoded.message == null) {
@@ -295,6 +349,18 @@ export function makeSender(deps: SendDeps): Sender {
     return refFor(jid, sent);
   }
 
+  /**
+   * React to a stored message, or remove this account's reaction from it.
+   *
+   * **Resolving does not mean the store has been updated.** A reaction travels as a control stanza,
+   * which the `reingest` below drops (see this module's header); the row is written when Baileys'
+   * own `emitOwnEvents` copy comes back round as `messages.reaction`, and it schedules that with
+   * `process.nextTick` (`lib/Socket/messages-send.js:1135`). So a caller that reacts and immediately
+   * reads is racing that tick and may not see the reaction yet. Nothing here can close the gap
+   * without writing the row twice by two different rules.
+   *
+   * A revoked message is refused — see `requireRow`.
+   */
   async function react(chat: string, messageId: string, emoji: string): Promise<void> {
     const jid = canonical(chat);
     const sock = conn.requireSocket();
@@ -318,6 +384,13 @@ export function makeSender(deps: SendDeps): Sender {
     chats.clearUnread(jid);
   }
 
+  /**
+   * Replace the text of one of this account's own messages.
+   *
+   * Same lag as `react`, for the same reason: the edit goes out as a `protocolMessage`, `reingest`
+   * drops it, and the stored `text`/`edited_ts` are written only when Baileys' `messages.update`
+   * arrives on the next tick. A caller that edits and immediately lists can still read the old text.
+   */
   async function editMessage(chat: string, messageId: string, text: string): Promise<void> {
     const jid = canonical(chat);
     const sock = conn.requireSocket();
@@ -325,6 +398,15 @@ export function makeSender(deps: SendDeps): Sender {
     reingest(await sock.sendMessage(jid, { text, edit }));
   }
 
+  /**
+   * Revoke one of this account's own messages, for everyone.
+   *
+   * Same lag as `react` and `editMessage`, and the most visible of the three: the revoke travels as
+   * a `protocolMessage`, which `reingest` drops, so `deleted_ts` is set only when Baileys'
+   * `messages.update` lands on the next tick. `wa_delete_message` followed straight away by
+   * `wa_messages_list` can therefore still show the message, undeleted — it is a stale read, not a
+   * failed revoke, and the next read has it.
+   */
   async function deleteMessage(chat: string, messageId: string): Promise<void> {
     const jid = canonical(chat);
     const sock = conn.requireSocket();

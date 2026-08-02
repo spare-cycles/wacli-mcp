@@ -180,6 +180,52 @@ void test("a qr with no WA_PHONE_NUMBER logs an error once per socket, never the
   );
 });
 
+/**
+ * Everything one log call could have leaked, flattened into one string.
+ *
+ * `JSON.stringify` alone renders an `Error` as `{}` — it has no enumerable own properties — so a
+ * plain stringify would silently pass an assertion about what the *error* carries. The replacer
+ * expands one; every other value serializes normally.
+ */
+function loggedText(args: readonly unknown[]): string {
+  return JSON.stringify(args, (_key, value: unknown) =>
+    value instanceof Error ? `${value.name}: ${value.message}` : value,
+  );
+}
+
+void test("a failed pairing-code request is logged without the qr payload", async () => {
+  const { deps: d, sockets } = deps();
+  const errorCalls: unknown[][] = [];
+  const c = makeConnection({
+    ...d,
+    logger: {
+      ...d.logger,
+      error: (...args: unknown[]) => {
+        errorCalls.push(args);
+      },
+    },
+    makeSocket: () => {
+      const s = fakeSocket();
+      s.requestPairingCode = () => Promise.reject(new Error("pairing request rejected"));
+      sockets.push(s);
+      return s;
+    },
+  } as unknown as ConnectionDeps);
+  await c.start();
+  firstSocket(sockets).emit("connection.update", { qr: "qr-payload-secret" });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(errorCalls.length, 1, "a failed pairing request is still worth exactly one diagnostic");
+  const serialized = loggedText(errorCalls[0] ?? []);
+  assert.match(serialized, /requestPairingCode failed/, "the diagnostic must still say what failed");
+  assert.match(serialized, /pairing request rejected/, "and must still carry the error itself");
+  assert.doesNotMatch(
+    serialized,
+    /qr-payload-secret/,
+    "the failure path must not log the raw qr payload either — it is a live credential anyone reading the logs could link a device with",
+  );
+});
+
 void test("loggedOut is terminal: no reconnect, creds cleared", async () => {
   const { deps: d, sockets } = deps();
   let cleared = false;

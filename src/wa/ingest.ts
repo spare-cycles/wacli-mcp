@@ -84,6 +84,13 @@ const CHUNK_SIZE = 500;
  */
 const MILLISECOND_THRESHOLD = 1e11;
 
+/**
+ * Content wrapper → stored kind, for everything that is a message.
+ *
+ * No member of `CONTROL_CONTENT` belongs here: `ingestMessage` returns on those before `kindOf` is
+ * ever reached, so an entry for one would be dead code that reads like a decision. `protocolMessage`
+ * mapped to `"system"` here until it was removed for exactly that reason.
+ */
 const KIND_BY_CONTENT: Partial<Record<keyof proto.IMessage, MessageKind>> = {
   conversation: "text",
   extendedTextMessage: "text",
@@ -98,7 +105,6 @@ const KIND_BY_CONTENT: Partial<Record<keyof proto.IMessage, MessageKind>> = {
   liveLocationMessage: "location",
   contactMessage: "contact",
   contactsArrayMessage: "contact",
-  protocolMessage: "system",
 };
 
 const STATUS_NAMES: Record<number, string> = {
@@ -125,11 +131,22 @@ const STATUS_RANK: Record<string, number> = { pending: PENDING_RANK, sent: 2, de
  * on `messages.upsert` like any other message (`Socket/chats.js:917` emits every one). Storing
  * those would add a textless row per revoke and, since they arrive inbound, a phantom unread on
  * top of the effect we already applied.
+ *
+ * The last three are here for the second half of that reason alone. A pin, a keep-in-chat marker
+ * and a poll vote carry no conversation, and *nothing* consumes them: Baileys' `process-message.js`
+ * has no branch for a pin or a keep — and its poll-vote block is commented out — so no
+ * `messages.update` follows, and none of the three is in `KIND_BY_CONTENT` either. Left out of this
+ * set, each would land as a textless `kind: "other"` row that bumps the chat's unread count, which
+ * is exactly the class of row this set exists to keep out. Baileys agrees about the vote:
+ * `isRealMessage` excludes `pollUpdateMessage` alongside `protocolMessage` and `reactionMessage`.
  */
 const CONTROL_CONTENT: ReadonlySet<keyof proto.IMessage> = new Set<keyof proto.IMessage>([
   "protocolMessage",
   "reactionMessage",
   "encReactionMessage",
+  "pinInChatMessage",
+  "keepInChatMessage",
+  "pollUpdateMessage",
 ]);
 
 type NumberLike = Parameters<typeof toNumber>[0];

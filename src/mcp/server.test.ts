@@ -31,6 +31,7 @@ import { MediaUnavailableError, type MediaFile, type MediaStore } from "../media
 import { TranscriptionError, type Transcriber } from "../media/transcribe.js";
 import { ConnectionUnavailableError } from "../wa/connection.js";
 import {
+  MessageRevokedError,
   NotFoundError,
   NotOwnMessageError,
   SendPathError,
@@ -340,6 +341,11 @@ void test("a sender failure comes back as a tool error, never as a thrown protoc
       err: new NotOwnMessageError("message M1 was not sent by this account"),
       tool: "wa_edit_message",
       args: { chat: CHAT, message_id: MSG, text: "x" },
+    },
+    {
+      err: new MessageRevokedError("message M1 in chat c was revoked"),
+      tool: "wa_send_text",
+      args: { chat: CHAT, text: "re", reply_to: MSG },
     },
     {
       // `send.ts` never echoes the offending path, and neither may the tool that reports it.

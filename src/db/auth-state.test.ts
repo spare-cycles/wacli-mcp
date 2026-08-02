@@ -67,3 +67,49 @@ void test("clear wipes creds and keys", async () => {
   const reopened = makeAuthStore(openDb(path));
   assert.deepEqual(await reopened.state.keys.get("pre-key", ["1"]), {});
 });
+
+void test("clear also resets the live creds object, in place, to a fresh identity", () => {
+  const store = makeAuthStore(openDb(join(dir, "g.db")));
+  const held = store.state.creds; // the very object `makeSocket` is handed (wa/connection.ts)
+  held.me = { id: "33612345678:1@s.whatsapp.net", name: "the logged-out account" };
+  held.registered = true;
+  const oldNoiseKey = Buffer.from(held.noiseKey.private).toString("base64");
+  const oldSecret = held.advSecretKey;
+  store.saveCreds();
+
+  store.clear();
+
+  assert.equal(store.state.creds, held, "the reset must be in place: Baileys already holds this reference");
+  assert.notEqual(
+    Buffer.from(store.state.creds.noiseKey.private).toString("base64"),
+    oldNoiseKey,
+    "the in-memory keys must be regenerated, not merely deleted from disk",
+  );
+  assert.notEqual(store.state.creds.advSecretKey, oldSecret);
+  assert.equal(store.state.creds.registered, false);
+  assert.equal(
+    store.state.creds.me,
+    undefined,
+    "initAuthCreds() does not define `me`, so a plain Object.assign would leave the wiped account's identity behind",
+  );
+});
+
+void test("a creds.update arriving after clear cannot resurrect the wiped credentials", () => {
+  const path = join(dir, "h.db");
+  const store = makeAuthStore(openDb(path));
+  const oldSecret = store.state.creds.advSecretKey;
+  store.saveCreds();
+
+  store.clear();
+  // `attachListeners` never detaches, so the dead socket's last `creds.update` still fires here.
+  store.saveCreds();
+
+  const reopened = makeAuthStore(openDb(path));
+  assert.notEqual(
+    reopened.state.creds.advSecretKey,
+    oldSecret,
+    "a late save must not write the logged-out session's credentials back over the wipe",
+  );
+  assert.equal(reopened.state.creds.advSecretKey, store.state.creds.advSecretKey);
+  assert.equal(reopened.state.creds.registered, false);
+});

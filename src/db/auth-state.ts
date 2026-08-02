@@ -93,9 +93,54 @@ export function makeAuthStore(db: Db): AuthStore {
     }
   }
 
+  /**
+   * Reset the live creds object in place, to a brand-new identity.
+   *
+   * **In place, on the same object**, because `wa/connection.ts` hands `state.creds` straight to
+   * `makeSocket` and Baileys goes on mutating whatever it was given: rebinding here would leave the
+   * socket writing into an orphan while this module read a different object.
+   *
+   * `initAuthCreds()` defines only what a *fresh* session has. Everything a paired one accumulates —
+   * `me`, `account`, `signalIdentities`, `myAppStateKeyId`, `platform` — is absent from it, so a bare
+   * `Object.assign` would leave the logged-out account's identity sitting on top of brand-new keys.
+   * Those fields are therefore cleared first: set to `undefined` rather than `delete`d, which is what
+   * every reader of them already tests for, is what `JSON.stringify` drops on the way to the row
+   * anyway, and needs no dynamic delete.
+   */
+  function resetCreds(): void {
+    const fresh = initAuthCreds();
+    const mutable = creds as unknown as Record<string, unknown>;
+    for (const key of Object.keys(creds)) {
+      if (!(key in fresh)) mutable[key] = undefined;
+    }
+    Object.assign(creds, fresh);
+  }
+
+  /**
+   * Wipe the stored session *and* the live one, together.
+   *
+   * The two halves are one operation, which is why they share a transaction. `state.creds` is the
+   * object the socket was built from, so deleting the rows and leaving it untouched would leave a
+   * `start()` after `logged_out` — a transition `wa/connection.ts` documents and allows — trying to
+   * re-authenticate with precisely the credentials WhatsApp has just rejected. And because
+   * `attachListeners` never detaches, one late `creds.update` from the dead socket would call
+   * `saveCreds()` and write that identity straight back over the wipe. Regenerating in place closes
+   * both: a late save now persists the fresh identity, which is a no-op rather than a resurrection.
+   *
+   * `resetCreds()` sits last inside the transaction so a throw from either DELETE leaves the live
+   * object untouched, matching the rolled-back rows.
+   */
   function clear(): void {
-    clearCredsStmt.run();
-    clearKeysStmt.run();
+    db.exec("BEGIN");
+    try {
+      clearCredsStmt.run();
+      clearKeysStmt.run();
+      resetCreds();
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   return {

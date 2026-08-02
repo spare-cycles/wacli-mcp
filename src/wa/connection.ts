@@ -185,7 +185,8 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
       touch();
 
       if (update.qr !== undefined) {
-        handleQr(newSock, update.qr);
+        // Only that a QR was offered is passed on, never the payload itself — see `handleQr`.
+        handleQr(newSock);
       }
 
       if (update.connection === "open") {
@@ -203,7 +204,12 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
     setState("connected");
   }
 
-  function handleQr(activeSock: WASocket, qr: string): void {
+  /**
+   * A QR was offered. Deliberately takes no `qr` argument: nothing below this point needs the
+   * payload, and not having it is a stronger guarantee than remembering not to log it — see the
+   * comment inside, and `requestPairingCode`'s catch.
+   */
+  function handleQr(activeSock: WASocket): void {
     if (config.phoneNumber === undefined) {
       // Pairing is by code only (no rendered QR): without WA_PHONE_NUMBER this deployment sits in
       // `pairing` forever with nothing to act on. Say so loudly, but only once per socket — the QR
@@ -225,18 +231,25 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
       return;
     }
     pairingRequestedForSocket = true;
-    void requestPairingCode(activeSock, config.phoneNumber, qr);
+    // The pairing code is requested from the phone number, not from the QR: the payload is of no
+    // use past this point and is not carried into the request or its failure path.
+    void requestPairingCode(activeSock, config.phoneNumber);
     setState("pairing");
   }
 
-  async function requestPairingCode(activeSock: WASocket, phoneNumber: string, qr: string): Promise<void> {
+  async function requestPairingCode(activeSock: WASocket, phoneNumber: string): Promise<void> {
     try {
       const pairingCode = await activeSock.requestPairingCode(phoneNumber);
       logger.info({ pairingCode }, "wa: pairing code issued");
       // Deliberately unmissable in a Portainer log tail, on top of the structured log line above.
       console.log(`\n=== WhatsApp pairing code: ${pairingCode} ===\n`);
     } catch (err) {
-      logger.error({ err, qr }, "wa: requestPairingCode failed");
+      // The `qr` is not in this line, and must never be put back — for the reason `handleQr` gives
+      // above, which the failure path is bound by just as much as the success path. A failed pairing
+      // request is precisely when someone goes reading the logs. The error and the fact that the
+      // request failed are the whole of the diagnostic value here; the QR adds none of it, and the
+      // function no longer takes one so there is nothing to reach for.
+      logger.error({ err }, "wa: requestPairingCode failed");
     }
   }
 

@@ -13,7 +13,14 @@ import { makeReactionsRepo } from "../db/reactions.js";
 import type { WaConnection } from "./connection.js";
 import * as fx from "./fixtures.js";
 import { makeIngest, type Ingest } from "./ingest.js";
-import { makeSender, NotFoundError, NotOwnMessageError, SendPathError, type SendDeps } from "./send.js";
+import {
+  makeSender,
+  MessageRevokedError,
+  NotFoundError,
+  NotOwnMessageError,
+  SendPathError,
+  type SendDeps,
+} from "./send.js";
 
 const DM = "33612345678@s.whatsapp.net";
 const GROUP = "120363000000000000@g.us";
@@ -107,6 +114,11 @@ type FakeRow = {
   senderId?: string | undefined;
   /** false models a row stored without its protobuf envelope, which cannot be quoted. */
   quotable?: boolean | undefined;
+  /**
+   * true models a tombstoned row: `markDeleted` cleared its `text`, and deliberately left `raw` —
+   * the envelope Baileys' retry path still needs — sitting there for a read site to misuse.
+   */
+  deleted?: boolean | undefined;
 };
 
 type HarnessOptions = {
@@ -130,12 +142,13 @@ function materialize(id: string, spec: FakeRow): { row: MessageRow; raw: Uint8Ar
     ts,
     fromMe,
     kind: "text",
-    text: "stored",
+    // Exactly what `markDeleted` leaves behind: text and transcript cleared, deleted_ts set.
+    text: spec.deleted === true ? null : "stored",
     transcript: null,
     quotedId: null,
     status: null,
     editedTs: null,
-    deletedTs: null,
+    deletedTs: spec.deleted === true ? fx.FIXTURE_TS + 1 : null,
     mediaType: null,
     mediaSha: null,
   };
@@ -230,6 +243,63 @@ void test("replyTo pointing at a row with no stored envelope fails rather than s
   const h = harness({ rows: { M0: { quotable: false } } });
   await assert.rejects(() => h.sender.sendText(DM, "re", "M0"), NotFoundError);
   assert.equal(h.calls.length, 0);
+});
+
+// --- the tombstone, honoured on the send path too ----------------------------------------------
+
+void test("a reply naming a revoked message is refused, and nothing is sent", async () => {
+  const h = harness({ rows: { M0: { deleted: true } } });
+  await assert.rejects(() => h.sender.sendText(DM, "re", "M0"), MessageRevokedError);
+  assert.equal(
+    h.calls.length,
+    0,
+    "quoting embeds the stored envelope as contextInfo.quotedMessage, which would re-publish to the chat exactly the content the sender revoked",
+  );
+});
+
+void test("a file reply naming a revoked message is refused too", async () => {
+  const h = harness({ rows: { M0: { deleted: true } } });
+  await assert.rejects(
+    () => h.sender.sendFile(DM, { kind: "data", base64: b64("x") }, { mimetype: "image/png", replyTo: "M0" }),
+    MessageRevokedError,
+  );
+  assert.equal(h.calls.length, 0);
+});
+
+void test("reacting to a revoked message is refused", async () => {
+  const h = harness({ rows: { M0: { deleted: true } } });
+  await assert.rejects(() => h.sender.react(DM, "M0", "\u{1F44D}"), MessageRevokedError);
+  assert.equal(h.calls.length, 0, "a tombstone is not a message to hang a reaction on");
+});
+
+void test("editing or re-revoking a revoked message is refused", async () => {
+  const h = harness({ rows: { MINE: { fromMe: true, deleted: true } } });
+  await assert.rejects(() => h.sender.editMessage(DM, "MINE", "back from the dead"), MessageRevokedError);
+  await assert.rejects(() => h.sender.deleteMessage(DM, "MINE"), MessageRevokedError);
+  assert.equal(h.calls.length, 0);
+});
+
+void test("a revoked message is refused as revoked, not as missing", async () => {
+  const h = harness({ rows: { M0: { deleted: true } } });
+  await assert.rejects(
+    () => h.sender.sendText(DM, "re", "M0"),
+    (err: unknown) => {
+      assert.ok(err instanceof MessageRevokedError);
+      assert.ok(!(err instanceof NotFoundError), "the row is present; calling it missing tells the caller to retry");
+      assert.match(err.message, /revoked/);
+      return true;
+    },
+  );
+});
+
+void test("an ordinary reply, reaction, edit and delete still work alongside the tombstone check", async () => {
+  const h = harness({ rows: { LIVE: { fromMe: true }, THEIRS: { fromMe: false }, GONE: { deleted: true } } });
+  await h.sender.sendText(DM, "re", "LIVE");
+  await h.sender.react(DM, "THEIRS", "\u{1F44D}");
+  await h.sender.editMessage(DM, "LIVE", "corrigé");
+  await h.sender.deleteMessage(DM, "LIVE");
+  assert.equal(h.calls.length, 4, "the check must refuse only the tombstoned row");
+  assert.equal((h.calls[0]?.options as { quoted?: WAMessage }).quoted?.key.id, "LIVE");
 });
 
 void test("the chat argument is canonicalized before sending", async () => {
@@ -559,6 +629,23 @@ void test("quoting works against an envelope the real ingest stored", async () =
   const quoted = (h.calls[0]?.options as { quoted?: WAMessage }).quoted;
   assert.equal(quoted?.key.id, "M0");
   assert.equal(quoted.message?.conversation, "hello");
+});
+
+void test("a revoked message's content is never re-published, against the real repository", async () => {
+  const h = liveHarness();
+  h.ingest.ingestMessage(fx.textMessage({ chat: DM, id: "M0", ts: fx.FIXTURE_TS, text: "the secret" }));
+  h.messages.markDeleted(DM, "M0", fx.FIXTURE_TS + 1);
+
+  const row = h.messages.get(DM, "M0");
+  assert.equal(row?.text, null, "markDeleted clears the text");
+  assert.ok(
+    h.messages.getRaw(DM, "M0"),
+    "and deliberately keeps the envelope, which Baileys' retry path reads — so the send path is what has to refuse it",
+  );
+
+  await assert.rejects(() => h.sender.sendText(DM, "re", "M0"), MessageRevokedError);
+  await assert.rejects(() => h.sender.react(DM, "M0", "\u{1F44D}"), MessageRevokedError);
+  assert.equal(h.calls.length, 0, "nothing carrying `the secret` may reach the socket");
 });
 
 void test("markRead expands over rows the real ingest wrote", async () => {

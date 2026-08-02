@@ -205,6 +205,38 @@ void test("control stanzas delivered on messages.upsert are not stored as messag
   assert.equal(h.chats.get(DM)?.unreadCount, 1, "nor a phantom unread on top of the effect already applied");
 });
 
+void test("pins, keep-in-chat markers and poll votes are control stanzas too", () => {
+  const h = harness();
+  const s = socket();
+  h.ingest.attach(s.sock);
+  h.ingest.ingestMessage(fx.textMessage({ id: "M1" }));
+  // None of these three has a handler in Baileys' process-message.js — its poll-vote block is
+  // commented out — and none is in KIND_BY_CONTENT. Unrecognized, each lands as a textless
+  // `kind: "other"` row that also bumps the unread count.
+  s.emit("messages.upsert", {
+    messages: [
+      {
+        key: { remoteJid: DM, id: "C1", fromMe: false },
+        messageTimestamp: 1_700_000_100,
+        message: { pinInChatMessage: { key: { remoteJid: DM, id: "M1" }, type: 1 } },
+      },
+      {
+        key: { remoteJid: DM, id: "C2", fromMe: false },
+        messageTimestamp: 1_700_000_100,
+        message: { keepInChatMessage: { key: { remoteJid: DM, id: "M1" }, keepType: 1 } },
+      },
+      {
+        key: { remoteJid: DM, id: "C3", fromMe: false },
+        messageTimestamp: 1_700_000_100,
+        message: { pollUpdateMessage: { pollCreationMessageKey: { remoteJid: DM, id: "M1" } } },
+      },
+    ],
+    type: "notify",
+  });
+  assert.equal(h.messages.count(), 1, "none of the three may become a textless `other` row");
+  assert.equal(h.chats.get(DM)?.unreadCount, 1, "nor bump the unread count of a chat nobody wrote to");
+});
+
 void test("a message without a remoteJid or without an id is skipped", () => {
   const h = harness();
   const noChat = { ...fx.textMessage({ id: "M1" }), key: { id: "M1", fromMe: false } } as WAMessage;
