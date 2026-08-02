@@ -122,6 +122,34 @@ void test("whatsapp_health reports the age of the last event in seconds, not mil
   await h.close();
 });
 
+void test("whatsapp_health reports the newest ingested message, which is not the last event", async () => {
+  // An empty store has no newest message, and `0` would read as 1970 to anything doing arithmetic.
+  const empty = await harness();
+  assert.equal(
+    resultJson(await empty.client.callTool({ name: "whatsapp_health", arguments: {} }))["last_message_at"],
+    null,
+  );
+  await empty.close();
+
+  // The point of the field: the socket is healthy and its last *event* is recent, while ingestion
+  // stopped long ago. Only `last_message_at` can tell those apart, and a watchdog outside the
+  // process is the only thing that can act on it.
+  const h = await harness({
+    state: "connected",
+    lastEventAgeSec: 0,
+    seed: (ctx) => {
+      seedChat(ctx, ALICE, false, [
+        { id: "old", ts: 1_700_000_000 },
+        { id: "newest", ts: 1_700_009_999 },
+      ]);
+    },
+  });
+  const data = resultJson(await h.client.callTool({ name: "whatsapp_health", arguments: {} }));
+  assert.equal(data["last_message_at"], 1_700_009_999, "the MAX over the store, not the last row written");
+  assert.ok((data["last_event_age_sec"] as number) < 5, "and the connection still looks perfectly fresh");
+  await h.close();
+});
+
 void test("whatsapp_health carries no secret from the config", async () => {
   const config = loadConfig({
     WHATSAPP_DATA_DIR: "/tmp/whatsapp-health-secrets",

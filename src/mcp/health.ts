@@ -16,6 +16,8 @@ export type HealthReport = {
   needs_pairing: boolean;
   last_event_age_sec: number;
   last_connected_at: number | null;
+  /** Unix seconds of the newest message in the store, or `null` if it holds none. */
+  last_message_at: number | null;
   self_id: string | null;
   counts: { chats: number; messages: number; contacts: number };
   schema_version: number;
@@ -43,6 +45,13 @@ export async function buildHealth(ctx: ToolContext): Promise<HealthReport> {
     // suspended container) would otherwise report a negative age, which reads as a broken server.
     last_event_age_sec: Math.max(0, nowSec - snap.lastEventAt),
     last_connected_at: snap.lastConnectedAt,
+    // The only field here that reports INGESTION rather than the socket's opinion of itself.
+    // `last_event_age_sec` moves on `connection.update` and nothing else, so a socket that is
+    // connected and receiving nothing is indistinguishable from a healthy quiet one without this —
+    // which is precisely how a 44-hour outage went unnoticed on the retired stack. A watchdog
+    // outside the process compares it against its own clock; nothing in here decides what is stale,
+    // because "quiet" is a property of the conversation, not of the server.
+    last_message_at: ctx.messages.newestTs(),
     self_id: snap.selfId,
     counts: { chats: ctx.chats.count(), messages: ctx.messages.count(), contacts: ctx.contacts.count() },
     schema_version: ctx.meta.schemaVersion(),
