@@ -135,6 +135,29 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
     }, delay);
   }
 
+  /**
+   * Throw away the half-written identity an unclaimed pairing code leaves behind.
+   *
+   * `requestPairingCode` sets `creds.me` — and emits `creds.update`, so we persist it — the moment
+   * a code is *requested*, long before WhatsApp has registered anything. But Baileys chooses
+   * between the registration and the login node on `creds.me` alone. So the next socket after a
+   * code nobody typed logs in as a device WhatsApp has never seen, is answered
+   * `<failure reason='401'/>`, and `handleClose` — correctly, for a real logout — wipes the store
+   * and parks the server in `logged_out` without a retry. Every unclaimed code therefore cost a
+   * manual restart, and the pod that was waiting looked healthy the whole time.
+   *
+   * `creds.registered` is the honest signal: Baileys sets it only once pairing has completed. When
+   * it is false there is by definition no session to protect, so `clear()` — which regenerates the
+   * keys in place as well as deleting the rows — is safe and is what puts the next socket back on
+   * the registration path.
+   */
+  function discardUnregisteredIdentity(): void {
+    if (auth.state.creds.registered) return;
+    if (auth.state.creds.me === undefined) return;
+    logger.info("wa: discarding the unregistered identity left behind by an unclaimed pairing code");
+    auth.clear();
+  }
+
   // Synchronous: makeSocket() itself is synchronous (it returns a WASocket, not a Promise), so
   // there is nothing in here to await. start() still needs to hand back a Promise for its public
   // contract, which it does via Promise.resolve() rather than the `async` keyword.
@@ -142,6 +165,7 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
     if (stopped) return;
     pairingRequestedForSocket = false;
     missingPhoneNumberLoggedForSocket = false;
+    discardUnregisteredIdentity();
     setState("connecting");
     try {
       const newSock = makeSocket({
@@ -149,7 +173,19 @@ export function makeConnection(deps: ConnectionDeps): WaConnection {
         logger,
         printQRInTerminal: false,
         markOnlineOnConnect: false, // ban-risk mitigation from the spec
-        browser: Browsers.macOS("Desktop"), // a plausible browser identity, same reason
+        // 🔴 `Chrome`, never `Desktop`, and this is load-bearing rather than cosmetic. Baileys
+        // sends `companion_platform_display` as `${browser[1]} (${browser[0]})`, and WhatsApp
+        // validates that string strictly for the pairing-code IQ — it does not for QR
+        // registration, which is why only this deployment's login path is affected. "Desktop
+        // (Mac OS)" is answered `<iq type='error'><error code='400' text='bad-request'/></iq>`,
+        // and `requestPairingCode` never awaits that reply: it returns a locally generated code
+        // regardless, so the server prints a perfectly plausible 8 characters that were never
+        // registered and the phone answers "couldn't link device". Upstream issue #2560; its fix,
+        // PR #2559, is unmerged as of 7.0.0-rc14, so supplying a canonical label is ours to do.
+        // Only the six names in Baileys' `BROWSER_TO_COMPANION_WEB_CLIENT` map — Chrome, Edge,
+        // Firefox, IE, Opera, Safari — are accepted; anything else, "Desktop" included, is not.
+        browser: Browsers.macOS("Chrome"), // also the ban-risk mitigation from the spec
+
         syncFullHistory: false,
         generateHighQualityLinkPreview: false,
         getMessage: async (key: WAMessageKey) => {
