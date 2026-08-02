@@ -230,7 +230,7 @@ void test("a failing health probe is a 500 envelope, not a hung request", async 
 void test("/health never contains a token", async (t) => {
   const s = await start(t, {
     mcpToken: "super-secret-value",
-    ntfy: { baseUrl: "https://ntfy.example/", topic: "t", token: "ntfy-secret" },
+    ntfy: { baseUrl: "https://ntfy.example/", topic: "t", infoTopic: "i", token: "ntfy-secret" },
   });
 
   const text = await (await fetch(`${s.base}/health`)).text();

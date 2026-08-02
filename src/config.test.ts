@@ -54,8 +54,25 @@ void test("numeric vars fall back on garbage and clamp on range", () => {
 
 void test("ntfy is all-or-nothing", () => {
   assert.equal(loadConfig({ ...base, NTFY_BASE_URL: "https://n.example" }).ntfy, undefined);
+  assert.equal(loadConfig({ ...base, NTFY_TOPIC: "alerts" }).ntfy, undefined);
+  // The info topic is *not* part of the all-or-nothing rule: it is optional, and its absence falls
+  // back to the alert topic rather than disabling alerting or dropping routine notices on the floor.
   const c = loadConfig({ ...base, NTFY_BASE_URL: "https://n.example", NTFY_TOPIC: "alerts" });
-  assert.deepEqual(c.ntfy, { baseUrl: "https://n.example", topic: "alerts", token: "" });
+  assert.deepEqual(c.ntfy, { baseUrl: "https://n.example", topic: "alerts", infoTopic: "alerts", token: "" });
+});
+
+void test("NTFY_TOPIC_INFO splits routine notices off the alert topic", () => {
+  const c = loadConfig({
+    ...base,
+    NTFY_BASE_URL: "https://n.example",
+    NTFY_TOPIC: "alerts",
+    NTFY_TOPIC_INFO: "infos",
+    NTFY_TOKEN: "tk_x",
+  });
+  assert.deepEqual(c.ntfy, { baseUrl: "https://n.example", topic: "alerts", infoTopic: "infos", token: "tk_x" });
+  // An empty value is the unset spelling, not a topic named "".
+  const blank = loadConfig({ ...base, NTFY_BASE_URL: "https://n.example", NTFY_TOPIC: "alerts", NTFY_TOPIC_INFO: "" });
+  assert.equal(blank.ntfy?.infoTopic, "alerts");
 });
 
 // Every variable is read by its exact, fully spelled name. A near miss — a shorter prefix, a
