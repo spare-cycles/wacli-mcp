@@ -1,5 +1,5 @@
 import { lidFromJid, phoneFromJid } from "../wa/jid.js";
-import type { Db } from "./client.js";
+import { escapeLike, type Db } from "./client.js";
 
 export type ContactRow = {
   id: string;
@@ -49,11 +49,6 @@ type LidChatRow = {
 
 function toContactRow(raw: ContactRowRaw): ContactRow {
   return { id: raw.id, phoneNumber: raw.phone_number, lid: raw.lid, name: raw.name, notify: raw.notify };
-}
-
-/** Escape LIKE metacharacters (`\`, `%`, `_`) so a query is matched literally. */
-function escapeLike(query: string): string {
-  return query.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
 const SELECT_COLUMNS = "id, phone_number, lid, name, notify";

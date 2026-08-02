@@ -4,10 +4,11 @@
  *
  * Unlike the read tools, these two may reach for the socket — `MediaStore.fetch` requires it on a
  * cache miss, because an attachment that was never downloaded cannot be produced from SQLite. That
- * makes the *two* failures they can hit genuinely different, and both are surfaced as themselves
- * rather than collapsed: `ConnectionUnavailableError` means "wait and retry", `MediaUnavailableError`
- * means "this is gone, WhatsApp's media URLs have expired". Telling a model to give up on media that
- * is one reconnection away is the mistake this avoids.
+ * makes the failures they can hit genuinely different, and each is surfaced as itself rather than
+ * collapsed into the others: `ConnectionUnavailableError` means "wait and retry",
+ * `MediaUnavailableError` means "this is gone, WhatsApp's media URLs have expired", and
+ * `MessageNotFoundError` means "that id names nothing here". Telling a model to give up on media that
+ * is one reconnection away — or to keep retrying an id it mistyped — is the mistake this avoids.
  *
  * Every result has the same shape: zero or more image blocks, then a JSON summary block, then at most
  * one block of text (a transcript, a PDF's contents, or an instruction). The summary is where size,
@@ -31,10 +32,19 @@ import {
   type Dimensions,
   type ImageBlock,
 } from "../../media/convert.js";
-import { MediaUnavailableError, type MediaFile } from "../../media/store.js";
+import { MediaUnavailableError, MessageNotFoundError, type MediaFile } from "../../media/store.js";
+import { errorFields } from "../../logger.js";
 import { canonicalId } from "../../wa/jid.js";
 import type { ToolContext } from "../context.js";
-import { errorResult, jsonResult, presentReactions, textResult, type Block, type ToolResult } from "../result.js";
+import {
+  describeError,
+  failedResult,
+  jsonResult,
+  presentReactions,
+  textResult,
+  type Block,
+  type ToolResult,
+} from "../result.js";
 
 const chatSchema = z.string().min(1).describe("Chat JID, exactly as `wa_chats_list` returns it.");
 const messageIdSchema = z
@@ -61,7 +71,10 @@ async function probed<T>(what: string, ctx: ToolContext, probe: () => Promise<T 
   try {
     return await probe();
   } catch (err) {
-    ctx.logger.warn({ err }, `media: could not read the ${what} of this attachment`);
+    // The error's fields, never the error object — see `errorFields`. A failed download reaches the
+    // logger with a WhatsApp CDN URL hanging off it, and one habit here is worth more than one
+    // careful site.
+    ctx.logger.warn({ ...errorFields(err), what }, "media: could not read this property of an attachment");
     return undefined;
   }
 }
@@ -110,7 +123,9 @@ function compose(
     .slice(0, budget)
     .map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
   blocks.push(...jsonResult(summary, ctx.config.maxResultChars).content);
-  if (note !== undefined) blocks.push(...textResult(note).content);
+  // Capped like every other payload: a note is a transcript or a PDF's text, both of which are as
+  // capable of filling a context window as a page of messages is.
+  if (note !== undefined) blocks.push(...textResult(note, ctx.config.maxResultChars).content);
   return { content: blocks };
 }
 
@@ -152,13 +167,30 @@ async function audioAnswer(subject: Subject, ctx: ToolContext): Promise<ToolResu
   return compose([], summary, note, ctx);
 }
 
-/** A PDF as text; anything else as the path it is cached at, for a human or another tool to open. */
+/**
+ * A PDF as text; anything else as the path it is cached at, for a human or another tool to open.
+ *
+ * A failed extraction **degrades**, exactly as `probed` does above and for the same reason: no
+ * `pdftotext` in the image, or a file that is not the PDF it claims to be, does not make the path,
+ * the size and the mimetype worthless — and those are what a caller needs to do anything else with
+ * the attachment. Sinking the whole call would throw away everything the summary already holds in
+ * order to report the one part that failed.
+ */
 async function documentAnswer(subject: Subject, ctx: ToolContext): Promise<ToolResult> {
   const summary = summaryOf(subject, ctx, { path: subject.file.path });
   if (!subject.file.mimetype.startsWith(PDF_MIMETYPE)) {
     return compose([], summary, undefined, ctx);
   }
-  const text = await pdfText(subject.file.path, ctx.config.maxResultChars);
+  let text: string;
+  try {
+    text = await pdfText(subject.file.path, ctx.config.maxResultChars);
+  } catch (err) {
+    ctx.logger.warn(errorFields(err), "media: could not extract the text of this PDF");
+    const note =
+      `The text of this PDF could not be extracted (${describeError(err)}). The document itself is ` +
+      "intact and cached at the path in the summary above.";
+    return compose([], summary, note, ctx);
+  }
   const note =
     text === "" ? "This PDF carries no extractable text, which usually means it is a scan of a paper document." : text;
   return compose([], summary, note, ctx);
@@ -169,7 +201,11 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
   function subjectRow(chat: string, messageId: string): MessageRow {
     const chatId = canonicalId(chat, ctx.contacts);
     const row = ctx.messages.get(chatId, messageId);
-    if (row === undefined) throw new MediaUnavailableError(`no message ${messageId} in chat ${chatId}`);
+    // `MessageNotFoundError`, not `MediaUnavailableError`: a bad id and an expired attachment are
+    // different answers, and the class name is what a model reads first. `MediaStore.fetch` raises
+    // the same class for the same reason — this check is ahead of it because `wa_transcribe` answers
+    // from `row.transcript` without fetching anything at all.
+    if (row === undefined) throw new MessageNotFoundError(`no message ${messageId} in chat ${chatId}`);
     return row;
   }
 
@@ -183,7 +219,11 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
         "other document as the path it was cached at. Downloads once and reuses the cached copy after " +
         "that; a first download needs a live connection, while a cached one does not.",
       inputSchema: { chat: chatSchema, message_id: messageIdSchema },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      // Not `readOnlyHint`, for the same reason `wa_transcribe` is not: a first fetch writes the
+      // attachment into the media cache and stamps `media_sha` on the row. Idempotent, though —
+      // content-addressed, so calling it twice writes the same bytes to the same path, and a second
+      // call reads the cache without touching the socket at all.
+      annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: true },
     },
     async ({ chat, message_id }) => {
       try {
@@ -203,12 +243,14 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
           default:
             // Unreachable in practice: `MediaStore.fetch` refuses a non-media kind before this runs.
             // Kept because `MessageKind` is a closed union and a new member must land somewhere.
-            return errorResult(
+            return failedResult(
+              "wa_download_media",
               new MediaUnavailableError(`message ${row.id} is a ${row.kind} message and carries no media`),
+              ctx,
             );
         }
       } catch (err) {
-        return errorResult(err);
+        return failedResult("wa_download_media", err, ctx);
       }
     },
   );
@@ -229,16 +271,19 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
         const row = subjectRow(chat, message_id);
         // The cache is consulted before anything else, on purpose: a stored transcript is the whole
         // reason this tool is affordable to call twice.
-        if (row.transcript !== null && row.transcript !== "") return textResult(row.transcript);
+        if (row.transcript !== null && row.transcript !== "")
+          return textResult(row.transcript, ctx.config.maxResultChars);
 
         const file = await ctx.media.fetch(row.chatId, row.id);
         const text = await ctx.transcriber.transcribeFile(file.path);
         // Written through the repository rather than kept in memory: the update fires the FTS
         // trigger, which is what puts the speech into the search index.
         ctx.messages.setTranscript(row.chatId, row.id, text);
-        return textResult(text);
+        // The whole transcript is stored; what comes back is capped like every other payload, and
+        // `wa_messages_search` still finds the message by anything said past the cut.
+        return textResult(text, ctx.config.maxResultChars);
       } catch (err) {
-        return errorResult(err);
+        return failedResult("wa_transcribe", err, ctx);
       }
     },
   );

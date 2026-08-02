@@ -50,7 +50,6 @@ export type MessagesRepo = {
   /** Returns true when the row was newly inserted, false when it updated an existing one.
    *  Task 8 depends on this to avoid double-counting unread on a redelivery. */
   upsert: (m: MessageInput) => boolean;
-  upsertMany: (ms: readonly MessageInput[]) => void; // one transaction
   get: (chatId: string, id: string) => MessageRow | undefined;
   /** The protobuf bytes stored at ingest. Backs the socket's getMessage contract. */
   getRaw: (chatId: string, id: string) => Uint8Array | undefined;
@@ -123,12 +122,26 @@ function toMessageRow(raw: MessageRowRaw): MessageRow {
 const MATCH_OPEN = "\u0001";
 const MATCH_CLOSE = "\u0002";
 
+/** True when a stored value carries a marker character of its own, which makes its snippet unreadable. */
+function carriesMarker(stored: string | null): boolean {
+  return stored !== null && (stored.includes(MATCH_OPEN) || stored.includes(MATCH_CLOSE));
+}
+
 /**
  * The snippet of a column that really matched, with its markers rendered as `[…]` for the reader —
- * or `undefined` when that column took no part in the match.
+ * or `undefined` when that column took no part in the match, or cannot be read as having done so.
+ *
+ * `stored` is the column's own value, and checking it is what keeps the marker rule sound. A message
+ * body is sender-supplied UTF-8: nothing stops someone sending a literal SOH, and `snippet()` copies
+ * whatever the column holds into the snippet verbatim. Read on its own, a snippet carrying that
+ * character says "this column matched" for a column that did not — the same mislabelling the marker
+ * rule replaced "is the snippet empty?" to prevent, arriving by a different door. A column whose
+ * stored value carries a marker therefore contributes **no signal**: the hit is attributed to the
+ * other column, or to neither, and never to the wrong one.
  */
-function matchedSnippet(snippet: string | null): string | undefined {
+function matchedSnippet(snippet: string | null, stored: string | null): string | undefined {
   if (snippet?.includes(MATCH_OPEN) !== true) return undefined;
+  if (carriesMarker(stored)) return undefined;
   return snippet.replaceAll(MATCH_OPEN, "[").replaceAll(MATCH_CLOSE, "]");
 }
 
@@ -202,7 +215,7 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
   const searchStmt = db.prepare(searchQuery(""));
   const searchScopedStmt = db.prepare(searchQuery(" AND m.chat_id = :chatId"));
 
-  function upsertOne(m: MessageInput): boolean {
+  function upsert(m: MessageInput): boolean {
     const existed = hasStmt.get(m.chatId, m.id) !== undefined;
     insertStmt.run({
       chatId: m.chatId,
@@ -218,22 +231,6 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
       raw: m.raw ?? null,
     });
     return !existed;
-  }
-
-  function upsert(m: MessageInput): boolean {
-    return upsertOne(m);
-  }
-
-  function upsertMany(ms: readonly MessageInput[]): void {
-    if (ms.length === 0) return;
-    db.exec("BEGIN");
-    try {
-      for (const m of ms) upsertOne(m);
-      db.exec("COMMIT");
-    } catch (err) {
-      db.exec("ROLLBACK");
-      throw err;
-    }
   }
 
   function get(chatId: string, id: string): MessageRow | undefined {
@@ -296,8 +293,8 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
       // emptiness answers a different question (see `matchedSnippet`). A message matching in both
       // columns is a text hit, and shows the text snippet — the transcript label means the words
       // were found *only* in speech, which is what makes it worth telling the model about.
-      const snipText = matchedSnippet(row.snip_text);
-      const snipTranscript = matchedSnippet(row.snip_transcript);
+      const snipText = matchedSnippet(row.snip_text, row.text);
+      const snipTranscript = matchedSnippet(row.snip_transcript, row.transcript);
       return {
         ...toMessageRow(row),
         matchedTranscript: snipText === undefined && snipTranscript !== undefined,
@@ -337,7 +334,6 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
 
   return {
     upsert,
-    upsertMany,
     get,
     getRaw,
     list,

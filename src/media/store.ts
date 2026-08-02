@@ -21,12 +21,13 @@ import { mkdir, open, rename, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import type { MessageKind, MessagesRepo } from "../db/messages.js";
+import { errorFields } from "../logger.js";
 import type { WaConnection } from "../wa/connection.js";
 
 export type MediaFile = { path: string; sha256: string; bytes: number; mimetype: string };
 
 export type MediaStore = {
-  /** Download, or return the cached copy of, a message's media. Throws `MediaUnavailableError`. */
+  /** Download, or return the cached copy of, a message's media. Throws the two errors below. */
   fetch: (chatId: string, messageId: string) => Promise<MediaFile>;
   pathFor: (sha256: string) => string;
 };
@@ -48,9 +49,23 @@ export type MediaStoreDeps = {
   download?: MediaDownloader | undefined;
 };
 
-/** The media cannot be produced, and waiting will not help: unknown message, no envelope, gone. */
+/** The media cannot be produced, and waiting will not help: no envelope, not media, gone for good. */
 export class MediaUnavailableError extends Error {
   override name = "MediaUnavailableError";
+}
+
+/**
+ * There is no such message in that chat.
+ *
+ * Distinct from `MediaUnavailableError`, which used to carry this case too, because the two ask the
+ * caller for different corrections and `describeError` puts the class name in front of the model:
+ * this one says *check the id* — the message may never have existed, or may belong to another chat —
+ * while `MediaUnavailableError` says *the id is right and the bytes are gone*, which is what an
+ * expired WhatsApp media URL produces and what no retry will fix. Folded together, an id typo and a
+ * six-month-old photo are one indistinguishable failure, by name and by message.
+ */
+export class MessageNotFoundError extends Error {
+  override name = "MessageNotFoundError";
 }
 
 const MEDIA_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>(["image", "video", "audio", "document", "sticker"]);
@@ -123,7 +138,7 @@ export function makeMediaStore(deps: MediaStoreDeps): MediaStore {
 
   async function fetch(chatId: string, messageId: string): Promise<MediaFile> {
     const row = messages.get(chatId, messageId);
-    if (row === undefined) throw new MediaUnavailableError(`no message ${messageId} in chat ${chatId}`);
+    if (row === undefined) throw new MessageNotFoundError(`no message ${messageId} in chat ${chatId}`);
     if (!MEDIA_KINDS.has(row.kind)) {
       throw new MediaUnavailableError(
         `message ${messageId} in chat ${chatId} is a ${row.kind} message and carries no media`,
@@ -159,7 +174,11 @@ export function makeMediaStore(deps: MediaStoreDeps): MediaStore {
     try {
       data = await download(message, { reuploadRequest: (m) => sock.updateMediaMessage(m), logger });
     } catch (err) {
-      logger.warn({ err, chatId, messageId }, "media: download failed");
+      // The error's own fields, never the error: an undici- or axios-shaped failure from
+      // `downloadMediaMessage` hangs the WhatsApp CDN media URL off itself, and pino's standard
+      // serializer copies every own enumerable key — so one `{ err }` writes a capability URL for
+      // the attachment's encrypted bytes into the log. See `errorFields`.
+      logger.warn({ ...errorFields(err), chatId, messageId }, "media: download failed");
       throw new MediaUnavailableError(
         `could not download the media for message ${messageId} in chat ${chatId}: WhatsApp media URLs expire, ` +
           "so a message this old is most likely no longer downloadable",

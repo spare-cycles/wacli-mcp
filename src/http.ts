@@ -325,7 +325,16 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
     const onListenError = (err: Error): void => {
       reject(err);
     };
-    const server: HttpServer = app.listen(config.port, "0.0.0.0", () => {
+    // **`app.listen` is called without a callback, and that is not a style choice.** Express 5.2.1
+    // wraps a callback passed here in `once()` and *also* registers it as an `error` handler
+    // (`lib/application.js:598`), so an EADDRINUSE runs the success path: the port is read off an
+    // `address()` of null, falls back to the port that could not be bound, and `startHttp` resolves a
+    // handle onto a server that is not listening — while `reject` runs afterwards against an
+    // already-settled promise and does nothing. Booting straight into "http: listening" on a port
+    // owned by another process is the failure this shape prevents; `listening` fires only on success.
+    const server: HttpServer = app.listen(config.port, "0.0.0.0");
+    server.on("error", onListenError);
+    server.once("listening", () => {
       server.off("error", onListenError);
       server.on("error", (err) => {
         logger.error(errorDetail(err), "http: server error");
@@ -335,7 +344,6 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
       logger.info({ port, path: config.httpPath, authenticated: token !== "" }, "http: listening");
       resolve({ port, close: () => closeServer(server) });
     });
-    server.on("error", onListenError);
   });
 
   async function closeServer(server: HttpServer): Promise<void> {

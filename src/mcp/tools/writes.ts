@@ -11,9 +11,10 @@
  * Three conventions:
  *
  * 1. **A handler never throws.** Every failure `send.ts` documents — `ConnectionUnavailableError`,
- *    `NotFoundError`, `MessageRevokedError`, `NotOwnMessageError`, `SendPathError` — comes back as an
- *    `errorResult` with its one readable line. An exception escaping into the SDK becomes a protocol
- *    error the model cannot read, and it would take the tool call's identity with it.
+ *    `NotFoundError`, `MessageRevokedError`, `NotOwnMessageError`, `SendPathError` — comes back as a
+ *    `failedResult`: one readable line to the model, one log line to the operator. An exception
+ *    escaping into the SDK becomes a protocol error the model cannot read, and it would take the tool
+ *    call's identity with it.
  * 2. **This module is gated, not conditional.** It is registered only when `config.readOnly` is
  *    false (`buildMcpServer`), so a read-only server does not advertise these tools at all rather
  *    than advertising them and refusing every call.
@@ -24,9 +25,9 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { FileSource, SendRef } from "../../wa/send.js";
+import type { ChatRef, FileSource, SendRef } from "../../wa/send.js";
 import type { ToolContext } from "../context.js";
-import { errorResult, jsonResult, type ToolResult } from "../result.js";
+import { failedResult, jsonResult, type ToolResult } from "../result.js";
 
 const chatSchema = z.string().min(1).describe("Chat JID, exactly as `wa_chats_list` returns it — a person or a group.");
 
@@ -86,15 +87,18 @@ const sendFileShape = {
 type SendFileArgs = { [K in keyof typeof sendFileShape]: z.infer<(typeof sendFileShape)[K]> };
 
 /**
- * Run a handler, turning anything it throws into a readable `isError` result.
+ * Run a handler, turning anything it throws into a readable `isError` result *and* a log line.
  *
- * Written once rather than as six try/catch blocks so that no tool can be added later without it.
+ * Written once rather than as six try/catch blocks so that no tool can be added later without it —
+ * which is also why the logging belongs here: a failure reported to the model and to nobody else
+ * leaves a bug in one of these six handlers with no trace anywhere an operator looks. `failedResult`
+ * never hands the error object to the logger; see `errorFields`.
  */
-async function guarded(work: () => Promise<ToolResult>): Promise<ToolResult> {
+async function guarded(tool: string, ctx: ToolContext, work: () => Promise<ToolResult>): Promise<ToolResult> {
   try {
     return await work();
   } catch (err) {
-    return errorResult(err);
+    return failedResult(tool, err, ctx);
   }
 }
 
@@ -106,11 +110,15 @@ function sendResult(ref: SendRef, ctx: ToolContext): ToolResult {
 /**
  * What an operation with no new message answers with.
  *
- * It echoes the caller's own `chat` rather than a canonical JID: this layer does not interpret JIDs
- * (Constraint 11), and echoing the input is honest, where re-deriving it would be a claim.
+ * `chat` is the id `send.ts` resolved the call against, exactly as `sendResult` reports `ref.chatId`
+ * — not the string the caller passed in. Echoing the input would make one field name mean the
+ * canonical chat in two of these six tools and "whatever you typed" in the other four, so a model
+ * that fed a LID to `wa_react` and the answer to `wa_messages_list` would read an empty chat. This
+ * layer still interprets no JID of its own (Constraint 11): it reports what the layer that owns
+ * `jid.ts` resolved.
  */
-function okResult(chat: string, messageId: string, ctx: ToolContext): ToolResult {
-  return jsonResult({ status: "ok", chat, message_id: messageId }, ctx.config.maxResultChars);
+function okResult(ref: ChatRef, messageId: string, ctx: ToolContext): ToolResult {
+  return jsonResult({ status: "ok", chat: ref.chatId, message_id: messageId }, ctx.config.maxResultChars);
 }
 
 /**
@@ -146,7 +154,7 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async ({ chat, text, reply_to }) =>
-      await guarded(async () => sendResult(await ctx.sender.sendText(chat, text, reply_to), ctx)),
+      await guarded("wa_send_text", ctx, async () => sendResult(await ctx.sender.sendText(chat, text, reply_to), ctx)),
   );
 
   server.registerTool(
@@ -160,7 +168,7 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async (args) =>
-      await guarded(async () => {
+      await guarded("wa_send_file", ctx, async () => {
         const ref = await ctx.sender.sendFile(args.chat, fileSource(args), {
           filename: args.filename,
           mimetype: args.mimetype,
@@ -186,10 +194,9 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async ({ chat, message_id, emoji }) =>
-      await guarded(async () => {
-        await ctx.sender.react(chat, message_id, emoji);
-        return okResult(chat, message_id, ctx);
-      }),
+      await guarded("wa_react", ctx, async () =>
+        okResult(await ctx.sender.react(chat, message_id, emoji), message_id, ctx),
+      ),
   );
 
   server.registerTool(
@@ -202,10 +209,9 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async ({ chat, message_id }) =>
-      await guarded(async () => {
-        await ctx.sender.markRead(chat, message_id);
-        return okResult(chat, message_id, ctx);
-      }),
+      await guarded("wa_mark_read", ctx, async () =>
+        okResult(await ctx.sender.markRead(chat, message_id), message_id, ctx),
+      ),
   );
 
   server.registerTool(
@@ -222,10 +228,9 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async ({ chat, message_id, text }) =>
-      await guarded(async () => {
-        await ctx.sender.editMessage(chat, message_id, text);
-        return okResult(chat, message_id, ctx);
-      }),
+      await guarded("wa_edit_message", ctx, async () =>
+        okResult(await ctx.sender.editMessage(chat, message_id, text), message_id, ctx),
+      ),
   );
 
   server.registerTool(
@@ -238,9 +243,8 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: DESTRUCTIVE_TOOL,
     },
     async ({ chat, message_id }) =>
-      await guarded(async () => {
-        await ctx.sender.deleteMessage(chat, message_id);
-        return okResult(chat, message_id, ctx);
-      }),
+      await guarded("wa_delete_message", ctx, async () =>
+        okResult(await ctx.sender.deleteMessage(chat, message_id), message_id, ctx),
+      ),
   );
 }

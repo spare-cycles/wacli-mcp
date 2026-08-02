@@ -13,6 +13,7 @@
  */
 
 import { execFile, type ExecFileException } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { Jimp } from "jimp";
 import type { Logger } from "pino";
 import { logger as defaultLogger } from "../logger.js";
@@ -56,7 +57,13 @@ const MAX_SHRINK_PASSES = 24;
 /** Fraction of the running time skipped at each end when sampling keyframes. */
 const KEYFRAME_MARGIN = 0.05;
 
-export type ToolResult = { stdout: Buffer; stderr: string };
+/**
+ * What an external process left behind. Named for the process and not for the tool call: `ToolResult`
+ * is `src/mcp/result.ts`'s MCP content-block envelope, and `src/mcp/tools/media.ts` imports from both
+ * files — two exported types of the same name and no relation is one careless auto-import away from a
+ * confusing compile error, or from none at all.
+ */
+export type ProcessOutput = { stdout: Buffer; stderr: string };
 
 /** A jimp image, named off the factory so the enormous structural type never has to be written out. */
 type Image = Awaited<ReturnType<typeof Jimp.read>>;
@@ -91,8 +98,8 @@ function toolFailure(bin: string, timeoutMs: number, err: ExecFileException, std
  * Exported because the timeout has no other observable trigger from outside — and because Task 11's
  * whisper.cpp invocation needs exactly this contract rather than a second copy of it.
  */
-export function runTool(bin: string, args: readonly string[], timeoutMs: number): Promise<ToolResult> {
-  return new Promise<ToolResult>((resolve, reject) => {
+export function runTool(bin: string, args: readonly string[], timeoutMs: number): Promise<ProcessOutput> {
+  return new Promise<ProcessOutput>((resolve, reject) => {
     execFile(
       bin,
       [...args],
@@ -106,6 +113,17 @@ export function runTool(bin: string, args: readonly string[], timeoutMs: number)
       },
     );
   });
+}
+
+/** The errno of whatever is wrong with `path` (`ENOENT`, `EACCES`, …), or undefined when it is fine. */
+async function statusOfFile(path: string): Promise<string | undefined> {
+  try {
+    await stat(path);
+    return undefined;
+  } catch (err) {
+    const code: unknown = typeof err === "object" && err !== null ? (err as { code?: unknown }).code : undefined;
+    return typeof code === "string" ? code : "unreadable";
+  }
 }
 
 function toBlock(jpeg: Buffer): ImageBlock {
@@ -127,11 +145,22 @@ async function decodeImage(source: string | Buffer): Promise<Image> {
   try {
     return await Jimp.read(source);
   } catch {
-    // Not a format jimp knows. Fall through to ffmpeg, which reads far more of them.
+    // Not a format jimp knows — or a file that is not there. jimp 1.6 cannot tell them apart *for*
+    // us: every source failure arrives as the same bare `Error` ("Could not load Buffer from URL:
+    // …"), with no `code`, no `cause` and nothing else to read, so the distinction is made below
+    // rather than off the error. Fall through to ffmpeg, which reads far more formats.
   }
   // Only a file on disk can be handed to ffmpeg; in-memory sources here are frames ffmpeg itself
   // just produced, so a jimp failure on one of those is a real corruption rather than a format gap.
   if (typeof source !== "string") throw new ConversionError("the image data could not be decoded");
+
+  // Before the spawn, not after it. An unreadable path costs an ffmpeg process for a failure that is
+  // already decided — and on an image without ffmpeg installed it is then reported as "ffmpeg is not
+  // installed or not on PATH", which sends whoever reads it to rebuild an image that was fine.
+  const unreadable = await statusOfFile(source);
+  if (unreadable !== undefined) {
+    throw new ConversionError(`the file to decode could not be read (${unreadable}), so nothing can be made of it`);
+  }
 
   const { stdout } = await runTool(
     FFMPEG,

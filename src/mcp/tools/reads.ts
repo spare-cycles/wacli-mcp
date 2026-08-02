@@ -11,8 +11,10 @@
  *    by one to find out. A cursor is opaque; a malformed one is an error, never a silent restart.
  * 2. **Reaction counts are one grouped query per page,** not one per row. The full reaction shapes
  *    belong to single-message tools.
- * 3. **A handler never throws.** Everything comes back as `jsonResult` or `errorResult`, because an
+ * 3. **A handler never throws.** Everything comes back as `jsonResult` or `failedResult`, because an
  *    exception escaping into the SDK becomes a protocol error rather than something a model can read.
+ *    `failedResult` is `errorResult` plus a log line: a handler that answered the model and told the
+ *    operator nothing makes a `TypeError` in here invisible to everyone who could fix it.
  *
  * This module imports nothing from `baileys` (Constraint 12) and interprets no JID itself — `chat`
  * and `sender` arguments go through `wa/jid.ts`'s `canonicalId` (Constraint 11), the same way
@@ -27,7 +29,7 @@ import { canonicalId } from "../../wa/jid.js";
 import type { ToolContext } from "../context.js";
 import { decodeCursor, encodeCursor } from "../cursor.js";
 import { buildHealth } from "../health.js";
-import { errorResult, jsonResult, presentChat, presentContact, presentMessage, type ToolResult } from "../result.js";
+import { failedResult, jsonResult, presentChat, presentContact, presentMessage, type ToolResult } from "../result.js";
 
 const OFFLINE = "Reads the local SQLite store only, so it answers offline, while the WhatsApp connection is down.";
 
@@ -142,7 +144,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
       try {
         return jsonResult(await buildHealth(ctx), ctx.config.maxResultChars);
       } catch (err) {
-        return errorResult(err);
+        return failedResult("wa_health", err, ctx);
       }
     },
   );
@@ -173,7 +175,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
           ctx,
         );
       } catch (err) {
-        return errorResult(err);
+        return failedResult("wa_chats_list", err, ctx);
       }
     },
   );
@@ -196,7 +198,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
           ctx,
         );
       } catch (err) {
-        return errorResult(err);
+        return failedResult("wa_groups_list", err, ctx);
       }
     },
   );
@@ -230,7 +232,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
         const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.messages.list(filter, l, o));
         return page(presentMessagePage(rows, ctx), nextCursor, ctx);
       } catch (err) {
-        return errorResult(err);
+        return failedResult("wa_messages_list", err, ctx);
       }
     },
   );
@@ -256,7 +258,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
         const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.messages.search(query, opts, l, o));
         return page(presentSearchPage(rows, ctx), nextCursor, ctx);
       } catch (err) {
-        return errorResult(err);
+        return failedResult("wa_messages_search", err, ctx);
       }
     },
   );
@@ -278,7 +280,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
         const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.contacts.search(query, l, o));
         return page(rows.map(presentContact), nextCursor, ctx);
       } catch (err) {
-        return errorResult(err);
+        return failedResult("wa_contacts_search", err, ctx);
       }
     },
   );

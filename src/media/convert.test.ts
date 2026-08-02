@@ -164,8 +164,20 @@ void test("imageBlock decodes WebP, which jimp cannot read, through the ffmpeg f
   assert.equal(decoded.width, 512);
 });
 
-void test("a conversion failure raises ConversionError rather than hanging", async () => {
-  await assert.rejects(() => imageBlock(join(dir, "does-not-exist.png"), 1000), ConversionError);
+void test("a file that is not there is named as such, and costs no ffmpeg process", async () => {
+  // jimp reports a missing file and a format it does not ship with the same opaque error, so without
+  // an explicit check both fall through to the ffmpeg fallback — where a missing *input* is reported
+  // as "ffmpeg is not installed or not on PATH" on any image built without ffmpeg, which sends the
+  // reader to rebuild a runtime that was fine.
+  await assert.rejects(
+    () => imageBlock(join(dir, "does-not-exist.png"), 1000),
+    (err: unknown) => {
+      assert.ok(err instanceof ConversionError, `expected ConversionError, got ${String(err)}`);
+      assert.match(err.message, /ENOENT/, "the error must name what is actually wrong");
+      assert.doesNotMatch(err.message, /ffmpeg/, "and must not blame the transcoder for it");
+      return true;
+    },
+  );
 });
 
 // --- video ------------------------------------------------------------------------------------

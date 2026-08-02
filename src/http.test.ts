@@ -166,6 +166,29 @@ const INITIALIZE = {
   },
 };
 
+// --- startup ------------------------------------------------------------------------------------
+
+void test("a port that is already taken rejects instead of resolving a dead handle", async (t) => {
+  const taken = await start(t);
+
+  // The only *listen* failure that is cheap and portable to provoke. It is worth provoking: the
+  // `error` listener that catches it has to be attached before `listen` settles and taken off again
+  // after — left on, every later server error is handed to an already-resolved `reject`, which is a
+  // no-op, and the failure vanishes; never attached, the event is unhandled and takes the process
+  // down instead of rejecting the promise `main.ts` awaits.
+  await assert.rejects(
+    () => start(t, { port: taken.handle.port }),
+    (err: unknown) => {
+      assert.ok(err instanceof Error, `expected an Error, got ${String(err)}`);
+      assert.match(err.message, /EADDRINUSE/);
+      return true;
+    },
+  );
+
+  const still = await fetch(`${taken.base}/health`);
+  assert.equal(still.status, 200, "and the server that owns the port is untouched");
+});
+
 // --- /health ------------------------------------------------------------------------------------
 
 void test("/health is public and returns the snapshot", async (t) => {

@@ -116,13 +116,16 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
    */
   const refuse = (): Promise<never> => Promise.reject(new ConnectionUnavailableError(state));
   const connected = state === "connected";
+  // Every method answers with chat `"c"` and never with the id it was handed: the real sender
+  // canonicalizes what the caller passed (a LID and its phone JID are one conversation), so a stub
+  // echoing the input would let a tool that reports the caller's own string back to it pass.
   const sender: Sender = {
     sendText: () => (connected ? Promise.resolve({ chatId: "c", messageId: "S1" }) : refuse()),
     sendFile: () => (connected ? Promise.resolve({ chatId: "c", messageId: "S2" }) : refuse()),
-    react: () => (connected ? Promise.resolve() : refuse()),
-    markRead: () => (connected ? Promise.resolve() : refuse()),
-    editMessage: () => (connected ? Promise.resolve() : refuse()),
-    deleteMessage: () => (connected ? Promise.resolve() : refuse()),
+    react: () => (connected ? Promise.resolve({ chatId: "c" }) : refuse()),
+    markRead: () => (connected ? Promise.resolve({ chatId: "c" }) : refuse()),
+    editMessage: () => (connected ? Promise.resolve({ chatId: "c" }) : refuse()),
+    deleteMessage: () => (connected ? Promise.resolve({ chatId: "c" }) : refuse()),
   };
 
   const media: MediaStore = {

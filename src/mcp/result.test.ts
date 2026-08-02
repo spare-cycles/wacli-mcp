@@ -79,7 +79,29 @@ void test("errorResult handles non-Error throwables", () => {
 });
 
 void test("textResult passes text through", () => {
-  assert.equal((textResult("hi").content[0] as { text: string }).text, "hi");
+  assert.equal((textResult("hi", 1000).content[0] as { text: string }).text, "hi");
+});
+
+void test("textResult is capped too, and its note counts what it really emitted", () => {
+  // The payload transcripts and PDF text come back as. It used to be the one thing a tool could
+  // return with no cap at all, which made "every payload is capped" false and let one voice note
+  // outweigh a whole page of messages.
+  const long = "x".repeat(5000);
+  const text = (textResult(long, 200).content[0] as { text: string }).text;
+  assert.ok(text.length < 600, `a capped payload must be short, got ${text.length}`);
+  assert.equal(truncatedBody(text), "x".repeat(200));
+  assert.match(text, /5000 chars total, showing first 200/);
+});
+
+void test("a truncation note reports what was emitted, not what was asked for", () => {
+  // The cut lands between the halves of a surrogate pair, so the codepoint-safe slice keeps one
+  // character less than the cap — and the note has to say 199, not 200. A note built from `maxChars`
+  // is off by one exactly on the payloads where the difference exists.
+  const payload = `${"a".repeat(199)}😀tail`;
+  const text = (textResult(payload, 200).content[0] as { text: string }).text;
+  assert.equal(truncatedBody(text).length, 199);
+  assert.match(text, /showing first 199\./);
+  assert.doesNotMatch(text, /showing first 200\./);
 });
 
 // ── presentReactions ──────────────────────────────────────────────────────

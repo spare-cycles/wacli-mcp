@@ -40,8 +40,10 @@ read-only deployment does not advertise them, so a model never sees an ability i
 | `wa_edit_message` | Replace the text of a message this account sent. | **yes** |
 | `wa_delete_message` | Revoke a message this account sent, for everyone. Irreversible. | **yes** |
 
-Every tool returns a JSON result, truncated at `WA_MCP_MAX_RESULT_CHARS`; failures come back as an MCP error result
-naming what went wrong, not as a transport error. A write attempted while the socket is down fails with the connection
+Every tool result is capped at `WA_MCP_MAX_RESULT_CHARS` — the JSON payloads and the free-text blocks alike, so a
+transcript or a PDF's contents is bounded exactly as a page of messages is. Whatever is cut carries a note saying how
+long the whole thing was and how much of it is above. Failures come back as an MCP error result naming what went wrong,
+not as a transport error. A write attempted while the socket is down fails with the connection
 state in the message, so a model can tell "retry in a moment" from "this will never work".
 
 ## Prerequisites
@@ -109,10 +111,11 @@ Every variable is optional except where noted. Invalid numbers fall back to the 
 | `WA_MAX_UPLOAD_BYTES` | 64 MiB | Largest file `wa_send_file` will send, whichever way the bytes arrived. Clamped to `[1, 256 MiB]`. It also sizes the HTTP body limit, which is this value plus base64 overhead plus 1 MiB of envelope — so raising it raises what an authenticated client may POST. |
 | `WA_SEND_FILE_DIR` | — | The **one** directory `wa_send_file`'s `path` argument may resolve inside. Unset disables `path` entirely, which is the default and the right one: a container serving a remote client has no legitimate caller for a server-side path, and left open, `path` is an arbitrary-file-read primitive that would hand `/proc/self/environ` — every secret in the process environment — to a WhatsApp conversation. When set, paths are resolved through symlinks and confined to it; a refusal never echoes the path it was asked to read. |
 | `WA_VIDEO_KEYFRAMES` | `4` | Frames extracted per video, evenly spaced. Clamped to `[1, 16]`. |
-| `WA_MCP_MAX_RESULT_CHARS` | `200000` | Tool results longer than this are truncated with a marker. Clamped to `[1000, 50000000]`. |
+| `WA_MCP_MAX_RESULT_CHARS` | `200000` | Every tool payload longer than this is truncated with a note naming the full length — JSON results, transcripts and extracted PDF text alike. Clamped to `[1000, 50000000]`. |
 | `NTFY_BASE_URL` | — | ntfy server for connection alerts. Alerting is all-or-nothing: it is off unless both this and `NTFY_TOPIC` are set. |
 | `NTFY_TOPIC` | — | ntfy topic to publish to. |
 | `NTFY_TOKEN` | — | Bearer token for ntfy, if the server needs one. Travels in a header and appears in no log line. |
+| `LOG_LEVEL` | `info` | pino level for every log line the process writes: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. Read in `src/logger.ts`, not through `loadConfig`, so it is the one variable here that is not part of `Config`. |
 
 Alerting debounces on purpose: a dropped socket must stay down for a grace period before anyone is paged, re-alerts on
 a cadence while still down, and announces recovery only if a down alert actually went out. `logged_out` skips the grace

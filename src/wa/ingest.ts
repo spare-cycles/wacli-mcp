@@ -222,7 +222,8 @@ function quotedIdOf(content: WAMessageContent | undefined): string | undefined {
 }
 
 /**
- * Exported for tests and for send.ts: classify a Baileys message into our MessageKind.
+ * Exported for tests only — `send.ts` imports neither this nor `extractText`, and nothing else does
+ * either: classify a Baileys message into our MessageKind.
  *
  * `normalizeMessageContent` first, always. WhatsApp routinely wraps real content in
  * `ephemeralMessage` / `viewOnceMessage` / `viewOnceMessageV2` / `documentWithCaptionMessage`, and
@@ -256,7 +257,7 @@ export function makeIngest(deps: IngestDeps): Ingest {
    * `fn`: **SQLite has no nested transactions.** A `BEGIN` issued while one is already open fails
    * with "cannot start a transaction within a transaction", so no repository call that opens its
    * own may be made from inside `fn` — today that means `contacts.upsertMany`
-   * (`db/contacts.ts:156`) and `contacts.linkIdentity` (`db/contacts.ts:204`), neither of which may
+   * (`db/contacts.ts:150`) and `contacts.linkIdentity` (`db/contacts.ts:195`), neither of which may
    * ever be called from `applyChat`, `ingestMessage`, or anything they reach. Contact and identity
    * work therefore runs outside the chunk loop; see `applyHistory` and `upsertContacts`.
    */

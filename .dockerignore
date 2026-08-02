@@ -2,7 +2,8 @@ node_modules
 dist
 .git
 .github
-.remember
+.claude
+.stpr
 .vscode
 *.log
 README.md

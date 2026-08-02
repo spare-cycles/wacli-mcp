@@ -169,6 +169,34 @@ void test("a caption that does not match leaves the transcript hit labelled as o
   assert.match(hit.snippet, /demain/, "a snippet that does not contain the hit is worse than no snippet");
 });
 
+void test("a marker character typed by a sender cannot fake a text match", () => {
+  // The markers are `char(1)`/`char(2)`, and a message body is sender-supplied UTF-8: nothing stops
+  // someone sending a literal SOH. `snippet()` copies it into the snippet verbatim, so reading the
+  // snippet alone reports "the text column matched" for a caption that contains none of the searched
+  // words — the very mislabelling the marker rule replaced "is the snippet empty?" to prevent.
+  const r = repo();
+  r.upsert(msg({ id: "V1", kind: "video", text: "\u0001voici la legende de ma video sans le mot" }));
+  r.setTranscript("c", "V1", "on se retrouve demain");
+  const hit = r.search("demain", {}, 10, 0)[0];
+  assert.equal(hit?.matchedTranscript, true, "the words are in the speech; the SOH in the caption is not a match");
+  assert.match(hit.snippet, /demain/);
+});
+
+void test("a marker in the column that did match costs the label rather than mislabelling the hit", () => {
+  // The price of the rule above, stated so it is a decision and not a surprise: when the column that
+  // really matched is also the one carrying a marker of its own, its signal is unreadable, so the row
+  // comes back as a hit with no snippet and no transcript label — rather than being attributed to a
+  // text column the words are not in. `matched_transcript` is what tells a model the words were
+  // spoken rather than typed, and unknown is worth more to it than confidently wrong.
+  const r = repo();
+  r.upsert(msg({ id: "V1", kind: "audio", text: undefined }));
+  r.setTranscript("c", "V1", "\u0001on se retrouve demain");
+  const hit = r.search("demain", {}, 10, 0)[0];
+  assert.equal(hit?.id, "V1", "the row is still found — only the attribution is withheld");
+  assert.equal(hit.matchedTranscript, false);
+  assert.equal(hit.snippet, "");
+});
+
 void test("search can be scoped to one chat", () => {
   const r = repo();
   r.upsert(msg({ chatId: "c", id: "M1", text: "orange" }));
@@ -184,12 +212,6 @@ void test("search survives FTS5 operator characters in user input", () => {
     assert.doesNotThrow(() => r.search(q, {}, 10, 0), `query ${JSON.stringify(q)} must not throw`);
   }
   assert.equal(r.search("quoted", {}, 10, 0).length, 1);
-});
-
-void test("upsertMany is atomic", () => {
-  const r = repo();
-  r.upsertMany([msg({ id: "A" }), msg({ id: "B" }), msg({ id: "C" })]);
-  assert.equal(r.count(), 3);
 });
 
 void test("unreadKeysUpTo returns non-from_me, non-deleted messages at or before ts, newest first", () => {

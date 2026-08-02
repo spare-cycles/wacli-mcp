@@ -267,9 +267,9 @@ void test("wa_react accepts an empty emoji, which is how WhatsApp removes a reac
   const calls: string[] = [];
   const sender: Sender = {
     ...failingSender(new Error("not part of this test")),
-    react: (_chat, _messageId, emoji) => {
+    react: (chat, _messageId, emoji) => {
       calls.push(emoji);
-      return Promise.resolve();
+      return Promise.resolve({ chatId: chat });
     },
   };
   const h = await serverHarness({ overrides: { sender } });
@@ -372,8 +372,54 @@ void test("wa_mark_read and wa_delete_message report success without inventing a
     for (const tool of ["wa_mark_read", "wa_delete_message"]) {
       const res = await h.client.callTool({ name: tool, arguments: { chat: CHAT, message_id: MSG } });
       assert.notEqual(res.isError, true, resultText(res));
-      assert.deepEqual(JSON.parse(resultText(res)), { status: "ok", chat: CHAT, message_id: MSG });
+      // `chat` is the id the sender resolved the call against — the stub answers "c" for every
+      // method — and not the string that went in. One field name cannot mean the canonical chat in
+      // `wa_send_text` and "whatever you typed" here: a caller naming a chat by its LID would get
+      // its own LID back and read an empty conversation when it fed that to wa_messages_list.
+      assert.deepEqual(JSON.parse(resultText(res)), { status: "ok", chat: "c", message_id: MSG });
     }
+  } finally {
+    await h.close();
+  }
+});
+
+/**
+ * Argument order, per tool, against a sender that records which method was called with what.
+ *
+ * `markRead`, `deleteMessage`, `editMessage` and `react` all take `(chat, messageId, …)` as strings,
+ * so a transposed pair type-checks, and two of the six tools are otherwise asserted identically —
+ * which means calling `markRead` inside `wa_delete_message` passes every other test in this file.
+ * Distinct values for the chat and the id are what make a swap visible; recording the method name is
+ * what makes the wrong-method-entirely case visible.
+ */
+void test("each write tool calls its own sender method, with the chat and the message id in that order", async () => {
+  const calls: string[] = [];
+  const record =
+    (method: string) =>
+    (chat: string, messageId: string): Promise<{ chatId: string }> => {
+      calls.push(`${method}(${chat}, ${messageId})`);
+      return Promise.resolve({ chatId: chat });
+    };
+  const sender: Sender = {
+    ...failingSender(new Error("not part of this test")),
+    react: record("react"),
+    markRead: record("markRead"),
+    editMessage: record("editMessage"),
+    deleteMessage: record("deleteMessage"),
+  };
+  const h = await serverHarness({ overrides: { sender } });
+  try {
+    const args = { chat: CHAT, message_id: MSG, emoji: "\u{1F44D}", text: "corrigé" };
+    for (const tool of ["wa_react", "wa_mark_read", "wa_edit_message", "wa_delete_message"]) {
+      const res = await h.client.callTool({ name: tool, arguments: args });
+      assert.notEqual(res.isError, true, `${tool}: ${resultText(res)}`);
+    }
+    assert.deepEqual(calls, [
+      `react(${CHAT}, ${MSG})`,
+      `markRead(${CHAT}, ${MSG})`,
+      `editMessage(${CHAT}, ${MSG})`,
+      `deleteMessage(${CHAT}, ${MSG})`,
+    ]);
   } finally {
     await h.close();
   }
@@ -442,9 +488,11 @@ void test("wa_download_media samples a video and never exceeds the keyframe budg
     const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
     assert.notEqual(res.isError, true, resultText(res));
 
-    const budget = h.ctx.config.videoKeyframes;
-    assert.equal(imageBlocks(res).length, budget);
-    assert.ok(imageBlocks(res).length <= budget + 1, "a result may never carry more than videoKeyframes + 1 images");
+    // The `videoKeyframes + 1` cap in `compose` is deliberately *not* asserted here. No branch can
+    // reach it — the image branch produces one block and this one produces exactly
+    // `config.videoKeyframes` — so from out here any assertion about it is a restatement of the line
+    // above. The line that used to follow it (`length <= budget + 1`) was exactly that.
+    assert.equal(imageBlocks(res).length, h.ctx.config.videoKeyframes);
 
     const summary = summaryOf(res);
     assert.equal(summary["width"], 320);
@@ -512,7 +560,7 @@ void test("wa_download_media hands back the cache path for a document it cannot 
   }
 });
 
-void test("wa_download_media routes a PDF through text extraction rather than the path fallback", async () => {
+void test("a PDF whose text cannot be extracted degrades to the summary rather than failing", async () => {
   // The fixture is deliberately *not* a PDF, and that is the point: what is under test is the
   // routing, not pdftotext (convert.test.ts covers that against a real PDF). The same bytes under
   // `application/octet-stream` came back with their path and no error in the test above; claiming to
@@ -525,8 +573,12 @@ void test("wa_download_media routes a PDF through text extraction rather than th
   });
   try {
     const res = await h.client.callTool({ name: "wa_download_media", arguments: { chat: CHAT, message_id: MSG } });
-    assert.equal(res.isError, true);
-    assert.match(resultText(res), /pdftotext/);
+    assert.notEqual(res.isError, true, "one failed extraction must not throw away the whole answer");
+    assert.match(resultText(res), /pdftotext/, "and it says why the text is missing");
+    const summary = summaryOf(res);
+    assert.equal(summary["path"], docPath, "the path, size and mimetype survive the failure");
+    assert.equal(summary["mimetype"], "application/pdf");
+    assert.equal(summary["bytes"], statSync(docPath).size);
   } finally {
     await h.close();
   }

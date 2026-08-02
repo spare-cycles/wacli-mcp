@@ -38,6 +38,15 @@ import { canonicalId, isGroupJid } from "./jid.js";
 
 export type SendRef = { chatId: string; messageId: string };
 
+/**
+ * Where an operation that produces no new message landed.
+ *
+ * Returned rather than `void` so the tool layer can report the chat it really acted on instead of
+ * echoing what the caller typed: a LID and its phone JID name one conversation, and only this module
+ * — which owns the call into `jid.ts` — knows which id that is.
+ */
+export type ChatRef = { chatId: string };
+
 export type FileSource = { kind: "path"; path: string } | { kind: "data"; base64: string };
 
 export type SendFileOptions = {
@@ -56,11 +65,11 @@ export type SendFileOptions = {
 export type Sender = {
   sendText: (chat: string, text: string, replyTo?: string) => Promise<SendRef>;
   sendFile: (chat: string, src: FileSource, opts: SendFileOptions) => Promise<SendRef>;
-  react: (chat: string, messageId: string, emoji: string) => Promise<void>;
+  react: (chat: string, messageId: string, emoji: string) => Promise<ChatRef>;
   /** Marks the chat read *up to and including* `messageId`, not that message alone. */
-  markRead: (chat: string, messageId: string) => Promise<void>;
-  editMessage: (chat: string, messageId: string, text: string) => Promise<void>;
-  deleteMessage: (chat: string, messageId: string) => Promise<void>;
+  markRead: (chat: string, messageId: string) => Promise<ChatRef>;
+  editMessage: (chat: string, messageId: string, text: string) => Promise<ChatRef>;
+  deleteMessage: (chat: string, messageId: string) => Promise<ChatRef>;
 };
 
 export type SendDeps = {
@@ -157,6 +166,18 @@ const MIMETYPE_BY_EXTENSION: Readonly<Record<string, string>> = {
 function isWithin(root: string, candidate: string): boolean {
   const prefix = root.endsWith(sep) ? root : root + sep;
   return candidate.startsWith(prefix);
+}
+
+/**
+ * How many bytes a base64 string decodes to: three per four characters, less its padding.
+ *
+ * Exact for canonical base64, which is what the `data` argument is — and it is a *bound* on the
+ * allocation either way, which is the point: it is read off the string that is already in memory,
+ * before a second, decoded copy of it exists.
+ */
+function decodedSize(base64: string): number {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.floor((base64.length * 3) / 4) - padding;
 }
 
 /** The mimetype to send under: what the caller said, else the filename's extension, else a default. */
@@ -307,6 +328,10 @@ export function makeSender(deps: SendDeps): Sender {
   /** The bytes to upload. The size limit is enforced here, before anything is sent or even read. */
   async function loadSource(src: FileSource): Promise<Buffer> {
     if (src.kind === "data") {
+      // The encoded length first, so an oversize payload is refused *before* it is materialized as a
+      // second copy in memory — the same reason the path branch below stats before it reads. The
+      // check is then repeated on the bytes actually decoded, which is the one the limit is about.
+      assertWithinLimit(decodedSize(src.base64));
       const data = Buffer.from(src.base64, "base64");
       assertWithinLimit(data.length);
       return data;
@@ -344,8 +369,12 @@ export function makeSender(deps: SendDeps): Sender {
   async function sendFile(chat: string, src: FileSource, opts: SendFileOptions): Promise<SendRef> {
     const jid = canonical(chat);
     const sock = conn.requireSocket();
+    // The quote is resolved before the bytes are, matching `sendText`: an unknown or revoked
+    // `replyTo` is a refusal either way, and this way it costs no decode and no read of up to
+    // `maxUploadBytes` first.
+    const quote = quoteOption(jid, opts.replyTo);
     const data = await loadSource(src);
-    const sent = await sock.sendMessage(jid, mediaContent(data, opts), quoteOption(jid, opts.replyTo));
+    const sent = await sock.sendMessage(jid, mediaContent(data, opts), quote);
     return refFor(jid, sent);
   }
 
@@ -361,16 +390,17 @@ export function makeSender(deps: SendDeps): Sender {
    *
    * A revoked message is refused — see `requireRow`.
    */
-  async function react(chat: string, messageId: string, emoji: string): Promise<void> {
+  async function react(chat: string, messageId: string, emoji: string): Promise<ChatRef> {
     const jid = canonical(chat);
     const sock = conn.requireSocket();
     const row = requireRow(jid, messageId);
     // An empty string is not a missing emoji: it is how WhatsApp removes a reaction.
     const key = keyFor(jid, row.id, row.senderId, row.fromMe);
     reingest(await sock.sendMessage(jid, { react: { text: emoji, key } }));
+    return { chatId: jid };
   }
 
-  async function markRead(chat: string, messageId: string): Promise<void> {
+  async function markRead(chat: string, messageId: string): Promise<ChatRef> {
     const jid = canonical(chat);
     const sock = conn.requireSocket();
     const target = requireRow(jid, messageId);
@@ -382,6 +412,7 @@ export function makeSender(deps: SendDeps): Sender {
       .map((m) => keyFor(jid, m.id, m.senderId, false));
     if (keys.length > 0) await sock.readMessages(keys);
     chats.clearUnread(jid);
+    return { chatId: jid };
   }
 
   /**
@@ -391,11 +422,12 @@ export function makeSender(deps: SendDeps): Sender {
    * drops it, and the stored `text`/`edited_ts` are written only when Baileys' `messages.update`
    * arrives on the next tick. A caller that edits and immediately lists can still read the old text.
    */
-  async function editMessage(chat: string, messageId: string, text: string): Promise<void> {
+  async function editMessage(chat: string, messageId: string, text: string): Promise<ChatRef> {
     const jid = canonical(chat);
     const sock = conn.requireSocket();
     const edit = ownKey(jid, messageId);
     reingest(await sock.sendMessage(jid, { text, edit }));
+    return { chatId: jid };
   }
 
   /**
@@ -407,11 +439,12 @@ export function makeSender(deps: SendDeps): Sender {
    * `wa_messages_list` can therefore still show the message, undeleted — it is a stale read, not a
    * failed revoke, and the next read has it.
    */
-  async function deleteMessage(chat: string, messageId: string): Promise<void> {
+  async function deleteMessage(chat: string, messageId: string): Promise<ChatRef> {
     const jid = canonical(chat);
     const sock = conn.requireSocket();
     const key = ownKey(jid, messageId);
     reingest(await sock.sendMessage(jid, { delete: key }));
+    return { chatId: jid };
   }
 
   return { sendText, sendFile, react, markRead, editMessage, deleteMessage };

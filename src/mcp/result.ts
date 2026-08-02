@@ -17,11 +17,29 @@ import type { ChatRow } from "../db/chats.js";
 import type { ContactRow } from "../db/contacts.js";
 import type { MessageRow } from "../db/messages.js";
 import type { ReactionRow } from "../db/reactions.js";
+import { errorFields } from "../logger.js";
 import type { ToolContext } from "./context.js";
 
 export type Block = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
 export type ToolResult = { content: Block[]; isError?: boolean };
+
+/**
+ * What a payload that had to be cut says about itself: how long the whole thing was, and how much of
+ * it is really above.
+ *
+ * `shown` is what was actually emitted, never the cap that was asked for. The codepoint-safe cut
+ * drops one further character whenever the boundary lands inside a surrogate pair, so a note built
+ * from `maxChars` claims one more character than it delivered — exactly on the payloads where a
+ * model might count on the number.
+ */
+function truncationNote(total: number, shown: number, advice: string): string {
+  return `\n\n…[truncated: ${total} chars total, showing first ${shown}.${advice}]`;
+}
+
+const JSON_ADVICE =
+  " The response was cut mid-JSON, so what is above is an incomplete document and will not parse " +
+  'as it stands. Narrow the request with a smaller "limit" or more filters.';
 
 /**
  * JSON, pretty-printed, truncated to `maxChars` with a note naming the true total length.
@@ -34,14 +52,9 @@ export function jsonResult(data: unknown, maxChars: number): ToolResult {
   // `undefined`. Taking the declared type at face value turns "a tool returned nothing" into a
   // TypeError on `.length` that kills the whole call.
   const full = data === undefined ? "null" : JSON.stringify(data, null, 2);
-  const text =
-    full.length > maxChars
-      ? truncateToCodepoint(full, maxChars) +
-        `\n\n…[truncated: ${full.length} chars total, showing first ${maxChars}. The response was cut ` +
-        `mid-JSON, so what is above is an incomplete document and will not parse as it stands. ` +
-        `Narrow the request with a smaller "limit" or more filters.]`
-      : full;
-  return { content: [{ type: "text", text }] };
+  if (full.length <= maxChars) return { content: [{ type: "text", text: full }] };
+  const shown = truncateToCodepoint(full, maxChars);
+  return { content: [{ type: "text", text: shown + truncationNote(full.length, shown.length, JSON_ADVICE) }] };
 }
 
 /**
@@ -61,8 +74,18 @@ function truncateToCodepoint(s: string, maxChars: number): string {
   return s.slice(0, isOrphanedHighSurrogate ? maxChars - 1 : maxChars);
 }
 
-export function textResult(text: string): ToolResult {
-  return { content: [{ type: "text", text }] };
+/**
+ * Free text — a transcript, a PDF's contents, an instruction — under the same cap as everything else.
+ *
+ * `maxChars` is required rather than defaulted, because rule 1 above is "every payload is capped" and
+ * an optional cap is one a caller forgets. A voice note is minutes of speech and a PDF is a document:
+ * both are exactly as capable of filling a context window as a page of messages is, and the transcript
+ * blocks used to be the one payload that escaped `WA_MCP_MAX_RESULT_CHARS` entirely.
+ */
+export function textResult(text: string, maxChars: number): ToolResult {
+  if (text.length <= maxChars) return { content: [{ type: "text", text }] };
+  const shown = truncateToCodepoint(text, maxChars);
+  return { content: [{ type: "text", text: shown + truncationNote(text.length, shown.length, "") }] };
 }
 
 /** An `isError` result carrying one readable line. Never a stack trace — see rule 2 above. */
@@ -70,8 +93,20 @@ export function errorResult(err: unknown): ToolResult {
   return { content: [{ type: "text", text: describeError(err) }], isError: true };
 }
 
+/**
+ * The failure of one tool call: one line to the model, one line to the operator.
+ *
+ * The single choke point every handler's catch goes through, so that a `TypeError` in any of the
+ * fourteen tools cannot be a thing only the model ever sees. The error object itself is never handed
+ * to the logger — see `errorFields`.
+ */
+export function failedResult(tool: string, err: unknown, ctx: ToolContext): ToolResult {
+  ctx.logger.warn({ ...errorFields(err), tool }, "tool: call failed");
+  return errorResult(err);
+}
+
 /** The one line an error is worth: its name and message, or a safe rendering of a non-Error throw. */
-function describeError(err: unknown): string {
+export function describeError(err: unknown): string {
   if (err instanceof Error) return err.message === "" ? err.name : `${err.name}: ${err.message}`;
   if (typeof err === "string") return err === "" ? "unknown error" : err;
   if (typeof err === "number" || typeof err === "boolean" || typeof err === "bigint") return String(err);

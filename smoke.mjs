@@ -21,6 +21,16 @@
  *   node smoke.mjs                                    # health + tool list + wa_chats_list
  *   node smoke.mjs --transcribe <chatJid> <messageId> # ... and transcribe one voice note
  *
+ * Exit codes:
+ *
+ *   0  every step passed against a live, paired store
+ *   1  a step failed
+ *   2  every step passed, but the store is **not paired** — which makes the run prove almost nothing.
+ *      An unpaired server answers `wa_chats_list` with a perfectly valid empty page, so the reads
+ *      here cannot tell "the wiring works" from "there is nothing behind it", and every write and
+ *      every media fetch would fail. A green line for that is a green line for the case this script
+ *      exists to catch, so it gets a colour and a code of its own.
+ *
  * Environment:
  *
  *   WA_MCP_URL     base URL of the running server        (default http://127.0.0.1:8080)
@@ -78,7 +88,8 @@ async function main() {
   const health = await healthRes.json();
   log("health", JSON.stringify(health));
   assert.equal(health.ok, true, "health.ok is false — the account is logged out and needs re-pairing");
-  if (health.needs_pairing) console.warn("  ! the server is waiting to be paired; writes and media will fail");
+  const unpaired = health.needs_pairing === true;
+  if (unpaired) console.warn("  ! the server is waiting to be paired; writes and media will fail");
   if (!health.transcription_available && transcribe) {
     console.warn("  ! transcription_available is false — whisper-cli or the model is missing");
   }
@@ -126,6 +137,13 @@ async function main() {
     await client.close();
   }
 
+  if (unpaired) {
+    console.log(
+      "\n\x1b[33mincomplete\x1b[0m — every step ran, but against an unpaired store: an empty " +
+        "wa_chats_list proves nothing, and neither writes nor media were reachable. Pair the server and run again.",
+    );
+    process.exit(2);
+  }
   console.log("\n\x1b[32mok\x1b[0m — every step passed");
 }
 

@@ -10,7 +10,16 @@
 import { proto, type WAMessage, type WASocket } from "baileys";
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -20,7 +29,7 @@ import { closeDb, openDb, type Db } from "../db/client.js";
 import { makeMessagesRepo, type MessageKind, type MessagesRepo } from "../db/messages.js";
 import { ConnectionUnavailableError, type ConnectionSnapshot, type WaConnection } from "../wa/connection.js";
 import * as fx from "../wa/fixtures.js";
-import { makeMediaStore, MediaUnavailableError, type MediaDownloader } from "./store.js";
+import { makeMediaStore, MediaUnavailableError, MessageNotFoundError, type MediaDownloader } from "./store.js";
 
 const dir = mkdtempSync(join(tmpdir(), "wa-store-"));
 const opened: Db[] = [];
@@ -212,6 +221,41 @@ void test("the download context's reuploadRequest reaches the live socket", asyn
   assert.equal(h.reuploads[0]?.key.id, id);
 });
 
+/**
+ * What pins the *atomic* in `writeAtomic`, which every other test here is blind to: replace it with a
+ * plain `writeFile(path, data)` and all sixteen of them still pass.
+ *
+ * The observation is the rename, because that is the half with an observable consequence. A rename
+ * replaces a directory entry, so the mode of whatever sat at the destination is irrelevant to it;
+ * an in-place write has to open that file and is refused. So a read-only file at the content address
+ * — where a truncated or interleaved leftover would sit in the failure this design exists to prevent
+ * — is written through by the real implementation and is `EACCES` for the naive one.
+ *
+ * `handle.sync()` is deliberately not chased: a durability barrier has no observable effect short of
+ * cutting the machine's power, and a test that claimed to check it would be checking nothing.
+ */
+void test(
+  "the cached file is renamed into place, not written in place",
+  {
+    // Mode bits do not apply to uid 0, which would quietly turn this into a test of nothing.
+    skip: process.getuid?.() === 0 ? "the destination's mode only constrains a non-root uid" : false,
+  },
+  async () => {
+    const h = harness();
+    const id = seed(h.messages);
+    mkdirSync(h.mediaDir, { recursive: true });
+    const dest = join(h.mediaDir, PAYLOAD_SHA);
+    writeFileSync(dest, "a truncated leftover from an interrupted write");
+    chmodSync(dest, 0o444);
+
+    const file = await h.store.fetch(fx.FIXTURE_DM, id);
+
+    assert.equal(file.path, dest);
+    assert.deepEqual(readFileSync(dest), PAYLOAD, "the rename replaced the entry, leftover and all");
+    assert.deepEqual(h.files(), [PAYLOAD_SHA], "and left no temp file behind");
+  },
+);
+
 // --- connection state -------------------------------------------------------------------------
 
 void test("a cache hit is served while the connection is down", async () => {
@@ -258,9 +302,18 @@ void test("a cached row whose file has been deleted downloads it again", async (
 
 // --- refusals ---------------------------------------------------------------------------------
 
-void test("an unknown message is refused", async () => {
+void test("an unknown message is refused, and not as unavailable media", async () => {
   const h = harness();
-  await assert.rejects(() => h.store.fetch(fx.FIXTURE_DM, "NOPE"), MediaUnavailableError);
+  await assert.rejects(
+    () => h.store.fetch(fx.FIXTURE_DM, "NOPE"),
+    (err: unknown) => {
+      assert.ok(err instanceof MessageNotFoundError, `expected MessageNotFoundError, got ${String(err)}`);
+      // The class name is what a model reads first. "Check the id" and "the bytes expired and no retry
+      // will bring them back" are different instructions, and one class for both gives neither.
+      assert.ok(!(err instanceof MediaUnavailableError), "a bad id and expired media must stay distinguishable");
+      return true;
+    },
+  );
 });
 
 void test("a message that carries no media is refused, naming its kind", async () => {

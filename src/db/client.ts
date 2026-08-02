@@ -19,3 +19,15 @@ export function openDb(path: string): Db {
 export function closeDb(db: Db): void {
   db.close();
 }
+
+/**
+ * Escape LIKE metacharacters (`\`, `%`, `_`) so a query is matched literally.
+ *
+ * Lives here, once, because both `chats.list` and `contacts.search` take a caller-supplied substring:
+ * two identical copies is two places for the escape character to stop matching the `ESCAPE '\\'`
+ * clause in the SQL, and the half that drifts turns a user searching for `100_%` into a wildcard scan
+ * with no error anywhere.
+ */
+export function escapeLike(query: string): string {
+  return query.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}

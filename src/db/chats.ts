@@ -1,4 +1,4 @@
-import type { Db } from "./client.js";
+import { escapeLike, type Db } from "./client.js";
 
 export type ChatRow = {
   id: string;
@@ -169,9 +169,4 @@ export function makeChatsRepo(db: Db): ChatsRepo {
   }
 
   return { ensure, patch, get, list, touch, bumpUnread, clearUnread, count };
-}
-
-/** Escape LIKE metacharacters (`\`, `%`, `_`) so a query is matched literally. */
-function escapeLike(query: string): string {
-  return query.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
