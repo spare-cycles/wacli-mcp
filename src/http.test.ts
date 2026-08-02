@@ -108,10 +108,10 @@ async function start(
     logger,
     buildServer: () => {
       builds.n += 1;
-      const server = new McpServer({ name: "wa-mcp-test", version: "0.0.0" });
+      const server = new McpServer({ name: "whatsapp-mcp-test", version: "0.0.0" });
       // One tool, so the server advertises the tools capability and `tools/list` is a real round
       // trip rather than a "method not found" that would pass an `ok` assertion just as well.
-      server.registerTool("wa_test_ping", { description: "Test tool.", inputSchema: {} }, () => ({
+      server.registerTool("whatsapp_test_ping", { description: "Test tool.", inputSchema: {} }, () => ({
         content: [{ type: "text", text: "pong" }],
       }));
       const closeOriginal = server.close.bind(server);
@@ -277,7 +277,7 @@ void test("token comparison is constant-time and length-safe", async (t) => {
 void test("with no token configured /mcp is open and a warning was logged at boot", async (t) => {
   const s = await start(t, { mcpToken: undefined });
 
-  const warnings = s.entries.filter((e) => e.level === "warn" && e.msg.includes("WA_MCP_TOKEN"));
+  const warnings = s.entries.filter((e) => e.level === "warn" && e.msg.includes("WHATSAPP_MCP_TOKEN"));
   assert.equal(warnings.length, 1, "an unauthenticated deployment must say so, once, at boot");
 
   // A non-initialize request reaching the session rules is what proves the gate let it through: an
@@ -458,7 +458,7 @@ void test("a rejected body never reaches a log line", async (t) => {
 
   assert.equal(res.status, 400);
   // Logging the error object writes the caller's payload — up to the body limit, ~90 MB at the
-  // default `WA_MAX_UPLOAD_BYTES` — to disk, once per malformed request. A `wa_send_file` base64
+  // default `WHATSAPP_MAX_UPLOAD_BYTES` — to disk, once per malformed request. A `whatsapp_send_file` base64
   // argument is the legitimate version of the same accident.
   assert.doesNotMatch(rendered(s.entries), /LEAKMARKER/, "the request body must not be logged, in any field");
   assert.ok(

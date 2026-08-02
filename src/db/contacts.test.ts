@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 import { openDb } from "./client.js";
 import { makeContactsRepo } from "./contacts.js";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-contacts-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-contacts-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });

@@ -48,7 +48,7 @@ export type Transcriber = {
   /**
    * Whether the whisper binary can run at all. Never throws.
    *
-   * Memoized for `availabilityTtlMs`: this is what `wa_health` and Task 14's `/health` report, both
+   * Memoized for `availabilityTtlMs`: this is what `whatsapp_health` and Task 14's `/health` report, both
    * of which a model or a container healthcheck may poll freely, and an unmemoized probe forks a
    * process on every one of those calls. The answer is near-constant in practice — the binary is
    * baked into the image — so the TTL exists only so a repaired install is picked up without a
@@ -322,7 +322,7 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
       await res.body?.cancel().catch(() => undefined);
       throw new TranscriptionError(
         `${modelUrl} returned HTTP ${res.status}, so the whisper model could not be downloaded. ` +
-          `A 404 means WA_WHISPER_MODEL names a model this repository does not publish ` +
+          `A 404 means WHATSAPP_WHISPER_MODEL names a model this repository does not publish ` +
           `(it is currently ${JSON.stringify(config.whisperModel)}).`,
       );
     }
@@ -370,7 +370,7 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
     if (duration !== undefined && duration > config.whisperMaxSeconds) {
       throw new TranscriptionError(
         `this recording is ${duration.toFixed(1)}s long, over the ${config.whisperMaxSeconds}s transcription ` +
-          `limit; raise WA_WHISPER_MAX_SECONDS to transcribe recordings this long`,
+          `limit; raise WHATSAPP_WHISPER_MAX_SECONDS to transcribe recordings this long`,
       );
     }
 
@@ -406,7 +406,7 @@ export function makeTranscriber(deps: TranscriberDeps): Transcriber {
       await runTool(config.whisperBin, ["--help"], HELP_TIMEOUT_MS);
       return true;
     } catch {
-      // Deliberately swallowed: this is the readiness probe `wa_health` calls, and a probe that
+      // Deliberately swallowed: this is the readiness probe `whatsapp_health` calls, and a probe that
       // throws would turn "transcription is unavailable" into "health checks are broken".
       return false;
     }

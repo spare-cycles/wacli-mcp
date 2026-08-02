@@ -17,8 +17,8 @@
  *    operator nothing makes a `TypeError` in here invisible to everyone who could fix it.
  *
  * This module imports nothing from `baileys` (Constraint 12) and interprets no JID itself — `chat`
- * and `sender` arguments go through `wa/jid.ts`'s `canonicalId` (Constraint 11), the same way
- * `wa/send.ts` treats them, so a chat named by its LID reaches the same rows as its phone JID.
+ * and `sender` arguments go through `whatsapp/jid.ts`'s `canonicalId` (Constraint 11), the same way
+ * `whatsapp/send.ts` treats them, so a chat named by its LID reaches the same rows as its phone JID.
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -32,7 +32,7 @@ import {
   type MessageRow,
   type SearchHit,
 } from "../../db/messages.js";
-import { canonicalId } from "../../wa/jid.js";
+import { canonicalId } from "../../whatsapp/jid.js";
 import type { ToolContext } from "../context.js";
 import { decodeCursor, encodeCursor } from "../cursor.js";
 import { buildHealth } from "../health.js";
@@ -137,14 +137,14 @@ function resolveId(jid: string | undefined, ctx: ToolContext): string | undefine
 }
 
 /**
- * The narrowing arguments `wa_messages_list` and `wa_messages_search` both take.
+ * The narrowing arguments `whatsapp_messages_list` and `whatsapp_messages_search` both take.
  *
  * Shared so the two tools cannot answer the same question differently. The old server put `type`,
  * `has_media`, `after` and `before` on search alone, which meant "photos Marie sent me in June" was
  * askable only if you also had a word to search for.
  */
 const messageFilterShape = {
-  chat: z.string().min(1).optional().describe("Chat JID, as returned by wa_chats_list. Omit for every chat."),
+  chat: z.string().min(1).optional().describe("Chat JID, as returned by whatsapp_chats_list. Omit for every chat."),
   sender: z.string().min(1).optional().describe("Sender JID. In a group this is the participant."),
   from_me: z.boolean().optional().describe("True for messages this account sent, false for received ones."),
   kind: z.enum(MESSAGE_KINDS).optional().describe("Restrict to one kind of message, e.g. image or audio."),
@@ -189,7 +189,7 @@ function messageFilter(args: MessageFilterArgs, ctx: ToolContext): MessageFilter
 
 export function registerReadTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
-    "wa_health",
+    "whatsapp_health",
     {
       description:
         "WhatsApp server health: connection state, whether pairing is needed, seconds since the last socket " +
@@ -202,13 +202,13 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
       try {
         return jsonResult(await buildHealth(ctx), ctx.config.maxResultChars);
       } catch (err) {
-        return failedResult("wa_health", err, ctx);
+        return failedResult("whatsapp_health", err, ctx);
       }
     },
   );
 
   server.registerTool(
-    "wa_chats_list",
+    "whatsapp_chats_list",
     {
       description:
         "List WhatsApp chats — direct messages and groups — most recently active first, with their unread " +
@@ -233,13 +233,13 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
           ctx,
         );
       } catch (err) {
-        return failedResult("wa_chats_list", err, ctx);
+        return failedResult("whatsapp_chats_list", err, ctx);
       }
     },
   );
 
   server.registerTool(
-    "wa_groups_list",
+    "whatsapp_groups_list",
     {
       description:
         "List WhatsApp group chats only, most recently active first, with their participant counts. " + OFFLINE,
@@ -256,13 +256,13 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
           ctx,
         );
       } catch (err) {
-        return failedResult("wa_groups_list", err, ctx);
+        return failedResult("whatsapp_groups_list", err, ctx);
       }
     },
   );
 
   server.registerTool(
-    "wa_messages_list",
+    "whatsapp_messages_list",
     {
       description:
         "List stored WhatsApp messages, newest first unless `asc` is set, with sender names resolved from " +
@@ -281,13 +281,13 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
         const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.messages.list(filter, l, o));
         return page(presentMessagePage(rows, ctx), nextCursor, ctx);
       } catch (err) {
-        return failedResult("wa_messages_list", err, ctx);
+        return failedResult("whatsapp_messages_list", err, ctx);
       }
     },
   );
 
   server.registerTool(
-    "wa_messages_search",
+    "whatsapp_messages_search",
     {
       description:
         "Full-text search over stored WhatsApp message text and over voice-note transcripts, best matches " +
@@ -307,13 +307,13 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
         const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.messages.search(query, filter, l, o));
         return page(presentSearchPage(rows, ctx), nextCursor, ctx);
       } catch (err) {
-        return failedResult("wa_messages_search", err, ctx);
+        return failedResult("whatsapp_messages_search", err, ctx);
       }
     },
   );
 
   server.registerTool(
-    "wa_contacts_search",
+    "whatsapp_contacts_search",
     {
       description:
         "Search stored WhatsApp contacts by name, by the push name they broadcast, or by phone number. " + OFFLINE,
@@ -329,7 +329,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
         const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.contacts.search(query, l, o));
         return page(rows.map(presentContact), nextCursor, ctx);
       } catch (err) {
-        return failedResult("wa_contacts_search", err, ctx);
+        return failedResult("whatsapp_contacts_search", err, ctx);
       }
     },
   );

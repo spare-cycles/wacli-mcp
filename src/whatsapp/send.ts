@@ -32,7 +32,7 @@ import { extname, resolve, sep } from "node:path";
 import type { ChatsRepo } from "../db/chats.js";
 import type { ContactsRepo } from "../db/contacts.js";
 import type { MessageRow, MessagesRepo } from "../db/messages.js";
-import type { WaConnection } from "./connection.js";
+import type { WhatsAppConnection } from "./connection.js";
 import type { Ingest } from "./ingest.js";
 import { canonicalId, isGroupJid, parseRecipient } from "./jid.js";
 import { resolveRecipient } from "./recipient.js";
@@ -56,7 +56,7 @@ export type SendFileOptions = {
   caption?: string | undefined;
   replyTo?: string | undefined;
   asVoiceNote?: boolean | undefined;
-  /** Disambiguates a recipient named by name; see `wa/recipient.ts`. */
+  /** Disambiguates a recipient named by name; see `whatsapp/recipient.ts`. */
   pick?: number | undefined;
 };
 
@@ -64,7 +64,7 @@ export type SendTextOptions = {
   replyTo?: string | undefined;
   /** JIDs or phone numbers to @mention. The text must also carry each one as `@<number>`. */
   mentions?: readonly string[] | undefined;
-  /** Disambiguates a recipient named by name; see `wa/recipient.ts`. */
+  /** Disambiguates a recipient named by name; see `whatsapp/recipient.ts`. */
   pick?: number | undefined;
 };
 
@@ -84,7 +84,7 @@ export type Sender = {
 };
 
 export type SendDeps = {
-  conn: WaConnection;
+  conn: WhatsAppConnection;
   ingest: Ingest;
   messages: MessagesRepo;
   /** `markRead` clears the local unread count once WhatsApp has been told. */
@@ -92,7 +92,7 @@ export type SendDeps = {
   contacts: ContactsRepo;
   maxUploadBytes: number;
   /**
-   * WA_SEND_FILE_DIR: the one directory a caller-named path may resolve inside. Unset disables
+   * WHATSAPP_SEND_FILE_DIR: the one directory a caller-named path may resolve inside. Unset disables
    * path-based sending entirely, which is the default — see `resolveSendPath`.
    */
   sendFileDir: string | undefined;
@@ -341,7 +341,7 @@ export function makeSender(deps: SendDeps): Sender {
   /**
    * Resolve a caller-named path inside the configured directory, or refuse.
    *
-   * Without this, `wa_send_file`'s `path` is an arbitrary-file-read primitive: the caller names any
+   * Without this, `whatsapp_send_file`'s `path` is an arbitrary-file-read primitive: the caller names any
    * path inside the container and the server sends its contents to a WhatsApp conversation.
    * `/proc/self/environ` alone would exfiltrate every secret in the process environment. Bearer auth
    * does not help — this is the escalation from "can call tools" to "can read the filesystem".
@@ -355,13 +355,15 @@ export function makeSender(deps: SendDeps): Sender {
   async function resolveSendPath(candidate: string): Promise<string> {
     if (sendFileDir === undefined || sendFileDir === "") {
       throw new SendPathError(
-        "sending a file by path is disabled; set WA_SEND_FILE_DIR to the directory files may be read from",
+        "sending a file by path is disabled; set WHATSAPP_SEND_FILE_DIR to the directory files may be read from",
       );
     }
     const root = await realpath(sendFileDir).catch(() => undefined);
     const resolved = await realpath(resolve(candidate)).catch(() => undefined);
     if (root === undefined || resolved === undefined || !isWithin(root, resolved)) {
-      throw new SendPathError("refusing to read that path: it resolves outside the directory WA_SEND_FILE_DIR names");
+      throw new SendPathError(
+        "refusing to read that path: it resolves outside the directory WHATSAPP_SEND_FILE_DIR names",
+      );
     }
     return resolved;
   }
@@ -480,8 +482,8 @@ export function makeSender(deps: SendDeps): Sender {
    *
    * Same lag as `react` and `editMessage`, and the most visible of the three: the revoke travels as
    * a `protocolMessage`, which `reingest` drops, so `deleted_ts` is set only when Baileys'
-   * `messages.update` lands on the next tick. `wa_delete_message` followed straight away by
-   * `wa_messages_list` can therefore still show the message, undeleted — it is a stale read, not a
+   * `messages.update` lands on the next tick. `whatsapp_delete_message` followed straight away by
+   * `whatsapp_messages_list` can therefore still show the message, undeleted — it is a stale read, not a
    * failed revoke, and the next read has it.
    */
   async function deleteMessage(chat: string, messageId: string): Promise<ChatRef> {

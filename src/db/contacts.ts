@@ -1,4 +1,4 @@
-import { lidFromJid, phoneFromJid } from "../wa/jid.js";
+import { lidFromJid, phoneFromJid } from "../whatsapp/jid.js";
 import { escapeLike, type Db } from "./client.js";
 
 export type ContactRow = {

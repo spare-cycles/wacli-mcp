@@ -5,7 +5,7 @@
  * `*.test.ts` glob there catches none of them.
  *
  * This file is one of the two sanctioned exceptions to Global Constraint 11 (all raw JID
- * interpretation lives in `src/wa/jid.ts`): it holds JID **literals as data**, which a fixture for
+ * interpretation lives in `src/whatsapp/jid.ts`): it holds JID **literals as data**, which a fixture for
  * a group or a LID conversation cannot avoid. It never *interprets* one.
  */
 

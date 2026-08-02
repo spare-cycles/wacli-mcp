@@ -3,22 +3,22 @@ import os from "node:os";
 export type NtfyConfig = { baseUrl: string; topic: string; token: string };
 
 export type Config = {
-  dataDir: string; // WA_DATA_DIR, default "/data/wa"
-  dbPath: string; // `${dataDir}/wa.db`
-  mediaDir: string; // WA_MEDIA_DIR, default `${dataDir}/media`
-  phoneNumber: string | undefined; // WA_PHONE_NUMBER, digits only, 8..15
+  dataDir: string; // WHATSAPP_DATA_DIR, default "/data/whatsapp"
+  dbPath: string; // `${dataDir}/whatsapp.db`
+  mediaDir: string; // WHATSAPP_MEDIA_DIR, default `${dataDir}/media`
+  phoneNumber: string | undefined; // WHATSAPP_PHONE_NUMBER, digits only, 8..15
   port: number; // PORT, default 8080, clamped [1, 65535]
   httpPath: string; // MCP_HTTP_PATH, default "/mcp"
-  mcpToken: string | undefined; // WA_MCP_TOKEN
-  readOnly: boolean; // WA_MCP_READONLY, truthy = 1/true/yes/on
-  whisperBin: string; // WA_WHISPER_BIN, default "whisper-cli"
-  whisperModel: string; // WA_WHISPER_MODEL, default "large-v3-turbo-q5_0"
-  whisperThreads: number; // WA_WHISPER_THREADS, default max(1, cpus-1)
-  whisperMaxSeconds: number; // WA_WHISPER_MAX_SECONDS, default 900
-  maxImageBytes: number; // WA_MAX_IMAGE_BYTES, default 5 MiB
-  maxUploadBytes: number; // WA_MAX_UPLOAD_BYTES, default 64 MiB, clamped [1, 256 MiB]
+  mcpToken: string | undefined; // WHATSAPP_MCP_TOKEN
+  readOnly: boolean; // WHATSAPP_MCP_READONLY, truthy = 1/true/yes/on
+  whisperBin: string; // WHATSAPP_WHISPER_BIN, default "whisper-cli"
+  whisperModel: string; // WHATSAPP_WHISPER_MODEL, default "large-v3-turbo-q5_0"
+  whisperThreads: number; // WHATSAPP_WHISPER_THREADS, default max(1, cpus-1)
+  whisperMaxSeconds: number; // WHATSAPP_WHISPER_MAX_SECONDS, default 900
+  maxImageBytes: number; // WHATSAPP_MAX_IMAGE_BYTES, default 5 MiB
+  maxUploadBytes: number; // WHATSAPP_MAX_UPLOAD_BYTES, default 64 MiB, clamped [1, 256 MiB]
   /**
-   * WA_SEND_FILE_DIR: the one directory `wa_send_file`'s `path` argument may resolve inside.
+   * WHATSAPP_SEND_FILE_DIR: the one directory `whatsapp_send_file`'s `path` argument may resolve inside.
    *
    * Unset by default, which disables path-based sending entirely. That is the right default because
    * the deployment is a container serving a *remote* client, for which a server-side path has no
@@ -26,8 +26,8 @@ export type Config = {
    * `/proc/self/environ` — every secret in the process environment — to a WhatsApp conversation.
    */
   sendFileDir: string | undefined;
-  videoKeyframes: number; // WA_VIDEO_KEYFRAMES, default 4, clamped [1, 16]
-  maxResultChars: number; // WA_MCP_MAX_RESULT_CHARS, default 200_000
+  videoKeyframes: number; // WHATSAPP_VIDEO_KEYFRAMES, default 4, clamped [1, 16]
+  maxResultChars: number; // WHATSAPP_MCP_MAX_RESULT_CHARS, default 200_000
   sessionTtlMs: number; // fixed 30 * 60_000
   ntfy: NtfyConfig | undefined;
 };
@@ -55,7 +55,7 @@ function parsePhoneNumber(raw: string | undefined): string | undefined {
   if (raw === undefined || raw === "") return undefined;
   if (!PHONE_RE.test(raw)) {
     throw new ConfigError(
-      `WA_PHONE_NUMBER must be E.164 digits without a leading "+" (8-15 digits, no leading zero); got ${JSON.stringify(raw)}`,
+      `WHATSAPP_PHONE_NUMBER must be E.164 digits without a leading "+" (8-15 digits, no leading zero); got ${JSON.stringify(raw)}`,
     );
   }
   return raw;
@@ -70,32 +70,32 @@ function parseNtfy(env: NodeJS.ProcessEnv): NtfyConfig | undefined {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): Config {
-  const dataDir = env["WA_DATA_DIR"] || "/data/wa";
+  const dataDir = env["WHATSAPP_DATA_DIR"] || "/data/whatsapp";
   const whisperThreadsDefault = Math.max(1, os.cpus().length - 1);
 
   return {
     dataDir,
-    dbPath: `${dataDir}/wa.db`,
-    mediaDir: env["WA_MEDIA_DIR"] || `${dataDir}/media`,
-    phoneNumber: parsePhoneNumber(env["WA_PHONE_NUMBER"]),
+    dbPath: `${dataDir}/whatsapp.db`,
+    mediaDir: env["WHATSAPP_MEDIA_DIR"] || `${dataDir}/media`,
+    phoneNumber: parsePhoneNumber(env["WHATSAPP_PHONE_NUMBER"]),
     port: envInt(env["PORT"], 8080, 1, 65535),
     httpPath: env["MCP_HTTP_PATH"] || "/mcp",
-    mcpToken: env["WA_MCP_TOKEN"],
-    readOnly: envTruthy(env["WA_MCP_READONLY"]),
-    whisperBin: env["WA_WHISPER_BIN"] || "whisper-cli",
-    whisperModel: env["WA_WHISPER_MODEL"] || "large-v3-turbo-q5_0",
+    mcpToken: env["WHATSAPP_MCP_TOKEN"],
+    readOnly: envTruthy(env["WHATSAPP_MCP_READONLY"]),
+    whisperBin: env["WHATSAPP_WHISPER_BIN"] || "whisper-cli",
+    whisperModel: env["WHATSAPP_WHISPER_MODEL"] || "large-v3-turbo-q5_0",
     whisperThreads: envInt(
-      env["WA_WHISPER_THREADS"],
+      env["WHATSAPP_WHISPER_THREADS"],
       whisperThreadsDefault,
       1,
       Math.max(whisperThreadsDefault, os.cpus().length),
     ),
-    whisperMaxSeconds: envInt(env["WA_WHISPER_MAX_SECONDS"], 900, 1, 14_400),
-    maxImageBytes: envInt(env["WA_MAX_IMAGE_BYTES"], 5 * 1024 * 1024, 1, 100 * 1024 * 1024),
-    maxUploadBytes: envInt(env["WA_MAX_UPLOAD_BYTES"], 64 * 1024 * 1024, 1, 256 * 1024 * 1024),
-    sendFileDir: env["WA_SEND_FILE_DIR"] || undefined,
-    videoKeyframes: envInt(env["WA_VIDEO_KEYFRAMES"], 4, 1, 16),
-    maxResultChars: envInt(env["WA_MCP_MAX_RESULT_CHARS"], 200_000, 1_000, 50_000_000),
+    whisperMaxSeconds: envInt(env["WHATSAPP_WHISPER_MAX_SECONDS"], 900, 1, 14_400),
+    maxImageBytes: envInt(env["WHATSAPP_MAX_IMAGE_BYTES"], 5 * 1024 * 1024, 1, 100 * 1024 * 1024),
+    maxUploadBytes: envInt(env["WHATSAPP_MAX_UPLOAD_BYTES"], 64 * 1024 * 1024, 1, 256 * 1024 * 1024),
+    sendFileDir: env["WHATSAPP_SEND_FILE_DIR"] || undefined,
+    videoKeyframes: envInt(env["WHATSAPP_VIDEO_KEYFRAMES"], 4, 1, 16),
+    maxResultChars: envInt(env["WHATSAPP_MCP_MAX_RESULT_CHARS"], 200_000, 1_000, 50_000_000),
     sessionTtlMs: 30 * 60_000,
     ntfy: parseNtfy(env),
   };

@@ -155,7 +155,7 @@ void test("a pairing code is requested exactly once per socket", async () => {
   assert.equal(calls, 1, "a rotating QR must not spam requestPairingCode");
 });
 
-void test("a qr with no WA_PHONE_NUMBER logs an error once per socket, never the qr payload", async () => {
+void test("a qr with no WHATSAPP_PHONE_NUMBER logs an error once per socket, never the qr payload", async () => {
   const { deps: d, sockets } = deps({}, { phoneNumber: undefined });
   const errorCalls: unknown[][] = [];
   const c = makeConnection({
@@ -176,7 +176,7 @@ void test("a qr with no WA_PHONE_NUMBER logs an error once per socket, never the
   assert.equal(errorCalls.length, 1, "the missing-phone-number diagnostic must log exactly once per socket");
 
   const serialized = JSON.stringify(errorCalls[0]);
-  assert.match(serialized, /WA_PHONE_NUMBER/, "the diagnostic must name the missing env var");
+  assert.match(serialized, /WHATSAPP_PHONE_NUMBER/, "the diagnostic must name the missing env var");
   assert.doesNotMatch(
     serialized,
     /qr-payload-(one|two)/,

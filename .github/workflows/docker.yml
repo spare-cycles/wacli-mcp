@@ -1,6 +1,6 @@
 name: build-image
 
-# Build and push the wa-mcp container image to GHCR.
+# Build and push the whatsapp-mcp container image to GHCR.
 # Tags: a semver tag push (v1.2.3) -> :1.2.3 + :latest; any main push -> :main + :sha-<short>.
 on:
   push:

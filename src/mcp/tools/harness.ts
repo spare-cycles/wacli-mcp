@@ -33,9 +33,13 @@ import { makeMetaRepo } from "../../db/meta.js";
 import { makeReactionsRepo } from "../../db/reactions.js";
 import type { MediaFile, MediaStore } from "../../media/store.js";
 import type { Transcriber } from "../../media/transcribe.js";
-import { ConnectionUnavailableError, type ConnectionState, type WaConnection } from "../../wa/connection.js";
-import { FIXTURE_SELF } from "../../wa/fixtures.js";
-import type { Sender } from "../../wa/send.js";
+import {
+  ConnectionUnavailableError,
+  type ConnectionState,
+  type WhatsAppConnection,
+} from "../../whatsapp/connection.js";
+import { FIXTURE_SELF } from "../../whatsapp/fixtures.js";
+import type { Sender } from "../../whatsapp/send.js";
 import type { ToolContext } from "../context.js";
 import { registerReadTools } from "./reads.js";
 
@@ -63,7 +67,7 @@ export type Harness = {
 
 /**
  * Imported rather than spelled out here: Constraint 11's enforcing check excludes `*.test.ts`,
- * `src/wa/jid.ts` and `src/wa/fixtures.ts` and nothing else, so a JID literal in this file — which
+ * `src/whatsapp/jid.ts` and `src/whatsapp/fixtures.ts` and nothing else, so a JID literal in this file — which
  * is scaffolding, not a test — is a hit the check has no way to forgive. Keeping every test-data
  * JID in `fixtures.ts` keeps that command a clean signal instead of one with a known exception.
  */
@@ -75,23 +79,23 @@ function nowSec(): number {
 }
 
 function defaultBuild(ctx: ToolContext): McpServer {
-  const server = new McpServer({ name: "wa-mcp-test", version: "0.0.0" });
+  const server = new McpServer({ name: "whatsapp-mcp-test", version: "0.0.0" });
   registerReadTools(server, ctx);
   return server;
 }
 
 /** Build a real store, a real `McpServer`, and a linked in-memory client. */
 export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
-  const dir = mkdtempSync(join(tmpdir(), "wa-mcp-"));
+  const dir = mkdtempSync(join(tmpdir(), "whatsapp-mcp-"));
   const db = openDb(join(dir, "t.db"));
   const state: ConnectionState = opts.state ?? "connected";
   const transcribeCalls = { n: 0 };
 
   // A real Config, not a hand-built partial: a stub would let a field this layer starts reading
   // tomorrow go missing without a compile error.
-  const config: Config = { ...loadConfig({ WA_DATA_DIR: dir }), readOnly: opts.readOnly ?? false };
+  const config: Config = { ...loadConfig({ WHATSAPP_DATA_DIR: dir }), readOnly: opts.readOnly ?? false };
 
-  const conn: WaConnection = {
+  const conn: WhatsAppConnection = {
     snapshot: () => ({
       state,
       lastEventAt: nowSec() - (opts.lastEventAgeSec ?? 0),

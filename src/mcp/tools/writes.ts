@@ -3,8 +3,8 @@
  * editing and revoking.
  *
  * Every one of them is deliberately thin — validate, call `ctx.sender`, shape the answer — because
- * all the judgement lives one layer down. `wa/send.ts` is what resolves a JID, requires a socket,
- * refuses a path outside `WA_SEND_FILE_DIR`, enforces the upload cap and feeds the sent message back
+ * all the judgement lives one layer down. `whatsapp/send.ts` is what resolves a JID, requires a socket,
+ * refuses a path outside `WHATSAPP_SEND_FILE_DIR`, enforces the upload cap and feeds the sent message back
  * through ingest; duplicating any of that here would give a second, subtly different copy of a rule
  * that has to hold in exactly one place.
  *
@@ -25,11 +25,14 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { ChatRef, FileSource, SendRef } from "../../wa/send.js";
+import type { ChatRef, FileSource, SendRef } from "../../whatsapp/send.js";
 import type { ToolContext } from "../context.js";
 import { failedResult, jsonResult, type ToolResult } from "../result.js";
 
-const chatSchema = z.string().min(1).describe("Chat JID, exactly as `wa_chats_list` returns it — a person or a group.");
+const chatSchema = z
+  .string()
+  .min(1)
+  .describe("Chat JID, exactly as `whatsapp_chats_list` returns it — a person or a group.");
 
 /**
  * The recipient of a send, which is deliberately more forgiving than `chatSchema`.
@@ -42,7 +45,7 @@ const recipientSchema = z
   .string()
   .min(1)
   .describe(
-    "Who to send to: a chat JID from wa_chats_list, a phone number, or a contact/group/chat name. " +
+    "Who to send to: a chat JID from whatsapp_chats_list, a phone number, or a contact/group/chat name. " +
       "An ambiguous name is refused with the matches listed; re-send with `pick` to choose one.",
   );
 
@@ -53,7 +56,10 @@ const pickSchema = z
   .optional()
   .describe("When the recipient name matched several chats or contacts, the 1-indexed one to use.");
 
-const messageIdSchema = z.string().min(1).describe("Message id, as returned by wa_messages_list or wa_send_text.");
+const messageIdSchema = z
+  .string()
+  .min(1)
+  .describe("Message id, as returned by whatsapp_messages_list or whatsapp_send_text.");
 
 const replyToSchema = z
   .string()
@@ -65,7 +71,7 @@ const WRITE_TOOL = { readOnlyHint: false, openWorldHint: true } as const;
 const DESTRUCTIVE_TOOL = { readOnlyHint: false, openWorldHint: true, destructiveHint: true } as const;
 
 /**
- * `wa_send_file`'s arguments, as one flat object with `data` and `path` both optional.
+ * `whatsapp_send_file`'s arguments, as one flat object with `data` and `path` both optional.
  *
  * Not a discriminated union — that renders as a top-level `anyOf`, which several MCP clients present
  * badly — and **not** a `.refine()`d object either, which is what this task was specified with. A
@@ -94,7 +100,7 @@ const sendFileShape = {
     .min(1)
     .optional()
     .describe(
-      "A file on the server, inside the directory WA_SEND_FILE_DIR names. Disabled unless that " +
+      "A file on the server, inside the directory WHATSAPP_SEND_FILE_DIR names. Disabled unless that " +
         "variable is set, in which case anything resolving outside it is refused. Prefer `data`.",
     ),
   filename: z.string().min(1).optional().describe("Name the recipient sees. Also used to guess the mimetype."),
@@ -136,7 +142,7 @@ function sendResult(ref: SendRef, ctx: ToolContext): ToolResult {
  * `chat` is the id `send.ts` resolved the call against, exactly as `sendResult` reports `ref.chatId`
  * — not the string the caller passed in. Echoing the input would make one field name mean the
  * canonical chat in two of these six tools and "whatever you typed" in the other four, so a model
- * that fed a LID to `wa_react` and the answer to `wa_messages_list` would read an empty chat. This
+ * that fed a LID to `whatsapp_react` and the answer to `whatsapp_messages_list` would read an empty chat. This
  * layer still interprets no JID of its own (Constraint 11): it reports what the layer that owns
  * `jid.ts` resolved.
  */
@@ -158,12 +164,14 @@ function fileSource(args: SendFileArgs): FileSource {
   }
   if (args.path !== undefined) return { kind: "path", path: args.path };
   if (args.data !== undefined) return { kind: "data", base64: args.data };
-  throw new Error("provide exactly one of `data` (base64 bytes) or `path` (a server-side file under WA_SEND_FILE_DIR)");
+  throw new Error(
+    "provide exactly one of `data` (base64 bytes) or `path` (a server-side file under WHATSAPP_SEND_FILE_DIR)",
+  );
 }
 
 export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
-    "wa_send_text",
+    "whatsapp_send_text",
     {
       description:
         "Send a text message to a WhatsApp chat, optionally as a reply quoting an earlier message. " +
@@ -185,23 +193,23 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async ({ chat, text, reply_to, pick, mention }) =>
-      await guarded("wa_send_text", ctx, async () =>
+      await guarded("whatsapp_send_text", ctx, async () =>
         sendResult(await ctx.sender.sendText(chat, text, { replyTo: reply_to, pick, mentions: mention }), ctx),
       ),
   );
 
   server.registerTool(
-    "wa_send_file",
+    "whatsapp_send_file",
     {
       description:
         "Send an image, video, voice note or document to a WhatsApp chat. Give the bytes as base64 in " +
-        "`data`; `path` reads a server-side file and works only when WA_SEND_FILE_DIR is configured. " +
+        "`data`; `path` reads a server-side file and works only when WHATSAPP_SEND_FILE_DIR is configured. " +
         "The type is taken from `mimetype`, else guessed from `filename`.",
       inputSchema: sendFileShape,
       annotations: WRITE_TOOL,
     },
     async (args) =>
-      await guarded("wa_send_file", ctx, async () => {
+      await guarded("whatsapp_send_file", ctx, async () => {
         const ref = await ctx.sender.sendFile(args.chat, fileSource(args), {
           filename: args.filename,
           mimetype: args.mimetype,
@@ -215,7 +223,7 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
   );
 
   server.registerTool(
-    "wa_react",
+    "whatsapp_react",
     {
       description:
         "React to a message with an emoji, replacing whatever this account had reacted with before. " +
@@ -228,13 +236,13 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async ({ chat, message_id, emoji }) =>
-      await guarded("wa_react", ctx, async () =>
+      await guarded("whatsapp_react", ctx, async () =>
         okResult(await ctx.sender.react(chat, message_id, emoji), message_id, ctx),
       ),
   );
 
   server.registerTool(
-    "wa_mark_read",
+    "whatsapp_mark_read",
     {
       description:
         "Mark a chat read up to and including one message — not that message alone. Everything " +
@@ -243,13 +251,13 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async ({ chat, message_id }) =>
-      await guarded("wa_mark_read", ctx, async () =>
+      await guarded("whatsapp_mark_read", ctx, async () =>
         okResult(await ctx.sender.markRead(chat, message_id), message_id, ctx),
       ),
   );
 
   server.registerTool(
-    "wa_edit_message",
+    "whatsapp_edit_message",
     {
       description:
         "Replace the text of a message this account sent. WhatsApp refuses to edit anyone else's " +
@@ -262,13 +270,13 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: WRITE_TOOL,
     },
     async ({ chat, message_id, text }) =>
-      await guarded("wa_edit_message", ctx, async () =>
+      await guarded("whatsapp_edit_message", ctx, async () =>
         okResult(await ctx.sender.editMessage(chat, message_id, text), message_id, ctx),
       ),
   );
 
   server.registerTool(
-    "wa_delete_message",
+    "whatsapp_delete_message",
     {
       description:
         "Revoke a message this account sent, for everyone in the chat. Irreversible, and only ever " +
@@ -277,7 +285,7 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
       annotations: DESTRUCTIVE_TOOL,
     },
     async ({ chat, message_id }) =>
-      await guarded("wa_delete_message", ctx, async () =>
+      await guarded("whatsapp_delete_message", ctx, async () =>
         okResult(await ctx.sender.deleteMessage(chat, message_id), message_id, ctx),
       ),
   );

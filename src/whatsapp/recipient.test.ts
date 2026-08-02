@@ -8,7 +8,7 @@ import { openDb } from "../db/client.js";
 import { makeContactsRepo } from "../db/contacts.js";
 import { AmbiguousRecipientError, RecipientNotFoundError, resolveRecipient } from "./recipient.js";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-recipient-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-recipient-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
@@ -135,7 +135,7 @@ void test("a name nothing answers to is refused, and says where to look instead"
   const d = deps();
   const err = thrown(() => resolveRecipient("Nobody", undefined, d));
   assert.ok(err instanceof RecipientNotFoundError, `expected RecipientNotFoundError, got ${err.name}`);
-  assert.match(err.message, /wa_contacts_search/);
+  assert.match(err.message, /whatsapp_contacts_search/);
 });
 
 void test("an out-of-range pick is refused rather than clamped to the last candidate", () => {
