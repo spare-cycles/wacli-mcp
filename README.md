@@ -56,6 +56,38 @@ long the whole thing was and how much of it is above. Failures come back as an M
 not as a transport error. A write attempted while the socket is down fails with the connection
 state in the message, so a model can tell "retry in a moment" from "this will never work".
 
+## Coming from `wacli-mcp`
+
+This replaced a thin MCP wrapper around the Go `wacli` CLI. Every tool it had has a successor, and
+the successors take more arguments, not fewer:
+
+| old tool | now | notes |
+| --- | --- | --- |
+| `wacli_doctor` | `wa_health` | plus schema version and whether transcription can run |
+| `wacli_chats_list` | `wa_chats_list` | plus `is_group`, `archived`, `unread_only`, cursor paging |
+| `wacli_groups_list` | `wa_groups_list` | plus participant counts and paging |
+| `wacli_messages_list` | `wa_messages_list` | gained `kind` and `has_media`; kept `asc` |
+| `wacli_messages_search` | `wa_messages_search` | searches transcripts too; kept `type`→`kind`, `has_media`, `after`, `before`, gained `sender` |
+| `wacli_contacts_search` | `wa_contacts_search` | |
+| `wacli_send_text` | `wa_send_text` | kept name-or-number recipients, `pick`, `reply_to`, `mention` |
+| `wacli_send_file_bytes` | `wa_send_file` with `data` | gained `as_voice_note` |
+| `wacli_send_file_path` | `wa_send_file` with `path` | now confined to `WA_SEND_FILE_DIR`, **off by default** |
+| `wacli_run` | — | **removed, with nothing to replace it** |
+
+Six tools are new: `wa_download_media`, `wa_transcribe`, `wa_react`, `wa_mark_read`,
+`wa_edit_message`, `wa_delete_message`.
+
+Three differences worth knowing before porting a caller:
+
+1. **`wacli_run` is gone and is not coming back.** It ran an arbitrary `wacli` subcommand, and there
+   is no longer a binary to run one against. Of what it was documented for, *media download* is now
+   a first-class tool and better than the escape hatch ever was; *polls, presence, channels and
+   profile* are genuinely unavailable, and would each be a typed tool rather than a passthrough.
+2. **Timestamps are integer Unix seconds, UTC.** `wacli` took RFC3339 or `YYYY-MM-DD` strings for
+   `--after`/`--before`. A date string here is a validation error, not a silently different window.
+3. **`limit` caps at 200** and pages via an opaque `next_cursor`, where `wacli` took much larger
+   values. Walking the cursor is how you read a long history now.
+
 ## Prerequisites
 
 - **Node 24 or newer.** Not negotiable: storage is `node:sqlite`, which is still flagged experimental and has changed
