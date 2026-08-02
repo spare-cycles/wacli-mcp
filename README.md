@@ -28,17 +28,27 @@ read-only deployment does not advertise them, so a model never sees an ability i
 | `wa_health` | Connection state, whether pairing is needed, seconds since the last socket event, row counts, schema version, whether transcription can run. | no |
 | `wa_chats_list` | Chats — direct and group — most recently active first, with unread counts, archive and mute state. Filterable by name, group flag, archived, unread. | no |
 | `wa_groups_list` | Group chats only, with participant counts. | no |
-| `wa_messages_list` | Stored messages, newest first, sender names resolved from contacts, reaction counts attached. Filterable by chat, sender, direction and time window. | no |
+| `wa_messages_list` | Stored messages, newest first — or oldest first with `asc`. Sender names resolved from contacts, reaction counts attached. | no |
 | `wa_messages_search` | Full-text search over message text *and* voice-note transcripts, best matches first. Each hit carries a snippet and `matched_transcript`. | no |
 | `wa_contacts_search` | Contacts by name, push name or phone number. | no |
 | `wa_download_media` | An attachment in a form a model can consume: image, video keyframes, cached transcript, PDF text, or a cached path. Downloads once, reuses the cached copy after. | first fetch only |
 | `wa_transcribe` | Transcribe a voice note or a video's audio with whisper, and store the transcript so search can find it. Instant on a second call. | first fetch only |
-| `wa_send_text` | Send a text message, optionally quoting an earlier one. | **yes** |
+| `wa_send_text` | Send a text message, optionally quoting an earlier one and @mentioning participants. | **yes** |
 | `wa_send_file` | Send an image, video, voice note or document — bytes as base64 in `data`, or a server-side file via `path` (see `WA_SEND_FILE_DIR`). | **yes** |
 | `wa_react` | React with an emoji; an empty emoji removes the reaction. | **yes** |
 | `wa_mark_read` | Mark a chat read up to and including one message. | **yes** |
 | `wa_edit_message` | Replace the text of a message this account sent. | **yes** |
 | `wa_delete_message` | Revoke a message this account sent, for everyone. Irreversible. | **yes** |
+
+**Narrowing a listing or a search.** `wa_messages_list` and `wa_messages_search` take the same filters — `chat`,
+`sender`, `from_me`, `kind`, `has_media`, `after`, `before` — so "the photos Marie sent me in June" is one call
+whether or not you have a word to search for. `kind` and `has_media` are refused when they contradict each other
+(`kind: "text"` with `has_media: true`) rather than answered with an empty page, which would read as "there are none".
+
+**Naming a recipient.** `wa_send_text` and `wa_send_file` accept a chat JID, a phone number written any usual way, or
+a contact/group/chat name. A name matching several chats or contacts is **refused** with the matches listed and
+numbered — never resolved by guessing — and re-sending with `pick` set to one of those numbers chooses. Every other
+tool takes the JID it was given by a listing.
 
 Every tool result is capped at `WA_MCP_MAX_RESULT_CHARS` — the JSON payloads and the free-text blocks alike, so a
 transcript or a PDF's contents is bounded exactly as a page of messages is. Whatever is cut carries a note saying how

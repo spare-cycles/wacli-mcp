@@ -113,6 +113,41 @@ export function userJid(phone: string): string {
   return `${phone}@s.whatsapp.net`;
 }
 
+/**
+ * What a caller-supplied recipient string turned out to be. `name` carries no JID because there is
+ * nothing to build one from — resolving it needs the store, which this module deliberately cannot
+ * reach.
+ */
+export type RecipientForm = { kind: "jid" | "phone"; jid: string } | { kind: "name" };
+
+/**
+ * Digits, with the punctuation a human writes a phone number with. Deliberately not anchored on a
+ * `+`: WhatsApp itself shows numbers both ways, and a caller copying one out of a contact card has
+ * no reason to know which form this expects.
+ */
+const PHONE_SHAPED = /^\+?[\d\s().-]+$/;
+
+/** Below this many digits it is a nickname that happens to be numeric, not a phone number. */
+const MIN_PHONE_DIGITS = 6;
+
+/**
+ * Read a recipient the way a human writes one: a raw JID, a phone number, or a name.
+ *
+ * Here rather than in `recipient.ts` because deciding *whether* a string is a JID means reading its
+ * server, and turning a phone number into one means writing a server — both of which only this
+ * module may do (Global Constraint 11). What it cannot decide, it says so: a name is handed back
+ * unresolved for the layer that has the contacts and chats to look it up.
+ */
+export function parseRecipient(to: string): RecipientForm {
+  const trimmed = to.trim();
+  if (jidKind(trimmed) !== "unknown") return { kind: "jid", jid: trimmed };
+  if (PHONE_SHAPED.test(trimmed)) {
+    const digits = trimmed.replace(/\D/g, "");
+    if (digits.length >= MIN_PHONE_DIGITS) return { kind: "phone", jid: userJid(digits) };
+  }
+  return { kind: "name" };
+}
+
 export type IdentityLookup = { pnForLid: (lid: string) => string | undefined };
 
 /**

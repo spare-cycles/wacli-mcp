@@ -24,7 +24,14 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ChatListFilter } from "../../db/chats.js";
-import type { MessageListFilter, MessageRow, SearchHit } from "../../db/messages.js";
+import {
+  MEDIA_KINDS,
+  MESSAGE_KINDS,
+  type MessageFilter,
+  type MessageListFilter,
+  type MessageRow,
+  type SearchHit,
+} from "../../db/messages.js";
 import { canonicalId } from "../../wa/jid.js";
 import type { ToolContext } from "../context.js";
 import { decodeCursor, encodeCursor } from "../cursor.js";
@@ -129,6 +136,57 @@ function resolveId(jid: string | undefined, ctx: ToolContext): string | undefine
   return jid === undefined ? undefined : canonicalId(jid, ctx.contacts);
 }
 
+/**
+ * The narrowing arguments `wa_messages_list` and `wa_messages_search` both take.
+ *
+ * Shared so the two tools cannot answer the same question differently. The old server put `type`,
+ * `has_media`, `after` and `before` on search alone, which meant "photos Marie sent me in June" was
+ * askable only if you also had a word to search for.
+ */
+const messageFilterShape = {
+  chat: z.string().min(1).optional().describe("Chat JID, as returned by wa_chats_list. Omit for every chat."),
+  sender: z.string().min(1).optional().describe("Sender JID. In a group this is the participant."),
+  from_me: z.boolean().optional().describe("True for messages this account sent, false for received ones."),
+  kind: z.enum(MESSAGE_KINDS).optional().describe("Restrict to one kind of message, e.g. image or audio."),
+  has_media: z
+    .boolean()
+    .optional()
+    .describe("True for messages carrying an attachment (image, video, audio, document, sticker), false for none."),
+  after: z.number().int().optional().describe("Oldest timestamp to include, Unix seconds UTC, inclusive."),
+  before: z.number().int().optional().describe("Newest timestamp to include, Unix seconds UTC, inclusive."),
+};
+
+type MessageFilterArgs = { [K in keyof typeof messageFilterShape]: z.infer<(typeof messageFilterShape)[K]> };
+
+/**
+ * The filter those arguments describe, or a refusal naming the contradiction.
+ *
+ * `kind` and `has_media` can disagree — `kind: "text", has_media: true` asks for a text message with
+ * an attachment. Answering that with an empty page reads as "there are none", which is a different
+ * and wrong answer: a model that believes it would stop looking. Saying so is what the old server
+ * did for its one instance of the clash, and this generalizes it to every kind.
+ */
+function messageFilter(args: MessageFilterArgs, ctx: ToolContext): MessageFilter {
+  if (args.kind !== undefined && args.has_media !== undefined) {
+    const carries = (MEDIA_KINDS as readonly string[]).includes(args.kind);
+    if (carries !== args.has_media) {
+      throw new Error(
+        `has_media=${String(args.has_media)} contradicts kind="${args.kind}", which ` +
+          `${carries ? "always carries" : "never carries"} an attachment — drop one of the two`,
+      );
+    }
+  }
+  return {
+    chatId: resolveId(args.chat, ctx),
+    senderId: resolveId(args.sender, ctx),
+    fromMe: args.from_me,
+    kind: args.kind,
+    hasMedia: args.has_media,
+    after: args.after,
+    before: args.before,
+  };
+}
+
 export function registerReadTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
     "wa_health",
@@ -207,28 +265,19 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
     "wa_messages_list",
     {
       description:
-        "List stored WhatsApp messages, newest first, with sender names resolved from contacts and a count " +
-        `of the reactions each one carries. Deleted messages are omitted. ${OFFLINE}`,
+        "List stored WhatsApp messages, newest first unless `asc` is set, with sender names resolved from " +
+        `contacts and a count of the reactions each one carries. Deleted messages are omitted. ${OFFLINE}`,
       inputSchema: {
-        chat: z.string().min(1).optional().describe("Chat JID, as returned by wa_chats_list. Omit for every chat."),
-        sender: z.string().min(1).optional().describe("Sender JID. In a group this is the participant."),
-        from_me: z.boolean().optional().describe("True for messages this account sent, false for received ones."),
-        after: z.number().int().optional().describe("Oldest timestamp to include, Unix seconds UTC, inclusive."),
-        before: z.number().int().optional().describe("Newest timestamp to include, Unix seconds UTC, inclusive."),
+        ...messageFilterShape,
+        asc: z.boolean().optional().describe("Oldest first. Use it to read a chat forwards from `after`."),
         limit: limitSchema,
         cursor: cursorSchema,
       },
       annotations: READ_ONLY_TOOL,
     },
-    ({ chat, sender, from_me, after, before, limit, cursor }) => {
+    ({ asc, limit, cursor, ...args }) => {
       try {
-        const filter: MessageListFilter = {
-          chatId: resolveId(chat, ctx),
-          senderId: resolveId(sender, ctx),
-          fromMe: from_me,
-          after,
-          before,
-        };
+        const filter: MessageListFilter = { ...messageFilter(args, ctx), asc };
         const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.messages.list(filter, l, o));
         return page(presentMessagePage(rows, ctx), nextCursor, ctx);
       } catch (err) {
@@ -246,16 +295,16 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
         `in a transcription rather than in typed text. ${OFFLINE}`,
       inputSchema: {
         query: z.string().min(1).describe("Words to look for. Treated as literal text, not as a query language."),
-        chat: z.string().min(1).optional().describe("Restrict the search to one chat JID."),
+        ...messageFilterShape,
         limit: limitSchema,
         cursor: cursorSchema,
       },
       annotations: READ_ONLY_TOOL,
     },
-    ({ query, chat, limit, cursor }) => {
+    ({ query, limit, cursor, ...args }) => {
       try {
-        const opts = { chatId: resolveId(chat, ctx) };
-        const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.messages.search(query, opts, l, o));
+        const filter = messageFilter(args, ctx);
+        const { rows, nextCursor } = paginate(cursor, limit, (l, o) => ctx.messages.search(query, filter, l, o));
         return page(presentSearchPage(rows, ctx), nextCursor, ctx);
       } catch (err) {
         return failedResult("wa_messages_search", err, ctx);

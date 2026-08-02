@@ -127,6 +127,8 @@ type HarnessOptions = {
   maxUploadBytes?: number | undefined;
   /** LID → phone JID, the one identity fact `canonicalId` consults. */
   pnForLid?: ((lid: string) => string | undefined) | undefined;
+  /** Chats and contacts a name can resolve to; see `wa/recipient.ts`. Empty means JIDs only. */
+  named?: readonly { id: string; name: string; isGroup?: boolean }[] | undefined;
   /** true makes `requireSocket()` throw, as it does whenever the connection is not open. */
   offline?: boolean | undefined;
 };
@@ -159,7 +161,13 @@ function materialize(id: string, spec: FakeRow): { row: MessageRow; raw: Uint8Ar
   return { row, raw };
 }
 
+/** The substring rule both repositories match names by, restated for the stubs above. */
+function matchesName(name: string, query: string | undefined): boolean {
+  return query === undefined || name.toLowerCase().includes(query.toLowerCase());
+}
+
 function harness(opts: HarnessOptions = {}) {
+  const named = (opts.named ?? []).map((c) => ({ ...c, notify: null }));
   const { sock, calls, readCalls } = fakeSocket();
   const entries = Object.entries(opts.rows ?? {}).map(([id, spec]) => [id, materialize(id, spec)] as const);
   const stored = new Map(entries);
@@ -198,8 +206,14 @@ function harness(opts: HarnessOptions = {}) {
       clearUnread: (id: string) => {
         clearedUnread.push(id);
       },
+      // Substring, case-insensitive — the same shape the real `chats.list({ query })` has.
+      list: (filter: { query?: string | undefined }) =>
+        named.filter((c) => c.isGroup === true && matchesName(c.name, filter.query)),
     } as unknown as ChatsRepo,
-    contacts: { pnForLid: opts.pnForLid ?? (() => undefined) } as unknown as ContactsRepo,
+    contacts: {
+      pnForLid: opts.pnForLid ?? (() => undefined),
+      search: (query: string) => named.filter((c) => c.isGroup !== true && matchesName(c.name, query)),
+    } as unknown as ContactsRepo,
     maxUploadBytes: opts.maxUploadBytes ?? 1024,
     sendFileDir: opts.sendFileDir,
   };
@@ -222,9 +236,64 @@ void test("sendText sends and re-ingests the produced message", async () => {
   assert.equal(h.ingested[0]?.key.id, "SENT1");
 });
 
+void test("sendText resolves a recipient named by name", async () => {
+  const h = harness({
+    named: [
+      { id: DM, name: "Marie" },
+      { id: GROUP, name: "Les Copains", isGroup: true },
+    ],
+  });
+  await h.sender.sendText("Marie", "salut");
+  assert.equal(h.calls[0]?.jid, DM, "the name must reach the socket as the resolved JID");
+  await h.sender.sendText("Les Copains", "salut");
+  assert.equal(h.calls[1]?.jid, GROUP);
+  // And a phone number written the way a human writes one.
+  await h.sender.sendText("+33 6 12 34 56 78", "salut");
+  assert.equal(h.calls[2]?.jid, DM);
+});
+
+void test("an ambiguous name is refused before the socket is touched at all", async () => {
+  const h = harness({
+    named: [
+      { id: DM, name: "Marie Dupont" },
+      { id: SELF, name: "Marie Curie" },
+    ],
+  });
+  await assert.rejects(() => h.sender.sendText("Marie", "salut"), /matches 2/);
+  assert.equal(h.calls.length, 0, "nothing may be sent while the recipient is in doubt");
+  // `pick` is what resolves it, and it selects by the order the refusal printed.
+  await h.sender.sendText("Marie", "salut", { pick: 1 });
+  assert.equal(h.calls[0]?.jid, SELF, "1) Marie Curie sorts before 2) Marie Dupont");
+});
+
+void test("sendText marks mentions, resolving each to a user JID", async () => {
+  const h = harness();
+  await h.sender.sendText(GROUP, "@33612345678 tu viens ?", { mentions: ["+33 6 12 34 56 78"] });
+  assert.deepEqual(h.calls[0]?.content, { text: "@33612345678 tu viens ?", mentions: [DM] });
+});
+
+void test("sendText omits the mentions field entirely when there are none", async () => {
+  const h = harness();
+  await h.sender.sendText(DM, "salut", { mentions: [] });
+  assert.deepEqual(h.calls[0]?.content, { text: "salut" }, "an empty list must not become mentions: []");
+});
+
+void test("a mention that is a name rather than a number is refused, and sends nothing", async () => {
+  const h = harness({ named: [{ id: DM, name: "Marie" }] });
+  // Resolving it would happily answer with a group JID, which WhatsApp renders as a broken tag.
+  await assert.rejects(() => h.sender.sendText(GROUP, "@Marie", { mentions: ["Marie"] }), /must be a phone number/);
+  assert.equal(h.calls.length, 0);
+});
+
+void test("sendFile takes a name and a pick too", async () => {
+  const h = harness({ named: [{ id: DM, name: "Marie" }] });
+  await h.sender.sendFile("Marie", { kind: "data", base64: b64("hi") }, { filename: "a.txt" });
+  assert.equal(h.calls[0]?.jid, DM);
+});
+
 void test("sendText with replyTo attaches the quoted message", async () => {
   const h = harness({ rows: { M0: { fromMe: false } } });
-  await h.sender.sendText(DM, "re", "M0");
+  await h.sender.sendText(DM, "re", { replyTo: "M0" });
   const quoted = (h.calls[0]?.options as { quoted?: WAMessage }).quoted;
   assert.ok(quoted, "replyTo must become a quoted option");
   // `quoted` wants the whole WebMessageInfo envelope, not the inner `message` the socket's
@@ -235,13 +304,13 @@ void test("sendText with replyTo attaches the quoted message", async () => {
 
 void test("replyTo pointing at an unknown message fails loudly", async () => {
   const h = harness();
-  await assert.rejects(() => h.sender.sendText(DM, "re", "GHOST"), NotFoundError);
+  await assert.rejects(() => h.sender.sendText(DM, "re", { replyTo: "GHOST" }), NotFoundError);
   assert.equal(h.calls.length, 0);
 });
 
 void test("replyTo pointing at a row with no stored envelope fails rather than sending a broken quote", async () => {
   const h = harness({ rows: { M0: { quotable: false } } });
-  await assert.rejects(() => h.sender.sendText(DM, "re", "M0"), NotFoundError);
+  await assert.rejects(() => h.sender.sendText(DM, "re", { replyTo: "M0" }), NotFoundError);
   assert.equal(h.calls.length, 0);
 });
 
@@ -249,7 +318,7 @@ void test("replyTo pointing at a row with no stored envelope fails rather than s
 
 void test("a reply naming a revoked message is refused, and nothing is sent", async () => {
   const h = harness({ rows: { M0: { deleted: true } } });
-  await assert.rejects(() => h.sender.sendText(DM, "re", "M0"), MessageRevokedError);
+  await assert.rejects(() => h.sender.sendText(DM, "re", { replyTo: "M0" }), MessageRevokedError);
   assert.equal(
     h.calls.length,
     0,
@@ -282,7 +351,7 @@ void test("editing or re-revoking a revoked message is refused", async () => {
 void test("a revoked message is refused as revoked, not as missing", async () => {
   const h = harness({ rows: { M0: { deleted: true } } });
   await assert.rejects(
-    () => h.sender.sendText(DM, "re", "M0"),
+    () => h.sender.sendText(DM, "re", { replyTo: "M0" }),
     (err: unknown) => {
       assert.ok(err instanceof MessageRevokedError);
       assert.ok(!(err instanceof NotFoundError), "the row is present; calling it missing tells the caller to retry");
@@ -294,7 +363,7 @@ void test("a revoked message is refused as revoked, not as missing", async () =>
 
 void test("an ordinary reply, reaction, edit and delete still work alongside the tombstone check", async () => {
   const h = harness({ rows: { LIVE: { fromMe: true }, THEIRS: { fromMe: false }, GONE: { deleted: true } } });
-  await h.sender.sendText(DM, "re", "LIVE");
+  await h.sender.sendText(DM, "re", { replyTo: "LIVE" });
   await h.sender.react(DM, "THEIRS", "\u{1F44D}");
   await h.sender.editMessage(DM, "LIVE", "corrigé");
   await h.sender.deleteMessage(DM, "LIVE");
@@ -625,7 +694,7 @@ void test("an edit, a delete and a reaction round-trip without creating a spurio
 void test("quoting works against an envelope the real ingest stored", async () => {
   const h = liveHarness();
   h.ingest.ingestMessage(fx.textMessage({ chat: DM, id: "M0", ts: fx.FIXTURE_TS }));
-  await h.sender.sendText(DM, "re", "M0");
+  await h.sender.sendText(DM, "re", { replyTo: "M0" });
   const quoted = (h.calls[0]?.options as { quoted?: WAMessage }).quoted;
   assert.equal(quoted?.key.id, "M0");
   assert.equal(quoted.message?.conversation, "hello");
@@ -643,7 +712,7 @@ void test("a revoked message's content is never re-published, against the real r
     "and deliberately keeps the envelope, which Baileys' retry path reads — so the send path is what has to refuse it",
   );
 
-  await assert.rejects(() => h.sender.sendText(DM, "re", "M0"), MessageRevokedError);
+  await assert.rejects(() => h.sender.sendText(DM, "re", { replyTo: "M0" }), MessageRevokedError);
   await assert.rejects(() => h.sender.react(DM, "M0", "\u{1F44D}"), MessageRevokedError);
   assert.equal(h.calls.length, 0, "nothing carrying `the secret` may reach the socket");
 });

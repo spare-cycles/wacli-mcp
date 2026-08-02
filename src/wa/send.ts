@@ -34,7 +34,8 @@ import type { ContactsRepo } from "../db/contacts.js";
 import type { MessageRow, MessagesRepo } from "../db/messages.js";
 import type { WaConnection } from "./connection.js";
 import type { Ingest } from "./ingest.js";
-import { canonicalId, isGroupJid } from "./jid.js";
+import { canonicalId, isGroupJid, parseRecipient } from "./jid.js";
+import { resolveRecipient } from "./recipient.js";
 
 export type SendRef = { chatId: string; messageId: string };
 
@@ -55,6 +56,16 @@ export type SendFileOptions = {
   caption?: string | undefined;
   replyTo?: string | undefined;
   asVoiceNote?: boolean | undefined;
+  /** Disambiguates a recipient named by name; see `wa/recipient.ts`. */
+  pick?: number | undefined;
+};
+
+export type SendTextOptions = {
+  replyTo?: string | undefined;
+  /** JIDs or phone numbers to @mention. The text must also carry each one as `@<number>`. */
+  mentions?: readonly string[] | undefined;
+  /** Disambiguates a recipient named by name; see `wa/recipient.ts`. */
+  pick?: number | undefined;
 };
 
 /**
@@ -63,7 +74,7 @@ export type SendFileOptions = {
  * own event. Each method documents the mechanism where it is implemented.
  */
 export type Sender = {
-  sendText: (chat: string, text: string, replyTo?: string) => Promise<SendRef>;
+  sendText: (chat: string, text: string, opts?: SendTextOptions) => Promise<SendRef>;
   sendFile: (chat: string, src: FileSource, opts: SendFileOptions) => Promise<SendRef>;
   react: (chat: string, messageId: string, emoji: string) => Promise<ChatRef>;
   /** Marks the chat read *up to and including* `messageId`, not that message alone. */
@@ -219,8 +230,38 @@ function mediaContent(data: Buffer, opts: SendFileOptions): AnyMessageContent {
 export function makeSender(deps: SendDeps): Sender {
   const { conn, ingest, messages, chats, contacts, maxUploadBytes, sendFileDir } = deps;
 
-  function canonical(chat: string): string {
-    return canonicalId(chat, { pnForLid: contacts.pnForLid });
+  /**
+   * The chat id an operation acts on, from whatever the caller called it.
+   *
+   * Every method below goes through this, so a JID, a phone number and a name all reach the same
+   * row. `pick` is only ever passed by the two sends — the four operations that also take a message
+   * id already got their chat from a listing, so there is nothing there to disambiguate.
+   *
+   * Named `resolveChat` and not `resolve`: `node:path`'s `resolve` is imported at the top of this
+   * file and used by `resolveSendPath`, and a same-arity shadow of it inside this closure would have
+   * silently rerouted the path-containment check through a chat lookup — which type-checks, because
+   * both are `(string) => string`.
+   */
+  function resolveChat(chat: string, pick?: number): string {
+    return resolveRecipient(chat, pick, { chats, contacts });
+  }
+
+  /**
+   * The JIDs to mark as mentioned.
+   *
+   * A name is refused rather than looked up: a mention has to name a *person*, and the name lookup
+   * that serves the recipient argument can just as well answer with a group. Resolving "@Marie" to a
+   * group JID would put a mention in the stanza that no participant matches, which WhatsApp renders
+   * as a broken tag rather than as an error.
+   */
+  function mentionJids(mentions: readonly string[]): string[] {
+    return mentions.map((mention) => {
+      const form = parseRecipient(mention);
+      if (form.kind === "name") {
+        throw new Error(`cannot @mention "${mention}": a mention must be a phone number or a user JID, not a name`);
+      }
+      return canonicalId(form.jid, contacts);
+    });
   }
 
   /**
@@ -359,15 +400,19 @@ export function makeSender(deps: SendDeps): Sender {
     return { chatId, messageId };
   }
 
-  async function sendText(chat: string, text: string, replyTo?: string): Promise<SendRef> {
-    const jid = canonical(chat);
+  async function sendText(chat: string, text: string, opts: SendTextOptions = {}): Promise<SendRef> {
+    const jid = resolveChat(chat, opts.pick);
     const sock = conn.requireSocket();
-    const sent = await sock.sendMessage(jid, { text }, quoteOption(jid, replyTo));
+    // Both are resolved before the socket sends anything: a bad mention is a refusal, and refusing
+    // after the message is on its way is not a refusal at all.
+    const mentions: { mentions?: string[] } =
+      opts.mentions === undefined || opts.mentions.length === 0 ? {} : { mentions: mentionJids(opts.mentions) };
+    const sent = await sock.sendMessage(jid, { text, ...mentions }, quoteOption(jid, opts.replyTo));
     return refFor(jid, sent);
   }
 
   async function sendFile(chat: string, src: FileSource, opts: SendFileOptions): Promise<SendRef> {
-    const jid = canonical(chat);
+    const jid = resolveChat(chat, opts.pick);
     const sock = conn.requireSocket();
     // The quote is resolved before the bytes are, matching `sendText`: an unknown or revoked
     // `replyTo` is a refusal either way, and this way it costs no decode and no read of up to
@@ -391,7 +436,7 @@ export function makeSender(deps: SendDeps): Sender {
    * A revoked message is refused — see `requireRow`.
    */
   async function react(chat: string, messageId: string, emoji: string): Promise<ChatRef> {
-    const jid = canonical(chat);
+    const jid = resolveChat(chat);
     const sock = conn.requireSocket();
     const row = requireRow(jid, messageId);
     // An empty string is not a missing emoji: it is how WhatsApp removes a reaction.
@@ -401,7 +446,7 @@ export function makeSender(deps: SendDeps): Sender {
   }
 
   async function markRead(chat: string, messageId: string): Promise<ChatRef> {
-    const jid = canonical(chat);
+    const jid = resolveChat(chat);
     const sock = conn.requireSocket();
     const target = requireRow(jid, messageId);
     // `readMessages` marks exactly the keys it is given (baileys `lib/Socket/business.d.ts:37`);
@@ -423,7 +468,7 @@ export function makeSender(deps: SendDeps): Sender {
    * arrives on the next tick. A caller that edits and immediately lists can still read the old text.
    */
   async function editMessage(chat: string, messageId: string, text: string): Promise<ChatRef> {
-    const jid = canonical(chat);
+    const jid = resolveChat(chat);
     const sock = conn.requireSocket();
     const edit = ownKey(jid, messageId);
     reingest(await sock.sendMessage(jid, { text, edit }));
@@ -440,7 +485,7 @@ export function makeSender(deps: SendDeps): Sender {
    * failed revoke, and the next read has it.
    */
   async function deleteMessage(chat: string, messageId: string): Promise<ChatRef> {
-    const jid = canonical(chat);
+    const jid = resolveChat(chat);
     const sock = conn.requireSocket();
     const key = ownKey(jid, messageId);
     reingest(await sock.sendMessage(jid, { delete: key }));

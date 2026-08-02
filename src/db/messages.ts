@@ -1,7 +1,24 @@
 import type { Db } from "./client.js";
 
-export type MessageKind =
-  "text" | "image" | "video" | "audio" | "document" | "sticker" | "location" | "contact" | "system" | "other";
+/**
+ * Every kind a stored message can have, as a value rather than only a type: the tool layer needs the
+ * list at runtime to advertise it as an enum, and deriving `MessageKind` from the array is what stops
+ * the advertised set and the storable set from drifting apart.
+ */
+export const MESSAGE_KINDS = [
+  "text",
+  "image",
+  "video",
+  "audio",
+  "document",
+  "sticker",
+  "location",
+  "contact",
+  "system",
+  "other",
+] as const;
+
+export type MessageKind = (typeof MESSAGE_KINDS)[number];
 
 export type MessageRow = {
   rowid: number;
@@ -35,13 +52,36 @@ export type MessageInput = {
   raw?: Uint8Array | undefined;
 };
 
-export type MessageListFilter = {
+/**
+ * The kinds that carry an attachment: what `hasMedia` selects, and what `media/store.ts` will
+ * download. Exported so there is one list — a second copy would let "has media" and "can be
+ * fetched" drift apart, and a message that answers yes to one and no to the other is a tool call
+ * that finds a hit and then refuses to open it.
+ */
+export const MEDIA_KINDS: readonly MessageKind[] = ["image", "video", "audio", "document", "sticker"];
+
+/**
+ * Everything both `list` and `search` can narrow by. One type, because a filter a caller can use to
+ * find a message should not depend on whether they got there by browsing or by searching — the old
+ * server had `--type`/`--has-media`/`--after`/`--before` on search alone, and the asymmetry was a
+ * gap rather than a design.
+ */
+export type MessageFilter = {
   chatId?: string | undefined;
   senderId?: string | undefined;
   fromMe?: boolean | undefined;
+  kind?: MessageKind | undefined;
+  /** True for messages carrying an attachment (`MEDIA_KINDS`), false for those carrying none. */
+  hasMedia?: boolean | undefined;
   before?: number | undefined;
   after?: number | undefined;
   includeDeleted?: boolean | undefined;
+};
+
+/** `MessageFilter` plus the one thing only an ordered listing has: which end to start from. */
+export type MessageListFilter = MessageFilter & {
+  /** Oldest first. Defaults to newest first, which is what a chat view wants. */
+  asc?: boolean | undefined;
 };
 
 export type SearchHit = MessageRow & { matchedTranscript: boolean; snippet: string };
@@ -54,7 +94,7 @@ export type MessagesRepo = {
   /** The protobuf bytes stored at ingest. Backs the socket's getMessage contract. */
   getRaw: (chatId: string, id: string) => Uint8Array | undefined;
   list: (filter: MessageListFilter, limit: number, offset: number) => MessageRow[];
-  search: (query: string, opts: { chatId?: string | undefined }, limit: number, offset: number) => SearchHit[];
+  search: (query: string, filter: MessageFilter, limit: number, offset: number) => SearchHit[];
   markEdited: (chatId: string, id: string, text: string, ts: number) => void;
   markDeleted: (chatId: string, id: string, ts: number) => void;
   setStatus: (chatId: string, id: string, status: string) => void;
@@ -162,13 +202,66 @@ const SEARCH_COLUMNS = `
   snippet(messages_fts, 1, char(1), char(2), '…', 12) AS snip_transcript
 `;
 
-/** Shared skeleton for the search query; `extraWhere` scopes it to one chat when non-empty. */
+/**
+ * `MEDIA_KINDS` as a SQL list. Built from the constant above, never from anything a caller supplied
+ * — which is what makes interpolating it into the statement text sound. Every value a caller *can*
+ * influence is bound as a named parameter below.
+ */
+const MEDIA_KIND_SQL = MEDIA_KINDS.map((kind) => `'${kind}'`).join(", ");
+
+/** The WHERE fragments and bound parameters for a filter. `qualify` prefixes a column for a join. */
+function predicate(
+  filter: MessageFilter,
+  qualify: (column: string) => string,
+): { where: string[]; params: Record<string, string | number> } {
+  const where: string[] = [];
+  const params: Record<string, string | number> = {};
+
+  if (filter.chatId !== undefined) {
+    where.push(`${qualify("chat_id")} = :chatId`);
+    params["chatId"] = filter.chatId;
+  }
+  if (filter.senderId !== undefined) {
+    where.push(`${qualify("sender_id")} = :senderId`);
+    params["senderId"] = filter.senderId;
+  }
+  if (filter.fromMe !== undefined) {
+    where.push(`${qualify("from_me")} = :fromMe`);
+    params["fromMe"] = filter.fromMe ? 1 : 0;
+  }
+  if (filter.kind !== undefined) {
+    where.push(`${qualify("kind")} = :kind`);
+    params["kind"] = filter.kind;
+  }
+  if (filter.hasMedia !== undefined) {
+    where.push(`${qualify("kind")} ${filter.hasMedia ? "IN" : "NOT IN"} (${MEDIA_KIND_SQL})`);
+  }
+  if (filter.before !== undefined) {
+    where.push(`${qualify("ts")} <= :before`);
+    params["before"] = filter.before;
+  }
+  if (filter.after !== undefined) {
+    where.push(`${qualify("ts")} >= :after`);
+    params["after"] = filter.after;
+  }
+  // A revoked row is a tombstone, not a message: it is excluded unless a caller asks for it by name.
+  if (filter.includeDeleted !== true) {
+    where.push(`${qualify("deleted_ts")} IS NULL`);
+  }
+
+  return { where, params };
+}
+
+/**
+ * Shared skeleton for the search query; `extraWhere` is `predicate`'s output, already qualified with
+ * the `m.` alias and already carrying the tombstone exclusion.
+ */
 function searchQuery(extraWhere: string): string {
   return `
     SELECT ${SEARCH_COLUMNS}
       FROM messages_fts
       JOIN messages m ON m.rowid = messages_fts.rowid
-     WHERE messages_fts MATCH :q AND m.deleted_ts IS NULL${extraWhere}
+     WHERE messages_fts MATCH :q${extraWhere}
      ORDER BY rank
      LIMIT :limit OFFSET :offset
   `;
@@ -212,8 +305,6 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
      ORDER BY ts DESC, rowid DESC
      LIMIT :limit
   `);
-  const searchStmt = db.prepare(searchQuery(""));
-  const searchScopedStmt = db.prepare(searchQuery(" AND m.chat_id = :chatId"));
 
   function upsert(m: MessageInput): boolean {
     const existed = hasStmt.get(m.chatId, m.id) !== undefined;
@@ -245,48 +336,27 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
   }
 
   function list(filter: MessageListFilter, limit: number, offset: number): MessageRow[] {
-    const where: string[] = [];
-    const params: Record<string, string | number> = { limit, offset };
-
-    if (filter.chatId !== undefined) {
-      where.push("chat_id = :chatId");
-      params["chatId"] = filter.chatId;
-    }
-    if (filter.senderId !== undefined) {
-      where.push("sender_id = :senderId");
-      params["senderId"] = filter.senderId;
-    }
-    if (filter.fromMe !== undefined) {
-      where.push("from_me = :fromMe");
-      params["fromMe"] = filter.fromMe ? 1 : 0;
-    }
-    if (filter.before !== undefined) {
-      where.push("ts <= :before");
-      params["before"] = filter.before;
-    }
-    if (filter.after !== undefined) {
-      where.push("ts >= :after");
-      params["after"] = filter.after;
-    }
-    if (filter.includeDeleted !== true) {
-      where.push("deleted_ts IS NULL");
-    }
-
+    const { where, params } = predicate(filter, (column) => column);
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // `rowid` follows `ts` in both directions: it is the tie-break, so flipping one and not the
+    // other would make an ascending page and its descending twin disagree about equal timestamps —
+    // which is how a paginated walk skips or repeats a row.
+    const direction = filter.asc === true ? "ASC" : "DESC";
     const rows = db
       .prepare(
-        `SELECT ${SELECT_COLUMNS} FROM messages ${whereSql} ORDER BY ts DESC, rowid DESC LIMIT :limit OFFSET :offset`,
+        `SELECT ${SELECT_COLUMNS} FROM messages ${whereSql}
+          ORDER BY ts ${direction}, rowid ${direction} LIMIT :limit OFFSET :offset`,
       )
-      .all(params) as MessageRowRaw[];
+      .all({ ...params, limit, offset }) as MessageRowRaw[];
     return rows.map(toMessageRow);
   }
 
-  function search(query: string, opts: { chatId?: string | undefined }, limit: number, offset: number): SearchHit[] {
-    const q = quoteFtsQuery(query);
-    const rows =
-      opts.chatId !== undefined
-        ? (searchScopedStmt.all({ q, chatId: opts.chatId, limit, offset }) as SearchRowRaw[])
-        : (searchStmt.all({ q, limit, offset }) as SearchRowRaw[]);
+  function search(query: string, filter: MessageFilter, limit: number, offset: number): SearchHit[] {
+    const { where, params } = predicate(filter, (column) => `m.${column}`);
+    const extraWhere = where.length > 0 ? ` AND ${where.join(" AND ")}` : "";
+    const rows = db
+      .prepare(searchQuery(extraWhere))
+      .all({ ...params, q: quoteFtsQuery(query), limit, offset }) as SearchRowRaw[];
     return rows.map((row) => {
       // Which column matched is read from the markers, never from whether its snippet is empty:
       // `snippet()` returns unmarked leading text for a column that took no part in the match, so

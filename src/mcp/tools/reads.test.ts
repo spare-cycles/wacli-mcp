@@ -300,6 +300,76 @@ void test("wa_messages_list filters by chat, sender, direction and time window",
   await h.close();
 });
 
+void test("wa_messages_list walks a chat forwards under asc", async () => {
+  const h = await harness({
+    seed: (ctx) => {
+      seedChat(ctx, ALICE, false, [
+        { id: "M1", ts: 10 },
+        { id: "M2", ts: 20 },
+        { id: "M3", ts: 30 },
+      ]);
+    },
+  });
+  const call = async (args: Record<string, unknown>): Promise<string[]> =>
+    ids(resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: args })).items);
+
+  assert.deepEqual(await call({ chat: ALICE }), ["M3", "M2", "M1"], "the default stays newest first");
+  assert.deepEqual(await call({ chat: ALICE, asc: true }), ["M1", "M2", "M3"]);
+  // Paging forwards is the point of `asc`: reading a conversation from its start, a page at a time.
+  assert.deepEqual(await call({ chat: ALICE, asc: true, limit: 2 }), ["M1", "M2"]);
+  await h.close();
+});
+
+void test("the message filters narrow both wa_messages_list and wa_messages_search alike", async () => {
+  const h = await harness({
+    seed: (ctx) => {
+      seedChat(ctx, GROUP, true, [
+        { id: "T1", ts: 10, sender: ALICE, text: "orange juice please" },
+        { id: "P1", ts: 20, sender: BOB, kind: "image", text: "orange sunset" },
+        { id: "V1", ts: 30, sender: BOB, kind: "audio", text: null },
+        { id: "L1", ts: 40, sender: ALICE, kind: "location", text: "orange county" },
+      ]);
+    },
+  });
+  const list = async (args: Record<string, unknown>): Promise<string[]> =>
+    ids(resultPage(await h.client.callTool({ name: "wa_messages_list", arguments: args })).items);
+  const search = async (args: Record<string, unknown>): Promise<string[]> =>
+    ids(resultPage(await h.client.callTool({ name: "wa_messages_search", arguments: args })).items).sort();
+
+  assert.deepEqual(await list({ chat: GROUP, kind: "image" }), ["P1"]);
+  assert.deepEqual(await list({ chat: GROUP, has_media: true }), ["V1", "P1"]);
+  assert.deepEqual(await list({ chat: GROUP, has_media: false }), ["L1", "T1"]);
+
+  // The same four narrowings on search — the gap this closes: the old server had them on search
+  // alone, and the new one had them on neither.
+  assert.deepEqual(await search({ query: "orange", chat: GROUP }), ["L1", "P1", "T1"]);
+  assert.deepEqual(await search({ query: "orange", sender: BOB }), ["P1"]);
+  assert.deepEqual(await search({ query: "orange", kind: "image" }), ["P1"]);
+  assert.deepEqual(await search({ query: "orange", has_media: true }), ["P1"]);
+  assert.deepEqual(await search({ query: "orange", after: 20, before: 30 }), ["P1"]);
+  await h.close();
+});
+
+void test("a kind that contradicts has_media is refused rather than answered with an empty page", async () => {
+  const h = await harness({
+    seed: (ctx) => {
+      seedChat(ctx, ALICE, false, [{ id: "M1", ts: 10, text: "orange" }]);
+    },
+  });
+  for (const name of ["wa_messages_list", "wa_messages_search"]) {
+    const args = { kind: "text", has_media: true, ...(name === "wa_messages_search" && { query: "orange" }) };
+    const res = await h.client.callTool({ name, arguments: args });
+    assert.equal(res.isError, true, `${name} must refuse a contradictory filter`);
+    assert.match(resultText(res), /contradicts kind="text"/);
+  }
+  // And a consistent pair is not refused, which is what makes the check about the contradiction
+  // rather than about the two arguments ever appearing together.
+  const ok = await h.client.callTool({ name: "wa_messages_list", arguments: { kind: "text", has_media: false } });
+  assert.notEqual(ok.isError, true);
+  assert.deepEqual(ids(resultPage(ok).items), ["M1"]);
+  await h.close();
+});
+
 void test("wa_messages_list resolves a chat named by its LID to the folded phone chat", async () => {
   const lid = "5551234@lid";
   const h = await harness({

@@ -20,7 +20,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, rename, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
-import type { MessageKind, MessagesRepo } from "../db/messages.js";
+import { MEDIA_KINDS, type MessagesRepo } from "../db/messages.js";
 import { errorFields } from "../logger.js";
 import type { WaConnection } from "../wa/connection.js";
 
@@ -68,7 +68,12 @@ export class MessageNotFoundError extends Error {
   override name = "MessageNotFoundError";
 }
 
-const MEDIA_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>(["image", "video", "audio", "document", "sticker"]);
+/**
+ * The same list `wa_messages_search`'s `has_media` selects on, as a set for the membership test
+ * here. Derived from the one constant rather than restated, so a search that says a message has an
+ * attachment and a fetch that says it has none cannot disagree.
+ */
+const FETCHABLE = new Set(MEDIA_KINDS);
 
 const DEFAULT_MIMETYPE = "application/octet-stream";
 const SHA256_HEX = /^[0-9a-f]{64}$/;
@@ -139,7 +144,7 @@ export function makeMediaStore(deps: MediaStoreDeps): MediaStore {
   async function fetch(chatId: string, messageId: string): Promise<MediaFile> {
     const row = messages.get(chatId, messageId);
     if (row === undefined) throw new MessageNotFoundError(`no message ${messageId} in chat ${chatId}`);
-    if (!MEDIA_KINDS.has(row.kind)) {
+    if (!FETCHABLE.has(row.kind)) {
       throw new MediaUnavailableError(
         `message ${messageId} in chat ${chatId} is a ${row.kind} message and carries no media`,
       );

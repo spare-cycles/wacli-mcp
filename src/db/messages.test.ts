@@ -135,6 +135,70 @@ void test("list filters compose", () => {
   );
 });
 
+void test("list orders oldest first under asc, tie-breaking the same way in both directions", () => {
+  const r = repo();
+  // Equal timestamps on purpose: `rowid` is the tie-break, and it has to flip with `ts` or an
+  // ascending walk and a descending one disagree about the order of these two.
+  r.upsert(msg({ id: "A", ts: 100 }));
+  r.upsert(msg({ id: "B", ts: 100 }));
+  r.upsert(msg({ id: "C", ts: 300 }));
+  assert.deepEqual(
+    r.list({ chatId: "c", asc: true }, 10, 0).map((m) => m.id),
+    ["A", "B", "C"],
+  );
+  assert.deepEqual(
+    r.list({ chatId: "c" }, 10, 0).map((m) => m.id),
+    ["C", "B", "A"],
+  );
+});
+
+void test("list narrows by kind and by hasMedia in both directions", () => {
+  const r = repo();
+  r.upsert(msg({ id: "T", kind: "text" }));
+  r.upsert(msg({ id: "I", kind: "image", text: undefined, ts: 1100 }));
+  r.upsert(msg({ id: "V", kind: "audio", text: undefined, ts: 1200 }));
+  r.upsert(msg({ id: "L", kind: "location", text: undefined, ts: 1300 }));
+
+  assert.deepEqual(
+    r.list({ chatId: "c", kind: "image" }, 10, 0).map((m) => m.id),
+    ["I"],
+  );
+  assert.deepEqual(
+    r.list({ chatId: "c", hasMedia: true }, 10, 0).map((m) => m.id),
+    ["V", "I"],
+  );
+  // The false branch is the one a `NOT IN` typo would break silently: a location is not media, and
+  // must be *included* here rather than swept up with the attachments.
+  assert.deepEqual(
+    r.list({ chatId: "c", hasMedia: false }, 10, 0).map((m) => m.id),
+    ["L", "T"],
+  );
+});
+
+void test("search narrows by the same filters as list", () => {
+  const r = repo();
+  r.upsert(msg({ id: "A", ts: 100, senderId: "alice", text: "orange juice" }));
+  r.upsert(msg({ id: "B", ts: 200, senderId: "bob", text: "orange juice" }));
+  r.upsert(msg({ id: "P", ts: 300, senderId: "bob", kind: "image", text: "orange sunset" }));
+  r.upsert(msg({ id: "M", ts: 400, senderId: "me", fromMe: true, text: "orange again" }));
+
+  const ids = (hits: { id: string }[]) => hits.map((h) => h.id).sort();
+  assert.deepEqual(ids(r.search("orange", { senderId: "bob" }, 10, 0)), ["B", "P"]);
+  assert.deepEqual(ids(r.search("orange", { kind: "image" }, 10, 0)), ["P"]);
+  assert.deepEqual(ids(r.search("orange", { hasMedia: true }, 10, 0)), ["P"]);
+  assert.deepEqual(ids(r.search("orange", { fromMe: true }, 10, 0)), ["M"]);
+  assert.deepEqual(ids(r.search("orange", { after: 150, before: 300 }, 10, 0)), ["B", "P"]);
+  // And they compose, which is the point of sharing one predicate builder with `list`.
+  assert.deepEqual(ids(r.search("orange", { senderId: "bob", after: 250 }, 10, 0)), ["P"]);
+});
+
+void test("search still excludes revoked rows once the tombstone clause moved into the filter", () => {
+  const r = repo();
+  r.upsert(msg({ id: "K", text: "orange" }));
+  r.markDeleted("c", "K", 500);
+  assert.equal(r.search("orange", {}, 10, 0).length, 0);
+});
+
 void test("search finds transcripts and flags them", () => {
   const r = repo();
   r.upsert(msg({ id: "V1", kind: "audio", text: undefined }));

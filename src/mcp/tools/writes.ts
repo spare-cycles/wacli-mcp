@@ -31,6 +31,28 @@ import { failedResult, jsonResult, type ToolResult } from "../result.js";
 
 const chatSchema = z.string().min(1).describe("Chat JID, exactly as `wa_chats_list` returns it — a person or a group.");
 
+/**
+ * The recipient of a send, which is deliberately more forgiving than `chatSchema`.
+ *
+ * The four tools that also take a `message_id` got their chat from a listing, so a JID is the only
+ * sensible thing to pass them. A send has no such provenance — it is the one place a caller starts
+ * from what a human said — so it accepts a name too, and `pick` settles the ambiguity that follows.
+ */
+const recipientSchema = z
+  .string()
+  .min(1)
+  .describe(
+    "Who to send to: a chat JID from wa_chats_list, a phone number, or a contact/group/chat name. " +
+      "An ambiguous name is refused with the matches listed; re-send with `pick` to choose one.",
+  );
+
+const pickSchema = z
+  .number()
+  .int()
+  .positive()
+  .optional()
+  .describe("When the recipient name matched several chats or contacts, the 1-indexed one to use.");
+
 const messageIdSchema = z.string().min(1).describe("Message id, as returned by wa_messages_list or wa_send_text.");
 
 const replyToSchema = z
@@ -60,7 +82,8 @@ const DESTRUCTIVE_TOOL = { readOnlyHint: false, openWorldHint: true, destructive
  * never machine-readable to a client in the first place.
  */
 const sendFileShape = {
-  chat: chatSchema,
+  chat: recipientSchema,
+  pick: pickSchema,
   data: z
     .string()
     .min(1)
@@ -147,14 +170,24 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
         "Needs a live connection: when the socket is down the call fails naming the connection state, " +
         "and the read tools keep working meanwhile.",
       inputSchema: {
-        chat: chatSchema,
+        chat: recipientSchema,
         text: z.string().min(1).describe("The message body. WhatsApp markdown (*bold*, _italic_) works."),
         reply_to: replyToSchema,
+        pick: pickSchema,
+        mention: z
+          .array(z.string().min(1))
+          .optional()
+          .describe(
+            "Phone numbers or user JIDs to @mention. Write each one into `text` as @<number> too — " +
+              "this list only marks them, it does not insert them.",
+          ),
       },
       annotations: WRITE_TOOL,
     },
-    async ({ chat, text, reply_to }) =>
-      await guarded("wa_send_text", ctx, async () => sendResult(await ctx.sender.sendText(chat, text, reply_to), ctx)),
+    async ({ chat, text, reply_to, pick, mention }) =>
+      await guarded("wa_send_text", ctx, async () =>
+        sendResult(await ctx.sender.sendText(chat, text, { replyTo: reply_to, pick, mentions: mention }), ctx),
+      ),
   );
 
   server.registerTool(
@@ -175,6 +208,7 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
           caption: args.caption,
           replyTo: args.reply_to,
           asVoiceNote: args.as_voice_note,
+          pick: args.pick,
         });
         return sendResult(ref, ctx);
       }),

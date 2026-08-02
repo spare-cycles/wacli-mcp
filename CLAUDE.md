@@ -77,6 +77,18 @@ are non-obvious enough to get broken by an edit that looks correct.
 - **Read tools must work in every connection state** — they query SQLite and never touch the socket.
   Only write tools and a media *cache miss* may require a live connection.
 
+- **An ambiguous recipient name is refused, never resolved by picking one.** `wa/recipient.ts` turns a
+  JID, a phone number or a *name* into a chat id, and the whole point of it is the refusal: two people
+  called Marie is the ordinary case, and guessing sends a private message to the wrong person. The
+  refusal numbers the candidates and `pick` selects by that number, so the candidate order must stay a
+  total order over the data — sorting by anything a query happens to return would make `pick: 2` mean
+  a different person on the retry than in the refusal that suggested it. An out-of-range `pick` is an
+  error rather than a clamp, for the same reason.
+
+- **`wa/send.ts` must not name a local helper `resolve`.** `node:path`'s `resolve` is imported at the
+  top of that file and used by `resolveSendPath`'s containment check; a `(string) => string` shadow
+  inside `makeSender` type-checks perfectly and silently reroutes the path check. Hence `resolveChat`.
+
 - **Timestamps are integer Unix seconds, UTC, everywhere in the store.** `Number(m.messageTimestamp)`
   at the boundary, because protobuf may hand back a `Long` that fails silently in comparisons.
   Anything from `Date.now()` divides by 1000 and floors; the only milliseconds in the codebase carry

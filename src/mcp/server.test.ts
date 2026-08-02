@@ -38,6 +38,7 @@ import {
   type FileSource,
   type Sender,
   type SendFileOptions,
+  type SendTextOptions,
 } from "../wa/send.js";
 import type { ToolContext } from "./context.js";
 import { buildMcpServer } from "./server.js";
@@ -211,11 +212,11 @@ void test("wa_send_text answers with the reference WhatsApp gave back", async ()
 
 void test("wa_send_file passes every argument through to the sender under the right name", async () => {
   const files: { chat: string; src: FileSource; opts: SendFileOptions }[] = [];
-  const texts: { chat: string; text: string; replyTo: string | undefined }[] = [];
+  const texts: { chat: string; text: string; opts: SendTextOptions | undefined }[] = [];
   const sender: Sender = {
     ...failingSender(new Error("not part of this test")),
-    sendText: (chat, text, replyTo) => {
-      texts.push({ chat, text, replyTo });
+    sendText: (chat, text, opts) => {
+      texts.push({ chat, text, opts });
       return Promise.resolve({ chatId: chat, messageId: "S1" });
     },
     sendFile: (chat, src, opts) => {
@@ -249,6 +250,7 @@ void test("wa_send_file passes every argument through to the sender under the ri
       caption: "listen",
       replyTo: "M7",
       asVoiceNote: true,
+      pick: undefined,
     });
 
     await h.client.callTool({ name: "wa_send_file", arguments: { chat: CHAT, path: "/data/uploads/a.png" } });
@@ -257,7 +259,23 @@ void test("wa_send_file passes every argument through to the sender under the ri
     assert.deepEqual(byPath.src, { kind: "path", path: "/data/uploads/a.png" });
 
     await h.client.callTool({ name: "wa_send_text", arguments: { chat: CHAT, text: "hi", reply_to: "M7" } });
-    assert.deepEqual(texts[0], { chat: CHAT, text: "hi", replyTo: "M7" });
+    assert.deepEqual(texts[0], {
+      chat: CHAT,
+      text: "hi",
+      opts: { replyTo: "M7", pick: undefined, mentions: undefined },
+    });
+
+    // `mention` and `pick` reach the sender under their own names too — the two arguments the old
+    // server had and this one had lost.
+    await h.client.callTool({
+      name: "wa_send_text",
+      arguments: { chat: "Marie", text: "@33611111111 coucou", pick: 2, mention: ["33611111111"] },
+    });
+    assert.deepEqual(texts[1], {
+      chat: "Marie",
+      text: "@33611111111 coucou",
+      opts: { replyTo: undefined, pick: 2, mentions: ["33611111111"] },
+    });
   } finally {
     await h.close();
   }
