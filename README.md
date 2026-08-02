@@ -141,6 +141,15 @@ and goes out immediately — no backoff recovers it.
 returns a closed record built in `src/mcp/health.ts` rather than a spread of the config, so a new config field can
 never widen it by accident.
 
+**`last_event_age_sec` and `last_message_at` measure different things, and only the second one detects a frozen
+store.** `last_event_age_sec` is the age of the last `connection.update` — the socket's opinion of itself — so it stays
+small on a connection that is answering while receiving nothing. `last_message_at` is `MAX(ts)` over the store, the one
+value that separates "healthy and quiet" from "connected and ingesting nothing". Nothing inside the server decides
+which of those it is, because *quiet* is a property of the conversation and not of the server; that judgement belongs
+to a watchdog outside the process, with its own clock and its own threshold. `/health` answers `200` in every
+connection state, so a probe pointed at it detects a dead HTTP server and nothing more — deliberately, since read
+tools keep working while disconnected and a reconnect must not flap the container.
+
 ## Running it
 
 ```bash

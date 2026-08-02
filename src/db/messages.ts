@@ -101,6 +101,15 @@ export type MessagesRepo = {
   setTranscript: (chatId: string, id: string, transcript: string) => void;
   setMedia: (chatId: string, id: string, sha: string, mediaType: string) => void;
   count: () => number;
+  /**
+   * The newest `ts` in the store, or `null` when it is empty.
+   *
+   * Exists for the freshness watchdog, not for a tool. The connection's own `lastEventAt` moves on
+   * `connection.update` alone, so a socket that is answering while ingesting nothing looks identical
+   * to a healthy quiet one from outside — which is exactly the shape of the 2026-07-26 outage. This
+   * is the only value in the process that distinguishes them.
+   */
+  newestTs: () => number | null;
   /** Non-from_me, non-deleted messages at or before `ts`, newest first. Backs send.ts's markRead expansion. */
   unreadKeysUpTo: (chatId: string, ts: number, limit: number) => { id: string; senderId: string }[];
 };
@@ -286,6 +295,7 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
   const getStmt = db.prepare(`SELECT ${SELECT_COLUMNS} FROM messages WHERE chat_id = ? AND id = ?`);
   const getRawStmt = db.prepare("SELECT raw FROM messages WHERE chat_id = ? AND id = ?");
   const countStmt = db.prepare("SELECT COUNT(*) AS n FROM messages");
+  const newestTsStmt = db.prepare("SELECT MAX(ts) AS ts FROM messages");
   const markEditedStmt = db.prepare(
     "UPDATE messages SET text = :text, edited_ts = :editedTs WHERE chat_id = :chatId AND id = :id",
   );
@@ -397,6 +407,12 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
     return (countStmt.get() as { n: number }).n;
   }
 
+  function newestTs(): number | null {
+    // `MAX()` over an empty table is one row holding NULL, not zero rows.
+    const row = newestTsStmt.get() as { ts: number | null };
+    return row.ts;
+  }
+
   function unreadKeysUpTo(chatId: string, ts: number, limit: number): { id: string; senderId: string }[] {
     const rows = unreadKeysUpToStmt.all({ chatId, ts, limit }) as { id: string; sender_id: string }[];
     return rows.map((row) => ({ id: row.id, senderId: row.sender_id }));
@@ -414,6 +430,7 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
     setTranscript,
     setMedia,
     count,
+    newestTs,
     unreadKeysUpTo,
   };
 }
