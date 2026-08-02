@@ -1,0 +1,27 @@
+name: ci
+
+# The quality gate on pull requests, where no image is built.
+# `docker.yml` re-runs the same two steps as its own `check` job before it publishes anything —
+# see the note there for why the duplication is one file's worth and not a shared workflow.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      # ffmpeg is a real dependency of the media tests: they build fixtures with it and convert
+      # them back. Installed after `pnpm check` so the fast gate fails first when it is going to.
+      # ffmpeg for the conversion tests, poppler-utils for `pdftotext` — the suite exercises both
+      # for real rather than stubbing them, so a runner without either goes red on 2 tests that
+      # pass on any developer machine that happens to have them. The image installs both too.
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg poppler-utils
+      - run: pnpm test
