@@ -38,15 +38,15 @@ import { makeTranscriber } from "./media/transcribe.js";
 import type { ToolContext } from "./mcp/context.js";
 import { buildHealth } from "./mcp/health.js";
 import { buildMcpServer } from "./mcp/server.js";
-import { makeConnection, type WaConnection } from "./wa/connection.js";
-import { makeIngest } from "./wa/ingest.js";
-import { canonicalId } from "./wa/jid.js";
-import { makeSender } from "./wa/send.js";
+import { makeConnection, type WhatsAppConnection } from "./whatsapp/connection.js";
+import { makeIngest } from "./whatsapp/ingest.js";
+import { canonicalId } from "./whatsapp/jid.js";
+import { makeSender } from "./whatsapp/send.js";
 
 export type ShutdownDeps = {
   logger: Logger;
   http: HttpHandle;
-  conn: WaConnection;
+  conn: WhatsAppConnection;
   alerter: Alerter;
   db: Db;
   /** Seam: the real one is `process.exit`, which a test cannot call. */
@@ -134,7 +134,7 @@ export async function bootstrap(): Promise<void> {
    * new socket its listeners. A `let` plus a closure that reads the connection *at call time* is the
    * whole resolution — a container or a service locator would be a much larger machine for one edge.
    */
-  let live: WaConnection | undefined = undefined;
+  let live: WhatsAppConnection | undefined = undefined;
   const selfId = (): string | null => live?.snapshot().selfId ?? null;
 
   const ingest = makeIngest({ db, chats, contacts, messages, reactions, logger, selfId });

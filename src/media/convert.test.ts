@@ -28,7 +28,7 @@ import {
 
 const run = promisify(execFile);
 
-const dir = mkdtempSync(join(tmpdir(), "wa-conv-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-conv-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
@@ -323,5 +323,5 @@ void test("runTool kills a process that overruns its timeout", async () => {
 });
 
 void test("runTool names a binary that is not installed", async () => {
-  await assert.rejects(() => runTool("wa-mcp-no-such-binary", [], 5_000), /wa-mcp-no-such-binary/);
+  await assert.rejects(() => runTool("whatsapp-mcp-no-such-binary", [], 5_000), /whatsapp-mcp-no-such-binary/);
 });

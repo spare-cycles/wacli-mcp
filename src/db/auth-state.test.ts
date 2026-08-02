@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 import { makeAuthStore } from "./auth-state.js";
 import { openDb } from "./client.js";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-auth-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-auth-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
@@ -70,7 +70,7 @@ void test("clear wipes creds and keys", async () => {
 
 void test("clear also resets the live creds object, in place, to a fresh identity", () => {
   const store = makeAuthStore(openDb(join(dir, "g.db")));
-  const held = store.state.creds; // the very object `makeSocket` is handed (wa/connection.ts)
+  const held = store.state.creds; // the very object `makeSocket` is handed (whatsapp/connection.ts)
   held.me = { id: "33612345678:1@s.whatsapp.net", name: "the logged-out account" };
   held.registered = true;
   const oldNoiseKey = Buffer.from(held.noiseKey.private).toString("base64");

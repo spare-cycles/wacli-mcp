@@ -7,7 +7,7 @@ import { closeDb, openDb } from "./client.js";
 import { makeMetaRepo } from "./meta.js";
 import { SCHEMA_VERSION } from "./schema.js";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-meta-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-meta-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });

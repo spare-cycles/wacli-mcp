@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 import { closeDb, openDb } from "./client.js";
 import { SCHEMA_VERSION } from "./schema.js";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-db-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-db-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });

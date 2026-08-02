@@ -1,5 +1,5 @@
 {
-  "name": "wa-mcp",
+  "name": "whatsapp-mcp",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
     "node": ">=24"
   },
   "bin": {
-    "wa-mcp": "dist/main.js"
+    "whatsapp-mcp": "dist/main.js"
   },
   "scripts": {
     "dev": "tsx src/main.ts",

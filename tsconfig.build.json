@@ -2,5 +2,5 @@
   "extends": "./tsconfig.json",
   "include": ["src/**/*.ts"],
   "//": "harness.ts and fixtures.ts are test scaffolding, but neither is a *.test.ts file, so the glob below cannot catch them. Left in, they compile into dist/ and ship in the image as dead code that nothing imports.",
-  "exclude": ["src/**/*.test.ts", "src/mcp/tools/harness.ts", "src/wa/fixtures.ts"]
+  "exclude": ["src/**/*.test.ts", "src/mcp/tools/harness.ts", "src/whatsapp/fixtures.ts"]
 }

@@ -1,4 +1,4 @@
-# wa-mcp
+# whatsapp-mcp
 
 An [MCP](https://modelcontextprotocol.io) server that gives a language model a WhatsApp account.
 
@@ -14,79 +14,52 @@ There is no second process, no CLI to shell out to, no store lock and no IPC. Th
 The media pipeline is the reason this is more than a message log. An inbound attachment is not handed to the model as a
 file path it cannot open: a photo comes back as an image block, downscaled to fit a context window; a video as evenly
 spaced keyframes plus its duration; a PDF as extracted text; a voice note as a transcript, produced by whisper.cpp and
-written back into the search index — so `wa_messages_search` finds a message by what was *said* in it.
+written back into the search index — so `whatsapp_messages_search` finds a message by what was *said* in it.
 
 Transport is Streamable HTTP only, behind an optional bearer token.
 
 ## Tools
 
-Fourteen tools, all `wa_`-prefixed. The six write tools are not registered at all when `WA_MCP_READONLY` is set — a
+Fourteen tools, all `whatsapp_`-prefixed. The six write tools are not registered at all when `WHATSAPP_MCP_READONLY` is set — a
 read-only deployment does not advertise them, so a model never sees an ability it does not have.
 
 | Tool | What it does | Needs the connection |
 | --- | --- | --- |
-| `wa_health` | Connection state, whether pairing is needed, seconds since the last socket event, row counts, schema version, whether transcription can run. | no |
-| `wa_chats_list` | Chats — direct and group — most recently active first, with unread counts, archive and mute state. Filterable by name, group flag, archived, unread. | no |
-| `wa_groups_list` | Group chats only, with participant counts. | no |
-| `wa_messages_list` | Stored messages, newest first — or oldest first with `asc`. Sender names resolved from contacts, reaction counts attached. | no |
-| `wa_messages_search` | Full-text search over message text *and* voice-note transcripts, best matches first. Each hit carries a snippet and `matched_transcript`. | no |
-| `wa_contacts_search` | Contacts by name, push name or phone number. | no |
-| `wa_download_media` | An attachment in a form a model can consume: image, video keyframes, cached transcript, PDF text, or a cached path. Downloads once, reuses the cached copy after. | first fetch only |
-| `wa_transcribe` | Transcribe a voice note or a video's audio with whisper, and store the transcript so search can find it. Instant on a second call. | first fetch only |
-| `wa_send_text` | Send a text message, optionally quoting an earlier one and @mentioning participants. | **yes** |
-| `wa_send_file` | Send an image, video, voice note or document — bytes as base64 in `data`, or a server-side file via `path` (see `WA_SEND_FILE_DIR`). | **yes** |
-| `wa_react` | React with an emoji; an empty emoji removes the reaction. | **yes** |
-| `wa_mark_read` | Mark a chat read up to and including one message. | **yes** |
-| `wa_edit_message` | Replace the text of a message this account sent. | **yes** |
-| `wa_delete_message` | Revoke a message this account sent, for everyone. Irreversible. | **yes** |
+| `whatsapp_health` | Connection state, whether pairing is needed, seconds since the last socket event, row counts, schema version, whether transcription can run. | no |
+| `whatsapp_chats_list` | Chats — direct and group — most recently active first, with unread counts, archive and mute state. Filterable by name, group flag, archived, unread. | no |
+| `whatsapp_groups_list` | Group chats only, with participant counts. | no |
+| `whatsapp_messages_list` | Stored messages, newest first — or oldest first with `asc`. Sender names resolved from contacts, reaction counts attached. | no |
+| `whatsapp_messages_search` | Full-text search over message text *and* voice-note transcripts, best matches first. Each hit carries a snippet and `matched_transcript`. | no |
+| `whatsapp_contacts_search` | Contacts by name, push name or phone number. | no |
+| `whatsapp_download_media` | An attachment in a form a model can consume: image, video keyframes, cached transcript, PDF text, or a cached path. Downloads once, reuses the cached copy after. | first fetch only |
+| `whatsapp_transcribe` | Transcribe a voice note or a video's audio with whisper, and store the transcript so search can find it. Instant on a second call. | first fetch only |
+| `whatsapp_send_text` | Send a text message, optionally quoting an earlier one and @mentioning participants. | **yes** |
+| `whatsapp_send_file` | Send an image, video, voice note or document — bytes as base64 in `data`, or a server-side file via `path` (see `WHATSAPP_SEND_FILE_DIR`). | **yes** |
+| `whatsapp_react` | React with an emoji; an empty emoji removes the reaction. | **yes** |
+| `whatsapp_mark_read` | Mark a chat read up to and including one message. | **yes** |
+| `whatsapp_edit_message` | Replace the text of a message this account sent. | **yes** |
+| `whatsapp_delete_message` | Revoke a message this account sent, for everyone. Irreversible. | **yes** |
 
-**Narrowing a listing or a search.** `wa_messages_list` and `wa_messages_search` take the same filters — `chat`,
+**Narrowing a listing or a search.** `whatsapp_messages_list` and `whatsapp_messages_search` take the same filters — `chat`,
 `sender`, `from_me`, `kind`, `has_media`, `after`, `before` — so "the photos Marie sent me in June" is one call
 whether or not you have a word to search for. `kind` and `has_media` are refused when they contradict each other
 (`kind: "text"` with `has_media: true`) rather than answered with an empty page, which would read as "there are none".
 
-**Naming a recipient.** `wa_send_text` and `wa_send_file` accept a chat JID, a phone number written any usual way, or
+**Naming a recipient.** `whatsapp_send_text` and `whatsapp_send_file` accept a chat JID, a phone number written any usual way, or
 a contact/group/chat name. A name matching several chats or contacts is **refused** with the matches listed and
 numbered — never resolved by guessing — and re-sending with `pick` set to one of those numbers chooses. Every other
 tool takes the JID it was given by a listing.
 
-Every tool result is capped at `WA_MCP_MAX_RESULT_CHARS` — the JSON payloads and the free-text blocks alike, so a
+**Times and paging.** Every timestamp crossing the tool surface — `after`, `before`, and the `ts` on every row — is an
+integer Unix second in UTC. A date string is a validation error rather than a silently different window. `limit` caps
+at 200 and a listing that has more hands back an opaque `next_cursor`; walking that cursor is how you read a long
+history, and the cursor is stable against messages arriving while you page.
+
+Every tool result is capped at `WHATSAPP_MCP_MAX_RESULT_CHARS` — the JSON payloads and the free-text blocks alike, so a
 transcript or a PDF's contents is bounded exactly as a page of messages is. Whatever is cut carries a note saying how
 long the whole thing was and how much of it is above. Failures come back as an MCP error result naming what went wrong,
 not as a transport error. A write attempted while the socket is down fails with the connection
 state in the message, so a model can tell "retry in a moment" from "this will never work".
-
-## Coming from `wacli-mcp`
-
-This replaced a thin MCP wrapper around the Go `wacli` CLI. Every tool it had has a successor, and
-the successors take more arguments, not fewer:
-
-| old tool | now | notes |
-| --- | --- | --- |
-| `wacli_doctor` | `wa_health` | plus schema version and whether transcription can run |
-| `wacli_chats_list` | `wa_chats_list` | plus `is_group`, `archived`, `unread_only`, cursor paging |
-| `wacli_groups_list` | `wa_groups_list` | plus participant counts and paging |
-| `wacli_messages_list` | `wa_messages_list` | gained `kind` and `has_media`; kept `asc` |
-| `wacli_messages_search` | `wa_messages_search` | searches transcripts too; kept `type`→`kind`, `has_media`, `after`, `before`, gained `sender` |
-| `wacli_contacts_search` | `wa_contacts_search` | |
-| `wacli_send_text` | `wa_send_text` | kept name-or-number recipients, `pick`, `reply_to`, `mention` |
-| `wacli_send_file_bytes` | `wa_send_file` with `data` | gained `as_voice_note` |
-| `wacli_send_file_path` | `wa_send_file` with `path` | now confined to `WA_SEND_FILE_DIR`, **off by default** |
-| `wacli_run` | — | **removed, with nothing to replace it** |
-
-Six tools are new: `wa_download_media`, `wa_transcribe`, `wa_react`, `wa_mark_read`,
-`wa_edit_message`, `wa_delete_message`.
-
-Three differences worth knowing before porting a caller:
-
-1. **`wacli_run` is gone and is not coming back.** It ran an arbitrary `wacli` subcommand, and there
-   is no longer a binary to run one against. Of what it was documented for, *media download* is now
-   a first-class tool and better than the escape hatch ever was; *polls, presence, channels and
-   profile* are genuinely unavailable, and would each be a typed tool rather than a passthrough.
-2. **Timestamps are integer Unix seconds, UTC.** `wacli` took RFC3339 or `YYYY-MM-DD` strings for
-   `--after`/`--before`. A date string here is a validation error, not a silently different window.
-3. **`limit` caps at 200** and pages via an opaque `next_cursor`, where `wacli` took much larger
-   values. Walking the cursor is how you read a long history now.
 
 ## Prerequisites
 
@@ -95,22 +68,22 @@ Three differences worth knowing before porting a caller:
 - **pnpm 10.** Pinned in `package.json`'s `packageManager` field; `corepack enable` picks it up.
 - **`ffmpeg` and `ffprobe`** on `PATH` — video keyframes, audio conversion, voice notes. Also needed to run the test
   suite, which builds its media fixtures with them.
-- **`pdftotext`** (`poppler-utils`) — PDF text extraction. Its absence degrades one branch of `wa_download_media`; the
+- **`pdftotext`** (`poppler-utils`) — PDF text extraction. Its absence degrades one branch of `whatsapp_download_media`; the
   rest of the server is unaffected.
-- **`whisper-cli`** (whisper.cpp) — transcription only. Point `WA_WHISPER_BIN` at it. Without it, `wa_transcribe` fails
-  and `wa_health` reports `transcription_available: false`; nothing else changes.
+- **`whisper-cli`** (whisper.cpp) — transcription only. Point `WHATSAPP_WHISPER_BIN` at it. Without it, `whatsapp_transcribe` fails
+  and `whatsapp_health` reports `transcription_available: false`; nothing else changes.
 
 The Docker image ships all four. Locally, `apt install ffmpeg poppler-utils` covers everything but whisper.
 
 ## First run: pairing
 
 The server pairs **by code, not by QR**. It never renders a QR — a QR in a container log is a live credential anyone
-reading the log can use, so the code path is the only one implemented (`src/wa/connection.ts`, `handleQr` and
+reading the log can use, so the code path is the only one implemented (`src/whatsapp/connection.ts`, `handleQr` and
 `requestPairingCode`).
 
-1. Set `WA_PHONE_NUMBER` to the account's number in E.164 **digits only, no leading `+`** — e.g. `33612345678`.
+1. Set `WHATSAPP_PHONE_NUMBER` to the account's number in E.164 **digits only, no leading `+`** — e.g. `33612345678`.
    Validated at boot: 8–15 digits, no leading zero, or the process exits with a `ConfigError`.
-2. Start the server against an empty `WA_DATA_DIR`. It reaches the `pairing` state and logs an eight-character pairing
+2. Start the server against an empty `WHATSAPP_DATA_DIR`. It reaches the `pairing` state and logs an eight-character pairing
    code — Crockford base32, so no `0`, `I`, `O` or `U` and no separator — both as a structured log line and as a plain
    banner on stdout so it survives a log tail:
 
@@ -121,39 +94,39 @@ reading the log can use, so the code path is the only one implemented (`src/wa/c
 3. On the phone: **WhatsApp → Settings → Linked devices → Link a device → Link with phone number instead**, and enter
    the code. WhatsApp's own entry field shows it in two groups of four; type the eight characters as logged. Codes
    expire; if you miss one, the socket rotates and a new code is issued on the next attempt.
-4. `wa_health` flips to `connection: "connected"`, and WhatsApp starts pushing history. Contacts, chats and messages
+4. `whatsapp_health` flips to `connection: "connected"`, and WhatsApp starts pushing history. Contacts, chats and messages
    land in SQLite as they arrive.
 
-Leaving `WA_PHONE_NUMBER` unset is not a silent failure: the server logs, once per socket, that pairing requires it,
+Leaving `WHATSAPP_PHONE_NUMBER` unset is not a silent failure: the server logs, once per socket, that pairing requires it,
 and sits in `pairing` until it is configured.
 
-Credentials live in the database under `WA_DATA_DIR`, so **the volume is the account**. Back it up, and be aware that
-deleting it means re-pairing. `wa_health` reporting `ok: false` means exactly one thing: WhatsApp logged the device out
+Credentials live in the database under `WHATSAPP_DATA_DIR`, so **the volume is the account**. Back it up, and be aware that
+deleting it means re-pairing. `whatsapp_health` reporting `ok: false` means exactly one thing: WhatsApp logged the device out
 and a human has to re-pair it.
 
 ## Configuration
 
 Every variable is optional except where noted. Invalid numbers fall back to the default rather than failing the boot;
-`WA_PHONE_NUMBER` is the one exception and throws. All of this is one function — `loadConfig` in `src/config.ts`.
+`WHATSAPP_PHONE_NUMBER` is the one exception and throws. All of this is one function — `loadConfig` in `src/config.ts`.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `WA_DATA_DIR` | `/data/wa` | The state directory. Holds `wa.db` (store + credentials), `models/` (the whisper model) and `tmp/`. |
-| `WA_MEDIA_DIR` | `$WA_DATA_DIR/media` | The content-addressed attachment cache. See the note on eviction below. |
-| `WA_PHONE_NUMBER` | — | The account's number, E.164 digits without `+`. Required to pair; ignored once paired. Rejected at boot if malformed. |
+| `WHATSAPP_DATA_DIR` | `/data/whatsapp` | The state directory. Holds `whatsapp.db` (store + credentials), `models/` (the whisper model) and `tmp/`. |
+| `WHATSAPP_MEDIA_DIR` | `$WHATSAPP_DATA_DIR/media` | The content-addressed attachment cache. See the note on eviction below. |
+| `WHATSAPP_PHONE_NUMBER` | — | The account's number, E.164 digits without `+`. Required to pair; ignored once paired. Rejected at boot if malformed. |
 | `PORT` | `8080` | HTTP listen port, clamped to `[1, 65535]`. Binds `0.0.0.0`. |
 | `MCP_HTTP_PATH` | `/mcp` | Path the MCP endpoint is mounted on. `/health` is always at `/health` and always public. |
-| `WA_MCP_TOKEN` | — | Bearer token guarding the MCP path. **Unset means the endpoint is unauthenticated**, which the server warns about once at boot. Compared in constant time; never logged, never echoed in a refusal. |
-| `WA_MCP_READONLY` | off | `1`/`true`/`yes`/`on` unregisters the six write tools. The media tools stay: neither changes anything on WhatsApp. |
-| `WA_WHISPER_BIN` | `whisper-cli` | Path to the whisper.cpp binary. |
-| `WA_WHISPER_MODEL` | `large-v3-turbo-q5_0` | Model name. Fetched once, lazily, from Hugging Face into `$WA_DATA_DIR/models/ggml-<model>.bin` — 574 MB for the default. |
-| `WA_WHISPER_THREADS` | CPUs − 1 (min 1) | Threads passed to whisper, clamped to the CPU count. |
-| `WA_WHISPER_MAX_SECONDS` | `900` | Recordings longer than this are refused rather than transcribed. Clamped to `[1, 14400]`. |
-| `WA_MAX_IMAGE_BYTES` | 5 MiB | Budget for an image block returned to the model; larger images are downscaled to fit. Clamped to `[1, 100 MiB]`. |
-| `WA_MAX_UPLOAD_BYTES` | 64 MiB | Largest file `wa_send_file` will send, whichever way the bytes arrived. Clamped to `[1, 256 MiB]`. It also sizes the HTTP body limit, which is this value plus base64 overhead plus 1 MiB of envelope — so raising it raises what an authenticated client may POST. |
-| `WA_SEND_FILE_DIR` | — | The **one** directory `wa_send_file`'s `path` argument may resolve inside. Unset disables `path` entirely, which is the default and the right one: a container serving a remote client has no legitimate caller for a server-side path, and left open, `path` is an arbitrary-file-read primitive that would hand `/proc/self/environ` — every secret in the process environment — to a WhatsApp conversation. When set, paths are resolved through symlinks and confined to it; a refusal never echoes the path it was asked to read. |
-| `WA_VIDEO_KEYFRAMES` | `4` | Frames extracted per video, evenly spaced. Clamped to `[1, 16]`. |
-| `WA_MCP_MAX_RESULT_CHARS` | `200000` | Every tool payload longer than this is truncated with a note naming the full length — JSON results, transcripts and extracted PDF text alike. Clamped to `[1000, 50000000]`. |
+| `WHATSAPP_MCP_TOKEN` | — | Bearer token guarding the MCP path. **Unset means the endpoint is unauthenticated**, which the server warns about once at boot. Compared in constant time; never logged, never echoed in a refusal. |
+| `WHATSAPP_MCP_READONLY` | off | `1`/`true`/`yes`/`on` unregisters the six write tools. The media tools stay: neither changes anything on WhatsApp. |
+| `WHATSAPP_WHISPER_BIN` | `whisper-cli` | Path to the whisper.cpp binary. |
+| `WHATSAPP_WHISPER_MODEL` | `large-v3-turbo-q5_0` | Model name. Fetched once, lazily, from Hugging Face into `$WHATSAPP_DATA_DIR/models/ggml-<model>.bin` — 574 MB for the default. |
+| `WHATSAPP_WHISPER_THREADS` | CPUs − 1 (min 1) | Threads passed to whisper, clamped to the CPU count. |
+| `WHATSAPP_WHISPER_MAX_SECONDS` | `900` | Recordings longer than this are refused rather than transcribed. Clamped to `[1, 14400]`. |
+| `WHATSAPP_MAX_IMAGE_BYTES` | 5 MiB | Budget for an image block returned to the model; larger images are downscaled to fit. Clamped to `[1, 100 MiB]`. |
+| `WHATSAPP_MAX_UPLOAD_BYTES` | 64 MiB | Largest file `whatsapp_send_file` will send, whichever way the bytes arrived. Clamped to `[1, 256 MiB]`. It also sizes the HTTP body limit, which is this value plus base64 overhead plus 1 MiB of envelope — so raising it raises what an authenticated client may POST. |
+| `WHATSAPP_SEND_FILE_DIR` | — | The **one** directory `whatsapp_send_file`'s `path` argument may resolve inside. Unset disables `path` entirely, which is the default and the right one: a container serving a remote client has no legitimate caller for a server-side path, and left open, `path` is an arbitrary-file-read primitive that would hand `/proc/self/environ` — every secret in the process environment — to a WhatsApp conversation. When set, paths are resolved through symlinks and confined to it; a refusal never echoes the path it was asked to read. |
+| `WHATSAPP_VIDEO_KEYFRAMES` | `4` | Frames extracted per video, evenly spaced. Clamped to `[1, 16]`. |
+| `WHATSAPP_MCP_MAX_RESULT_CHARS` | `200000` | Every tool payload longer than this is truncated with a note naming the full length — JSON results, transcripts and extracted PDF text alike. Clamped to `[1000, 50000000]`. |
 | `NTFY_BASE_URL` | — | ntfy server for connection alerts. Alerting is all-or-nothing: it is off unless both this and `NTFY_TOPIC` are set. |
 | `NTFY_TOPIC` | — | ntfy topic to publish to. |
 | `NTFY_TOKEN` | — | Bearer token for ntfy, if the server needs one. Travels in a header and appears in no log line. |
@@ -163,7 +136,7 @@ Alerting debounces on purpose: a dropped socket must stay down for a grace perio
 a cadence while still down, and announces recovery only if a down alert actually went out. `logged_out` skips the grace
 and goes out immediately — no backoff recovers it.
 
-`WA_MCP_TOKEN` and `NTFY_TOKEN` never appear in a log line, an error message, or the `/health` response. `/health`
+`WHATSAPP_MCP_TOKEN` and `NTFY_TOKEN` never appear in a log line, an error message, or the `/health` response. `/health`
 returns a closed record built in `src/mcp/health.ts` rather than a spread of the config, so a new config field can
 never widen it by accident.
 
@@ -192,24 +165,24 @@ The image is `node:24-slim` plus ffmpeg, poppler-utils, and whisper.cpp binaries
 upstream image publishes no other architecture.
 
 ```bash
-docker build -t wa-mcp:latest .
+docker build -t whatsapp-mcp:latest .
 
-docker run -d --name wa-mcp -p 8080:8080 \
-  -v wa-data:/data/wa \
-  -e WA_PHONE_NUMBER=33612345678 \
-  -e WA_MCP_TOKEN="$(openssl rand -hex 32)" \
-  wa-mcp:latest
+docker run -d --name whatsapp-mcp -p 8080:8080 \
+  -v whatsapp-data:/data/whatsapp \
+  -e WHATSAPP_PHONE_NUMBER=33612345678 \
+  -e WHATSAPP_MCP_TOKEN="$(openssl rand -hex 32)" \
+  whatsapp-mcp:latest
 
-docker logs -f wa-mcp          # watch for the pairing code on the first run
+docker logs -f whatsapp-mcp          # watch for the pairing code on the first run
 ```
 
-The image sets `WA_DATA_DIR=/data/wa`, `WA_WHISPER_BIN=/opt/whisper/bin/whisper-cli`, `PORT=8080` and
+The image sets `WHATSAPP_DATA_DIR=/data/whatsapp`, `WHATSAPP_WHISPER_BIN=/opt/whisper/bin/whisper-cli`, `PORT=8080` and
 `LD_LIBRARY_PATH=/opt/whisper/bin` — that last one is load-bearing: `whisper-cli` is dynamically linked against
 `libwhisper.so` and three `libggml*.so` that live beside it. It runs as the unprivileged `node` user, so a bind mount
 in place of the named volume must be writable by uid 1000. A `HEALTHCHECK` polls `/health` and fails only on a
 logged-out account.
 
-The first `wa_transcribe` in a fresh container downloads the 574 MB model into the volume. It is worth doing once,
+The first `whatsapp_transcribe` in a fresh container downloads the 574 MB model into the volume. It is worth doing once,
 deliberately, rather than discovering it under a user's request.
 
 ## Quality gate
@@ -237,13 +210,13 @@ ffmpeg and convert them back, because a stubbed converter only ever asserts the 
 
 ```bash
 pnpm test                                              # everything
-node --import tsx --test src/wa/ingest.test.ts         # one file
+node --import tsx --test src/whatsapp/ingest.test.ts         # one file
 ```
 
 What the suite structurally cannot cover is the wiring end to end, and whisper. That is `smoke.mjs`:
 
 ```bash
-node smoke.mjs                                         # health, session, 14 tools, wa_chats_list
+node smoke.mjs                                         # health, session, 14 tools, whatsapp_chats_list
 node smoke.mjs --transcribe <chatJid> <messageId>      # ... and a real transcription
 ```
 
@@ -260,7 +233,7 @@ never messaged you, unusual timing — is exactly what that detection looks for.
 Use an account you can afford to lose, keep the volume human, and do not point it at strangers. A ban takes the number
 with it, not just this server.
 
-**The media cache is never evicted.** `WA_MEDIA_DIR` holds one file per distinct attachment, named by the sha256 of its
+**The media cache is never evicted.** `WHATSAPP_MEDIA_DIR` holds one file per distinct attachment, named by the sha256 of its
 bytes, and nothing ever deletes one. That is a deliberate v1 scope decision, not an oversight — the alternative is an
 eviction policy that has to reason about which cached transcript is still referenced by the search index — but it means
 the directory grows monotonically with every attachment ever read, and a chat full of videos will grow it fast. There

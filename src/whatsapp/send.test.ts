@@ -10,7 +10,7 @@ import { openDb } from "../db/client.js";
 import { makeContactsRepo, type ContactsRepo } from "../db/contacts.js";
 import { makeMessagesRepo, type MessageRow, type MessagesRepo } from "../db/messages.js";
 import { makeReactionsRepo } from "../db/reactions.js";
-import type { WaConnection } from "./connection.js";
+import type { WhatsAppConnection } from "./connection.js";
 import * as fx from "./fixtures.js";
 import { makeIngest, type Ingest } from "./ingest.js";
 import {
@@ -26,7 +26,7 @@ const DM = "33612345678@s.whatsapp.net";
 const GROUP = "120363000000000000@g.us";
 const SELF = "33600000000@s.whatsapp.net";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-send-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-send-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
@@ -127,7 +127,7 @@ type HarnessOptions = {
   maxUploadBytes?: number | undefined;
   /** LID → phone JID, the one identity fact `canonicalId` consults. */
   pnForLid?: ((lid: string) => string | undefined) | undefined;
-  /** Chats and contacts a name can resolve to; see `wa/recipient.ts`. Empty means JIDs only. */
+  /** Chats and contacts a name can resolve to; see `whatsapp/recipient.ts`. Empty means JIDs only. */
   named?: readonly { id: string; name: string; isGroup?: boolean }[] | undefined;
   /** true makes `requireSocket()` throw, as it does whenever the connection is not open. */
   offline?: boolean | undefined;
@@ -195,7 +195,7 @@ function harness(opts: HarnessOptions = {}) {
         if (opts.offline === true) throw new Error('WhatsApp connection unavailable: current state is "disconnected"');
         return sock as unknown as WASocket;
       },
-    } as unknown as WaConnection,
+    } as unknown as WhatsAppConnection,
     ingest: {
       ingestMessage: (m: WAMessage) => {
         ingested.push(m);
@@ -456,7 +456,7 @@ void test("path sending is refused when no directory is configured", async () =>
   const h = harness({ sendFileDir: undefined });
   await assert.rejects(
     () => h.sender.sendFile(DM, { kind: "path", path: "/etc/passwd" }, {}),
-    /WA_SEND_FILE_DIR/,
+    /WHATSAPP_SEND_FILE_DIR/,
     "the refusal must name the variable that would enable it",
   );
   assert.equal(h.calls.length, 0);
@@ -658,7 +658,7 @@ function liveHarness() {
   const ingest = makeIngest({ db, ...repos, logger: silentLogger, selfId: () => SELF });
   const { sock, calls } = fakeSocket();
   const sender = makeSender({
-    conn: { requireSocket: () => sock as unknown as WASocket } as unknown as WaConnection,
+    conn: { requireSocket: () => sock as unknown as WASocket } as unknown as WhatsAppConnection,
     ingest,
     messages: repos.messages,
     chats: repos.chats,

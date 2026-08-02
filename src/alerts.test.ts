@@ -26,7 +26,7 @@ import { loadConfig, type Config, type NtfyConfig } from "./config.js";
 
 const GRACE_MS = 60_000;
 const REALERT_MS = 300_000;
-const NTFY: NtfyConfig = { baseUrl: "https://ntfy.example/", topic: "wa", token: "ntfy-secret" };
+const NTFY: NtfyConfig = { baseUrl: "https://ntfy.example/", topic: "alerts", token: "ntfy-secret" };
 
 function configWith(ntfy: NtfyConfig | undefined): Config {
   return { ...loadConfig({}), ntfy };
@@ -249,7 +249,7 @@ void test("a pairing episode is paged as unpaired, not as a disconnection", () =
   const { logger } = captureLogger();
   const alerter = alerterUnder(clock, impl, logger);
 
-  // The first-boot sequence, exactly as `wa/connection.ts` produces it: `createSocket` sets
+  // The first-boot sequence, exactly as `whatsapp/connection.ts` produces it: `createSocket` sets
   // `connecting`, then the first QR sets `pairing`. So the state that *opens* the episode is the
   // uninformative one, and a notice built from it alone would say "disconnected" about a server
   // that has simply never been linked.
@@ -262,7 +262,7 @@ void test("a pairing episode is paged as unpaired, not as a disconnection", () =
   assert.equal(calls.length, 1);
   assert.match(titleOf(calls[0]), /pair/i);
   assert.doesNotMatch(titleOf(calls[0]), /disconnected/i);
-  assert.match(messageOf(calls[0]), /WA_PHONE_NUMBER/, "and it names what unblocks it");
+  assert.match(messageOf(calls[0]), /WHATSAPP_PHONE_NUMBER/, "and it names what unblocks it");
   assert.match(messageOf(calls[0]), /pairing code/i);
 
   // A real disconnection still reads as one — the two notices are not interchangeable.
@@ -275,7 +275,7 @@ void test("a pairing episode is paged as unpaired, not as a disconnection", () =
 
   assert.match(titleOf(second.calls[0]), /disconnected/i);
   assert.notEqual(titleOf(second.calls[0]), titleOf(calls[0]));
-  assert.doesNotMatch(messageOf(second.calls[0]), /WA_PHONE_NUMBER/);
+  assert.doesNotMatch(messageOf(second.calls[0]), /WHATSAPP_PHONE_NUMBER/);
 
   alerter.stop();
   dropped.stop();

@@ -8,7 +8,7 @@ import { openDb } from "./client.js";
 import { makeContactsRepo } from "./contacts.js";
 import { makeMessagesRepo, type MessageInput } from "./messages.js";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-msg-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-msg-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });

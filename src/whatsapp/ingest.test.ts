@@ -18,7 +18,7 @@ const DM = "33612345678@s.whatsapp.net";
 const GROUP = "120363@g.us";
 const SELF = "33600000000@s.whatsapp.net";
 
-const dir = mkdtempSync(join(tmpdir(), "wa-ingest-"));
+const dir = mkdtempSync(join(tmpdir(), "whatsapp-ingest-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });

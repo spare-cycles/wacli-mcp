@@ -12,7 +12,7 @@
  *    healthcheck polls, and a healthcheck that needs the secret is a secret in the compose file.
  * 3. **No stateless mode.** One code path, sessions always (Global Constraint 15).
  *
- * Global Constraint 8 lives here more than anywhere: this module holds `WA_MCP_TOKEN`. It is never
+ * Global Constraint 8 lives here more than anywhere: this module holds `WHATSAPP_MCP_TOKEN`. It is never
  * logged, never echoed in a refusal, and no log line here carries request headers — which is where a
  * caller's credential would be found. Nor does one carry a request *body*: no log line in this file
  * is ever handed a raw error object, for the reason spelled out on `errorType`.
@@ -120,7 +120,7 @@ function statusOf(err: unknown): number {
  * payload off a parse failure (`createError(400, err, { body: str })`) and pino's standard error
  * serializer copies `message`, `stack` and *every own enumerable key* — so one `{ err }` writes an
  * arbitrary caller's body, bounded only by the ~90 MB parser limit, into the log. Two ways that
- * bites: a malformed POST from anyone at all, and a legitimate `wa_send_file` whose base64 argument
+ * bites: a malformed POST from anyone at all, and a legitimate `whatsapp_send_file` whose base64 argument
  * lands on disk the one time the client gets the envelope wrong.
  *
  * `message` is left out of the rejected-request line for the same reason, and it is not paranoia:
@@ -187,7 +187,7 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
   if (token === "") {
     // Once, at boot — not per request, which would bury it. An unauthenticated MCP endpoint is a
     // deployment decision, so it is a warning rather than a refusal to start.
-    logger.warn("http: WA_MCP_TOKEN is not set; the MCP endpoint accepts unauthenticated requests");
+    logger.warn("http: WHATSAPP_MCP_TOKEN is not set; the MCP endpoint accepts unauthenticated requests");
   } else {
     app.use(config.httpPath, ((req, res, next) => {
       if (bearerMatches(token, req.headers.authorization)) {
@@ -200,7 +200,7 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
     }) satisfies RequestHandler);
   }
 
-  // Base64 in a `wa_send_file` argument is 4 bytes per 3, plus room for the rest of the envelope.
+  // Base64 in a `whatsapp_send_file` argument is 4 bytes per 3, plus room for the rest of the envelope.
   const bodyLimitBytes = Math.ceil((config.maxUploadBytes * 4) / 3) + 1024 * 1024;
   // Mounted on the MCP path, never globally, and after the gate above so the ordering still puts
   // auth in front of parsing. Global, this buffers and parses that ~90 MB for `POST /anything` —

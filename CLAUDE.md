@@ -1,20 +1,19 @@
-# wa-mcp — one Node process: Baileys + SQLite/FTS5 + a 14-tool MCP surface over HTTP
+# whatsapp-mcp — one Node process: Baileys + SQLite/FTS5 + a 14-tool MCP surface over HTTP
 
 `README.md` is the reference (tools, env vars, pairing, Docker). This file is the list of things that
 are non-obvious enough to get broken by an edit that looks correct.
 
-- **All raw JID interpretation lives in `src/wa/jid.ts`.** No other production module may contain
+- **All raw JID interpretation lives in `src/whatsapp/jid.ts`.** No other production module may contain
   `@lid`, `@s.whatsapp.net` or `@g.us`, or split a JID on `@` or `:`. WhatsApp hands the same human
   two identities — a phone JID and a LID — and folding them is the difference between one
   conversation and two half-empty ones. Every layer above calls `canonicalId(jid, contacts)` and
   treats the result as an opaque key. The enforcing check, which must print nothing:
   ```bash
   grep -rn '@lid\|@s\.whatsapp\.net\|@g\.us' src/ --include='*.ts' \
-    | grep -v '\.test\.ts:' | grep -v 'src/wa/jid\.ts:' | grep -v 'src/wa/fixtures\.ts:'
+    | grep -v '\.test\.ts:' | grep -v 'src/whatsapp/jid\.ts:' | grep -v 'src/whatsapp/fixtures\.ts:'
   ```
-  Test files and `src/wa/fixtures.ts` are excluded because they carry JID *literals as data* — a
-  test for identity folding has to name a LID. The same scoping applies to the "no `wacli`/`WACLI`"
-  rule: `src/config.test.ts` names the old variables solely to assert they are ignored.
+  Test files and `src/whatsapp/fixtures.ts` are excluded because they carry JID *literals as data* — a
+  test for identity folding has to name a LID.
 
 - **`getMessage` makes the store load-bearing for the protocol, not just for reads.** Baileys calls
   it to re-encrypt a message a peer failed to decrypt, and to build a quote. It is wired in
@@ -37,7 +36,7 @@ are non-obvious enough to get broken by an edit that looks correct.
 
 - **Baileys is pinned exactly: `"baileys": "7.0.0-rc14"`.** No caret, no tilde. It is a prerelease
   and rc→rc has broken APIs before. Bumping it is a task with a test run, not a dependency refresh.
-  Related: `src/mcp/tools/*` must not import from `baileys` — Baileys types stop at the `wa/` and
+  Related: `src/mcp/tools/*` must not import from `baileys` — Baileys types stop at the `whatsapp/` and
   `media/` boundary.
 
 - **The socket's `browser[1]` is a protocol value, not a cosmetic label, and only six strings work.**
@@ -48,7 +47,7 @@ are non-obvious enough to get broken by an edit that looks correct.
   awaits that reply: it returns the locally generated code either way. So the whole failure
   surfaces as eight plausible characters the phone refuses, with a healthy-looking pod and no
   error in the log. Only Baileys' `BROWSER_TO_COMPANION_WEB_CLIENT` keys — Chrome, Edge, Firefox,
-  IE, Opera, Safari — are safe; `src/wa/connection.ts` uses `Browsers.macOS("Chrome")`. Upstream
+  IE, Opera, Safari — are safe; `src/whatsapp/connection.ts` uses `Browsers.macOS("Chrome")`. Upstream
   issue #2560, whose fix (PR #2559) is unmerged as of rc14 — recheck on any Baileys bump.
 
 - **`creds.me` is written when a pairing code is *requested*, not when pairing succeeds**, and
@@ -66,7 +65,7 @@ are non-obvious enough to get broken by an edit that looks correct.
   apt line. Copying just the binary produces a loader error at the first transcription, not at build
   time. Verify after any image change:
   ```bash
-  docker build -t wa-mcp:test . && docker run --rm wa-mcp:test /opt/whisper/bin/whisper-cli --help | head -3
+  docker build -t whatsapp-mcp:test . && docker run --rm whatsapp-mcp:test /opt/whisper/bin/whisper-cli --help | head -3
   ```
   The whisper stage is pinned **by digest** — `:main` moves — and is amd64-only, which is why
   `docker.yml` builds `linux/amd64` and nothing else.
@@ -96,7 +95,7 @@ are non-obvious enough to get broken by an edit that looks correct.
 - **Read tools must work in every connection state** — they query SQLite and never touch the socket.
   Only write tools and a media *cache miss* may require a live connection.
 
-- **An ambiguous recipient name is refused, never resolved by picking one.** `wa/recipient.ts` turns a
+- **An ambiguous recipient name is refused, never resolved by picking one.** `whatsapp/recipient.ts` turns a
   JID, a phone number or a *name* into a chat id, and the whole point of it is the refusal: two people
   called Marie is the ordinary case, and guessing sends a private message to the wrong person. The
   refusal numbers the candidates and `pick` selects by that number, so the candidate order must stay a
@@ -104,7 +103,7 @@ are non-obvious enough to get broken by an edit that looks correct.
   a different person on the retry than in the refusal that suggested it. An out-of-range `pick` is an
   error rather than a clamp, for the same reason.
 
-- **`wa/send.ts` must not name a local helper `resolve`.** `node:path`'s `resolve` is imported at the
+- **`whatsapp/send.ts` must not name a local helper `resolve`.** `node:path`'s `resolve` is imported at the
   top of that file and used by `resolveSendPath`'s containment check; a `(string) => string` shadow
   inside `makeSender` type-checks perfectly and silently reroutes the path check. Hence `resolveChat`.
 
@@ -117,18 +116,18 @@ are non-obvious enough to get broken by an edit that looks correct.
   Full TS strict set, ESLint `strictTypeChecked` + `stylisticTypeChecked` at zero warnings; do not
   weaken a compiler option to make code compile. `smoke.mjs` is listed in `eslint.config.js`'s
   `ignores` — being outside `src/` is *not* enough, because `projectService` fatals on any file no
-  tsconfig includes. Symmetrically, `src/mcp/tools/harness.ts` and `src/wa/fixtures.ts` are named
+  tsconfig includes. Symmetrically, `src/mcp/tools/harness.ts` and `src/whatsapp/fixtures.ts` are named
   one by one in `tsconfig.build.json`'s `exclude`: both are test scaffolding, neither is a
   `*.test.ts` file, so that glob catches neither and anything left out compiles into `dist/` and
   ships in the image as dead code. Any new non-`*.test.ts` scaffolding needs a line there too.
 
-- **`WA_SEND_FILE_DIR` is unset by default and that is a security decision.** `wa_send_file`'s `path`
+- **`WHATSAPP_SEND_FILE_DIR` is unset by default and that is a security decision.** `whatsapp_send_file`'s `path`
   argument is an arbitrary-file-read primitive that would hand `/proc/self/environ` to a WhatsApp
   conversation; it is disabled entirely unless that variable names a directory, and refusals never
-  echo the path they were asked to read. `WA_MCP_TOKEN` and `NTFY_TOKEN` appear in no log line, no
+  echo the path they were asked to read. `WHATSAPP_MCP_TOKEN` and `NTFY_TOKEN` appear in no log line, no
   error message and not in `/health`, which returns a closed record rather than a spread of `Config`.
 
-- **The media cache is never evicted** (v1 scope, documented in `README.md`). `WA_MEDIA_DIR` grows
+- **The media cache is never evicted** (v1 scope, documented in `README.md`). `WHATSAPP_MEDIA_DIR` grows
   monotonically, one sha256-named file per distinct attachment.
 
 - **`smoke.mjs` is the only coverage whisper and the 574 MB model download get.** It is manual, needs

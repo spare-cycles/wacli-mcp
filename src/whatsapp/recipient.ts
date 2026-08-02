@@ -4,7 +4,7 @@
  * A model reading a conversation has a JID for every chat it saw, and for those this module is a
  * pass-through. It exists for the other case — "send this to Marie" — which the old server supported
  * and which is how a person actually names a recipient. Losing it would have made every send a
- * two-step dance through `wa_contacts_search`, and a model that skipped the first step would send to
+ * two-step dance through `whatsapp_contacts_search`, and a model that skipped the first step would send to
  * whatever it guessed.
  *
  * Two rules shape it:
@@ -18,7 +18,7 @@
  *    than left in whatever sequence two queries happened to return.
  *
  * No JID is interpreted here (Global Constraint 11): `parseRecipient` and `canonicalId` in
- * `wa/jid.ts` do that, and this module works with the opaque ids they return.
+ * `whatsapp/jid.ts` do that, and this module works with the opaque ids they return.
  */
 
 import type { ChatsRepo } from "../db/chats.js";
@@ -107,7 +107,7 @@ export function resolveRecipient(to: string, pick: number | undefined, deps: Rec
   const candidates = candidatesFor(name, deps);
   if (candidates.length === 0) {
     throw new RecipientNotFoundError(
-      `no chat, group or contact is named "${name}" — search with wa_contacts_search or wa_chats_list, ` +
+      `no chat, group or contact is named "${name}" — search with whatsapp_contacts_search or whatsapp_chats_list, ` +
         "or give a JID or phone number",
     );
   }

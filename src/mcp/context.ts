@@ -19,8 +19,8 @@ import type { MetaRepo } from "../db/meta.js";
 import type { ReactionsRepo } from "../db/reactions.js";
 import type { MediaStore } from "../media/store.js";
 import type { Transcriber } from "../media/transcribe.js";
-import type { WaConnection } from "../wa/connection.js";
-import type { Sender } from "../wa/send.js";
+import type { WhatsAppConnection } from "../whatsapp/connection.js";
+import type { Sender } from "../whatsapp/send.js";
 
 export type ToolContext = {
   config: Config;
@@ -30,7 +30,7 @@ export type ToolContext = {
   messages: MessagesRepo;
   reactions: ReactionsRepo;
   meta: MetaRepo;
-  conn: WaConnection;
+  conn: WhatsAppConnection;
   sender: Sender;
   media: MediaStore;
   transcriber: Transcriber;
