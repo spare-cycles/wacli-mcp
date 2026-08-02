@@ -40,6 +40,25 @@ are non-obvious enough to get broken by an edit that looks correct.
   Related: `src/mcp/tools/*` must not import from `baileys` — Baileys types stop at the `wa/` and
   `media/` boundary.
 
+- **The socket's `browser[1]` is a protocol value, not a cosmetic label, and only six strings work.**
+  Baileys sends `companion_platform_display` as `${browser[1]} (${browser[0]})`, and WhatsApp
+  validates it strictly for the pairing-code IQ — but not for QR registration, so this breaks
+  exactly one code path and only at first pairing. `Browsers.macOS("Desktop")` is answered
+  `<iq type='error'><error code='400' text='bad-request'/></iq>`, and `requestPairingCode` never
+  awaits that reply: it returns the locally generated code either way. So the whole failure
+  surfaces as eight plausible characters the phone refuses, with a healthy-looking pod and no
+  error in the log. Only Baileys' `BROWSER_TO_COMPANION_WEB_CLIENT` keys — Chrome, Edge, Firefox,
+  IE, Opera, Safari — are safe; `src/wa/connection.ts` uses `Browsers.macOS("Chrome")`. Upstream
+  issue #2560, whose fix (PR #2559) is unmerged as of rc14 — recheck on any Baileys bump.
+
+- **`creds.me` is written when a pairing code is *requested*, not when pairing succeeds**, and
+  Baileys branches registration-vs-login on `creds.me` alone. So an unclaimed code leaves a device
+  WhatsApp has never seen, the next socket tries to log in as it, and the `<failure reason='401'/>`
+  that comes back is indistinguishable from a real logout — which wipes the store and parks the
+  server in `logged_out` with no retry. `createSocket` therefore calls `discardUnregisteredIdentity()`,
+  which trusts `creds.registered` (set only on a completed pairing) rather than `creds.me`. Without
+  it every missed pairing code costs a manual restart.
+
 - **`whisper-cli` is dynamically linked against libraries that live beside it.** `libwhisper.so.1`,
   `libggml.so.0`, `libggml-base.so.0`, `libggml-cpu.so.0` all sit in the same directory, plus
   `libgomp.so.1` from the system, which `node:*-slim` does not ship. Hence the Dockerfile copying the

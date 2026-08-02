@@ -27,8 +27,11 @@ function firstSocket(sockets: ReturnType<typeof fakeSocket>[]): ReturnType<typeo
   return s;
 }
 
+type SocketConfig = { browser?: [string, string, string] };
+
 function deps(over: Partial<ConnectionDeps> = {}, configOver: Partial<Config> = {}) {
   const sockets: ReturnType<typeof fakeSocket>[] = [];
+  const socketConfigs: SocketConfig[] = [];
   const base = {
     config: { phoneNumber: "33612345678", ...configOver },
     logger: {
@@ -58,13 +61,14 @@ function deps(over: Partial<ConnectionDeps> = {}, configOver: Partial<Config> = 
     onSocket: () => {
       /* no-op */
     },
-    makeSocket: () => {
+    makeSocket: (cfg: SocketConfig) => {
+      socketConfigs.push(cfg);
       const s = fakeSocket();
       sockets.push(s);
       return s;
     },
   } as unknown as ConnectionDeps;
-  return { deps: { ...base, ...over }, sockets };
+  return { deps: { ...base, ...over }, sockets, socketConfigs };
 }
 
 void test("starts disconnected, moves to connecting on start", async () => {
@@ -382,4 +386,63 @@ void test("makeSocket throwing synchronously is an ordinary failed attempt, not 
   assert.equal(c.snapshot().state, "disconnected");
   assert.equal(c.snapshot().attempts, 1, "a synchronous makeSocket throw still counts as a failed attempt");
   await c.stop(); // the failed attempt scheduled a backoff retry; stop() it so the process can exit
+});
+
+// Baileys renders `companion_platform_display` as `${browser[1]} (${browser[0]})`, and WhatsApp
+// validates that string strictly for the pairing-code IQ — only these six names map to a companion
+// web-client type. Anything else is answered `<error code='400' text='bad-request'/>`, which
+// `requestPairingCode` never awaits: it returns a locally generated code regardless, so the whole
+// failure surfaces as eight plausible characters the phone refuses to accept. Upstream #2560.
+const CANONICAL_PAIRING_BROWSERS = ["Chrome", "Edge", "Firefox", "IE", "Opera", "Safari"];
+
+void test("the socket announces a browser WhatsApp accepts for pairing codes (upstream #2560)", async () => {
+  const { deps: d, socketConfigs } = deps();
+  const c = makeConnection(d);
+  await c.start();
+  const cfg = socketConfigs[0];
+  assert.ok(cfg, "expected a socket to have been created");
+  const browser = cfg.browser;
+  assert.ok(browser, "a browser identity must be supplied");
+  assert.ok(
+    CANONICAL_PAIRING_BROWSERS.includes(browser[1]),
+    `browser[1] is "${browser[1]}", so WhatsApp answers the pairing-code IQ 400 bad-request and every code issued is dead on arrival; use one of ${CANONICAL_PAIRING_BROWSERS.join(", ")}`,
+  );
+});
+
+type TestCreds = { registered: boolean; me?: { id: string } | undefined };
+
+function authSpy(creds: TestCreds) {
+  const calls = { cleared: 0 };
+  return {
+    calls,
+    auth: {
+      state: { creds },
+      saveCreds() {
+        /* no-op */
+      },
+      clear() {
+        calls.cleared += 1;
+        creds.me = undefined;
+      },
+    },
+  };
+}
+
+void test("the identity an unclaimed pairing code leaves behind is discarded before the next socket", async () => {
+  // requestPairingCode writes creds.me as soon as a code is *requested*; Baileys then branches
+  // login-vs-register on creds.me alone, so leaving it would log in as a device WhatsApp has never
+  // seen, draw a 401, and park the server in logged_out with the store wiped and no retry.
+  const { calls, auth } = authSpy({ registered: false, me: { id: "33612345678@s.whatsapp.net" } });
+  const { deps: d } = deps({ auth } as unknown as Partial<ConnectionDeps>);
+  const c = makeConnection(d);
+  await c.start();
+  assert.equal(calls.cleared, 1, "creds.me without creds.registered is a half-written identity and must be wiped");
+});
+
+void test("a genuinely paired identity is never discarded on socket creation", async () => {
+  const { calls, auth } = authSpy({ registered: true, me: { id: "33612345678@s.whatsapp.net" } });
+  const { deps: d } = deps({ auth } as unknown as Partial<ConnectionDeps>);
+  const c = makeConnection(d);
+  await c.start();
+  assert.equal(calls.cleared, 0, "wiping a registered session would unpair the device on every reconnect");
 });
