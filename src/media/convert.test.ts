@@ -22,7 +22,7 @@ import {
   probeDimensions,
   probeDuration,
   runTool,
-  toWav16k,
+  toOpus16k,
   videoKeyframes,
 } from "./convert.js";
 
@@ -223,26 +223,26 @@ void test("videoKeyframes refuses a file it cannot read a duration from", async 
 
 // --- audio ------------------------------------------------------------------------------------
 
-void test("toWav16k produces a 16 kHz mono wav", async () => {
-  const out = join(dir, "out.wav");
-  await toWav16k(wav, out);
-  assert.ok(statSync(out).size > 0);
+void test("toOpus16k produces a mono Opus stream far smaller than its input", async () => {
+  const out = join(dir, "out.ogg");
+  await toOpus16k(wav, out);
   const { stdout } = await run("ffprobe", [
-    "-v",
-    "error",
-    "-show_entries",
-    "stream=sample_rate,channels",
-    "-of",
-    "default=noprint_wrappers=1:nokey=1",
-    out,
+    ...["-v", "error", "-show_entries", "stream=codec_name,channels"],
+    ...["-of", "default=noprint_wrappers=1:nokey=1", out],
   ]);
-  assert.match(stdout, /16000/);
-  assert.match(stdout.trim().split("\n")[1] ?? "", /^1$/);
+  const [codec, channels] = stdout.trim().split("\n");
+  assert.equal(codec, "opus");
+  assert.equal(channels, "1");
+  // Size is the property that matters, not the sample rate: the audio is base64'd into a JSON
+  // request against a 10 MB cap, and Opus is what keeps a long recording inside it. (Sample rate is
+  // deliberately not asserted — Opus always *decodes* at 48 kHz, so ffprobe reports 48000 whatever
+  // `-ar` asked for, and asserting 16000 would be asserting a thing that is never true.)
+  assert.ok(statSync(out).size * 4 < statSync(wav).size, `${statSync(out).size} vs ${statSync(wav).size}`);
 });
 
-void test("toWav16k extracts the audio track of a video and drops the video stream", async () => {
-  const out = join(dir, "from-video.wav");
-  await toWav16k(avMp4, out);
+void test("toOpus16k extracts the audio track of a video and drops the video stream", async () => {
+  const out = join(dir, "from-video.ogg");
+  await toOpus16k(avMp4, out);
   const { stdout } = await run("ffprobe", [
     "-v",
     "error",
@@ -252,11 +252,11 @@ void test("toWav16k extracts the audio track of a video and drops the video stre
     "default=noprint_wrappers=1:nokey=1",
     out,
   ]);
-  assert.equal(stdout.trim(), "audio", "a video stream must not survive into the wav");
+  assert.equal(stdout.trim(), "audio", "a video stream must not survive into the upload");
 });
 
-void test("toWav16k on an unreadable input raises ConversionError", async () => {
-  await assert.rejects(() => toWav16k(join(dir, "nope.ogg"), join(dir, "nope.wav")), ConversionError);
+void test("toOpus16k on an unreadable input raises ConversionError", async () => {
+  await assert.rejects(() => toOpus16k(join(dir, "nope.ogg"), join(dir, "nope.out.ogg")), ConversionError);
 });
 
 void test("probeDuration reads a duration", async () => {

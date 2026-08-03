@@ -1,58 +1,79 @@
 /**
- * Voice notes into text: whisper.cpp, plus the lazy provisioning of the model it needs.
+ * Voice notes into text, on a GPU that is somewhere else.
  *
- * Two very different problems live here, and only the second is interesting.
+ * This file used to run whisper.cpp in-process against a 574 MB model downloaded onto the data
+ * volume, on a VPS with no GPU — minutes of CPU per recording, which is why the tool that called it
+ * warned against asking for more than one at a time. All of that is gone: the model, the download
+ * hardening it needed, and the ~250 lines that existed because a 574 MB transfer over a link we did
+ * not control failed in ways that were silent rather than loud.
  *
- * 1. **Running whisper** is a subprocess call. It goes through `runTool` from `convert.ts` — the
- *    single spawn point in this package — so it inherits that module's timeout, output cap and
- *    distinguished failures rather than growing a second, subtly different copy of them.
- * 2. **Getting the model** is a 574 MB download over a link we do not control, onto a NAS volume we
- *    do not control either, and it is by far the most failure-prone step in the whole server. Every
- *    rule it obeys exists because the alternative fails *silently*: a resumed `.part` is a corrupt
- *    model whose whisper error is unintelligible, a truncated body looks installed forever, and a
- *    cached rejected promise makes one bad minute of network permanent for the life of the process.
- *    The download therefore never resumes, verifies its own length, keeps its errno, and clears its
- *    in-flight promise on every outcome. It also refuses a content encoding, so the length check is
- *    never surrendered to a proxy, and it reports a connection that dies mid-transfer as exactly
- *    that, naming how far it got — the alternative there is the operator reading the single word
- *    `terminated` and having no idea whether the network, the disk or the model name was at fault.
+ * What replaces it is a **chain of remote backends**, tried in configured order:
  *
- * The stall budget is per read, not per transfer. A total-duration cap would be the wrong shape: a
- * slow link legitimately needs many minutes for this file, while a connection that has delivered
- * nothing for a minute is dead no matter how long it is given.
+ * 1. `runpod` — the self-hosted endpoint. Voxtral Small 24B, bf16, on an on-demand A100. The best
+ *    French WER of anything self-hostable, and better than Mistral's own closed API model.
+ * 2. `mistral` — the paid API, for when the endpoint is cold, saturated, or being redeployed.
+ *
+ * Three rules shape the chain.
+ *
+ * **The length gate runs first, before any bytes move.** It is the only refusal that costs nothing.
+ *
+ * **The lane decides which backends are eligible.** An interactive call — someone asked — may fall
+ * back to a paid third party. A background call may not: paying a vendor to transcribe a recording
+ * nobody asked about is not a trade worth making, and it is also the only path that would send
+ * conversation audio to a model vendor without anyone deciding to.
+ *
+ * **Every attempt is recorded against the budget, whichever lane it came from.** The cap only stops
+ * the background lane, but on-demand transcription costs the same dollars and a ledger that could
+ * not see them would under-report exactly when someone was using the tool heavily.
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, open, rename, stat, unlink, type FileHandle } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
-import type { Config } from "../config.js";
-import { probeDuration, runTool, toWav16k } from "./convert.js";
+import type { Config, TranscribeBackend } from "../config.js";
+import { makeMistralBackend } from "./backends/mistral.js";
+import { MAX_PAYLOAD_BYTES, makeRunpodBackend } from "./backends/runpod.js";
+import { BackendError, type Backend } from "./backends/types.js";
+import type { BudgetLedger } from "./budget.js";
+import { probeDuration, toOpus16k } from "./convert.js";
+
+/** Which caller a transcription is for, and therefore what it is allowed to cost. */
+export type Lane = "interactive" | "background";
+
+export type TranscribeOptions = {
+  /** The declared mimetype, which decides whether ffmpeg is needed at all. */
+  mimetype?: string | undefined;
+  /** Proper nouns worth spelling right. Sent to whichever backend answers; never required. */
+  biasTerms?: readonly string[] | undefined;
+  /** `null` or absent lets the model detect. See the language policy below. */
+  language?: string | null | undefined;
+  /** Defaults to `interactive`, the safe direction: only the background lane restricts backends. */
+  lane?: Lane | undefined;
+};
+
+/** A transcript and the provenance that goes into `messages.transcript_model`. */
+export type Transcript = { text: string; model: string; language: string | null };
 
 export type Transcriber = {
-  /** Ensure the model file exists locally, downloading it once. Throws `TranscriptionError`. */
-  ensureModel: () => Promise<string>;
   /**
    * Transcribe an audio or video file.
    *
-   * Throws `TranscriptionError` for anything this module decides — too long, no speech, no model —
-   * and lets `ConversionError` through unwrapped when ffmpeg or whisper itself is what failed, since
-   * that error already names the binary and the reader needs to know which layer broke.
+   * Throws `TranscriptionError` for anything this module decides — too long, no backend configured,
+   * every backend failed — with the individual backend failures folded into the message, because
+   * "transcription failed" on its own tells an operator nothing about which half to look at.
    *
-   * The length limit only applies to a file whose container declares a duration: when `probeDuration`
-   * returns nothing, the gate is skipped and the recording is bounded solely by whisper's own budget
-   * (the 60 s floor, since ten times an unknown duration is nothing), so such a file dies on that
-   * timeout rather than running unbounded.
+   * The length limit applies only to a file whose container declares a duration: when
+   * `probeDuration` returns nothing the gate is skipped, and the recording is bounded instead by
+   * the payload cap and the request timeout.
    */
-  transcribeFile: (path: string) => Promise<string>;
+  transcribeFile: (path: string, opts?: TranscribeOptions) => Promise<Transcript>;
   /**
-   * Whether the whisper binary can run at all. Never throws.
+   * Whether a transcript could be produced at all right now. Never throws.
    *
-   * Memoized for `availabilityTtlMs`: this is what `whatsapp_health` and Task 14's `/health` report, both
-   * of which a model or a container healthcheck may poll freely, and an unmemoized probe forks a
-   * process on every one of those calls. The answer is near-constant in practice — the binary is
-   * baked into the image — so the TTL exists only so a repaired install is picked up without a
-   * restart, not because the value is expected to change.
+   * No longer forks a process — there is no binary. It is a configuration check plus a TTL-cached
+   * probe of the endpoint, so `whatsapp_health` and the container's own healthcheck can poll it
+   * freely.
    */
   available: () => Promise<boolean>;
 };
@@ -60,371 +81,142 @@ export type Transcriber = {
 export type TranscriberDeps = {
   config: Config;
   logger: Logger;
-  /** Injectable so tests can serve a model from memory instead of pulling 574 MB. */
+  /** Charged on every completed attempt. Optional so a test can run without a database. */
+  ledger?: BudgetLedger | undefined;
+  /** Injectable so tests can drive the whole chain without a network. */
   fetchImpl?: typeof fetch | undefined;
-  /** Injectable for the same reason: a test cannot afford to wait out the real budget. */
-  stallTimeoutMs?: number | undefined;
-  /** How long an `available()` answer is reused. Injectable so a test can watch the memo expire. */
-  availabilityTtlMs?: number | undefined;
 };
 
-/** Transcription could not be produced: no model, an over-long recording, or nothing said. */
+/** Transcription could not be produced: no backend, an over-long recording, or nothing said. */
 export class TranscriptionError extends Error {
   override name = "TranscriptionError";
 }
 
-const MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
-
-/** No bytes for this long means the connection is dead, however slow the link is supposed to be. */
-const DEFAULT_STALL_TIMEOUT_MS = 60_000;
-/** `--help` either answers immediately or the binary is broken; there is no slow success here. */
-const HELP_TIMEOUT_MS = 10_000;
 /**
- * How long one `--help` probe stands for the next answer.
+ * Which backends a lane may use.
  *
- * A minute is long enough that a health endpoint polled every few seconds forks once rather than
- * every time, and short enough that an operator who installs the missing binary sees the server
- * agree within a minute instead of after a restart.
+ * `background` is `runpod` only, and not by omission — see the file header. Expressed as a filter
+ * over the configured chain rather than a second list, so a deployment that reorders or disables a
+ * backend does not have to remember to do it twice.
  */
-const DEFAULT_AVAILABILITY_TTL_MS = 60_000;
-/**
- * Whisper's budget: ten times the recording, never less than a minute. Deliberately generous — the
- * NAS this deploys to has no GPU, and `large-v3-turbo` on a cold CPU is far slower than real time.
- */
-const WHISPER_TIMEOUT_FACTOR = 10;
-const WHISPER_MIN_TIMEOUT_MS = 60_000;
+const LANE_BACKENDS: Record<Lane, ReadonlySet<TranscribeBackend>> = {
+  interactive: new Set<TranscribeBackend>(["runpod", "mistral"]),
+  background: new Set<TranscribeBackend>(["runpod"]),
+};
 
 /**
- * Anything whisper.cpp puts in square brackets: `[00:00:00.000 --> 00:00:02.000]` timestamps and
- * `[MUSIQUE]` / `[BLANK_AUDIO]` non-speech tags alike. `-nt` already suppresses the timestamps, but
- * whisper.cpp's flags have moved between versions and a regex is cheaper than a version check.
+ * Audio this size or smaller is sent exactly as WhatsApp delivered it.
  *
- * Excluding newlines from the span is what bounds the damage: a stray `[` in real speech costs its
- * own line at worst, instead of swallowing every word up to the next bracket anywhere in the text.
+ * **A voice note needs no ffmpeg at all.** WhatsApp already sends 16 kbps mono Ogg/Opus, which is
+ * both smaller and higher fidelity than anything a re-encode would produce, and the worker
+ * normalises to 16 kHz mono on arrival regardless. Transcoding it would spend a process to make it
+ * slightly worse. Only a video, or an audio file large enough to threaten the payload cap, is
+ * converted.
  */
-const ANNOTATION_RE = /\[[^\]\n]*\]/g;
-
-/** Exported for tests: strip whisper.cpp's `[00:00:00.000 --> …]` timestamps and join lines. */
-export function cleanTranscript(raw: string): string {
-  return raw.replace(ANNOTATION_RE, " ").replace(/\s+/g, " ").trim();
-}
-
-function errnoOf(err: unknown): string | undefined {
-  if (typeof err !== "object" || err === null) return undefined;
-  const code: unknown = (err as { code?: unknown }).code;
-  return typeof code === "string" ? code : undefined;
-}
-
-function messageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-/**
- * Turn a filesystem failure during the download into an error that says which one it was.
- *
- * Exported for tests. ENOSPC is the case that matters — 574 MB onto a NAS volume that is nearly
- * full is a realistic first run, and "download failed" would send the reader to the network — and it
- * is also the one case a unit test cannot reach, since it cannot fill a disk. The test asserts this
- * mapping directly and proves the wiring with an EACCES download, which is reachable.
- */
-export function modelWriteError(err: unknown, path: string): TranscriptionError {
-  const code = errnoOf(err);
-  if (code === "ENOSPC") {
-    return new TranscriptionError(
-      `ENOSPC: the volume holding ${path} is full, and the whisper model needs several hundred megabytes free`,
-    );
-  }
-  return new TranscriptionError(
-    `writing the whisper model to ${path} failed${code === undefined ? "" : ` (${code})`}: ${messageOf(err)}`,
-  );
-}
-
-/**
- * A directory that could not be created, said as that rather than as a write failure.
- *
- * Both directories this module creates go through here. Routing either into `modelWriteError` would
- * report "writing the whisper model to <dir> failed" for a `mkdir`, sending the reader after a
- * download problem that does not exist — and for the scratch directory, after a download entirely.
- */
-function dirCreateError(err: unknown, path: string, what: string): TranscriptionError {
-  const code = errnoOf(err);
-  return new TranscriptionError(
-    `could not create the ${what} directory ${path}${code === undefined ? "" : ` (${code})`}: ${messageOf(err)}`,
-  );
-}
-
-/** Resolve `p`, or reject once `ms` pass with nothing having happened. */
-async function withStallTimeout<T>(p: Promise<T>, ms: number, url: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const stalled = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(new TranscriptionError(`the whisper model download stalled: no data for ${ms}ms from ${url}`));
-    }, ms);
-  });
-  try {
-    // `race` attaches handlers to both, so a rejection from `p` after the stall fires is still
-    // handled and cannot surface as an unhandled rejection.
-    return await Promise.race([p, stalled]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Sent so rule 4 stays armed. Undici's default is `gzip, deflate`, and any encoding at all makes the
- * `Content-Length` comparison below meaningless — so the length check, which is the only thing
- * standing between a truncated body and a model that looks installed forever, would be surrendered
- * to whatever a proxy felt like doing. Asking for `identity` keeps it. The model is already
- * compressed, so nothing is lost by refusing a second pass over it.
- */
-const IDENTITY_ENCODING = { "accept-encoding": "identity" } as const;
-
-/**
- * The body length the server promised, when the comparison is meaningful.
- *
- * `Content-Length` describes the *encoded* body. Behind a proxy that gzips the response anyway —
- * ignoring the `identity` we asked for — fetch hands us the decoded bytes and the two numbers
- * legitimately differ, so comparing them there would reject a perfectly good download every single
- * time and the model would never install. This is the fallback, not the plan.
- */
-function declaredBytes(res: Response): number | undefined {
-  if (res.headers.get("content-encoding") !== null) return undefined;
-  const raw = res.headers.get("content-length");
-  if (raw === null) return undefined;
-  const n = Number(raw);
-  return Number.isInteger(n) && n >= 0 ? n : undefined;
+function needsTranscode(mimetype: string | undefined, bytes: number): boolean {
+  if (bytes > MAX_PAYLOAD_BYTES * 0.7) return true;
+  return !mimetype?.startsWith("audio/");
 }
 
 export function makeTranscriber(deps: TranscriberDeps): Transcriber {
   const { config, logger } = deps;
-  const doFetch = deps.fetchImpl ?? fetch;
-  const stallTimeoutMs = deps.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
-  const availabilityTtlMs = deps.availabilityTtlMs ?? DEFAULT_AVAILABILITY_TTL_MS;
+  const fetchImpl = deps.fetchImpl ?? fetch;
 
-  const modelsDir = join(config.dataDir, "models");
-  const modelPath = join(modelsDir, `ggml-${config.whisperModel}.bin`);
-  const partPath = `${modelPath}.part`;
-  const modelUrl = `${MODEL_BASE_URL}/ggml-${config.whisperModel}.bin`;
+  const byName: Record<TranscribeBackend, Backend> = {
+    runpod: makeRunpodBackend(config, logger, fetchImpl),
+    mistral: makeMistralBackend(config, logger, fetchImpl),
+  };
+  /** The configured chain, in order, minus anything that has no credentials to be tried with. */
+  const chain = config.transcribeBackends.map((name) => byName[name]);
   const tmpDir = join(config.dataDir, "tmp");
 
-  let inFlight: Promise<string> | undefined;
-  /** The last `--help` probe and when it was started. `undefined` until the first call. */
-  let availability: { startedAtMs: number; probe: Promise<boolean> } | undefined;
-
-  /** Run one filesystem step, labelling any failure with the errno it carried. */
-  async function fsStep<T>(path: string, step: () => Promise<T>): Promise<T> {
-    try {
-      return await step();
-    } catch (err) {
-      throw modelWriteError(err, path);
-    }
-  }
-
-  /**
-   * Write every byte of `chunk`, looping over a short write, and report how many really landed.
-   *
-   * `write(2)` on a regular file is allowed to accept less than it was handed — classically when the
-   * volume fills mid-write. Adding the chunk's length instead of the returned count would over-count:
-   * with a `Content-Length` that fails safe, since the size check then calls the download truncated,
-   * but *without* one it silently installs a short model, which is the exact outcome rule 4 exists to
-   * prevent.
-   */
-  async function writeAll(handle: FileHandle, chunk: Uint8Array): Promise<number> {
-    let offset = 0;
-    while (offset < chunk.byteLength) {
-      const { bytesWritten } = await handle.write(chunk, offset, chunk.byteLength - offset);
-      // A write that accepts nothing has no progress to wait for, and retrying it forever would
-      // turn a full volume into a wedged tool call. Fail instead; `modelWriteError` labels it.
-      if (bytesWritten <= 0) {
-        throw new Error(`the volume accepted 0 of the ${chunk.byteLength - offset} bytes still to write`);
-      }
-      offset += bytesWritten;
-    }
-    return offset;
-  }
-
-  /**
-   * One read from the body, with a mid-transfer failure told as what it is.
-   *
-   * This is the likeliest real failure of a 574 MB download, and undici reports it as a bare
-   * `TypeError: terminated` or `Error: aborted` — a single word, to an operator who then has no idea
-   * whether the network, the disk or the model name was at fault. It is also not a
-   * `TranscriptionError`, which is what `ensureModel` documents that it throws. The stall budget
-   * already produces its own `TranscriptionError` and passes through untouched.
-   *
-   * Takes the read as a thunk rather than the reader itself so the chunk type comes from the call
-   * site: `getReader`'s overloads make any hand-written reader type resolve to the BYOB one.
-   */
-  async function readChunk<T>(read: () => Promise<T>, soFar: number): Promise<T> {
-    try {
-      return await withStallTimeout(read(), stallTimeoutMs, modelUrl);
-    } catch (err) {
-      if (err instanceof TranscriptionError) throw err;
-      throw new TranscriptionError(
-        `the whisper model transfer from ${modelUrl} was interrupted after ${soFar} bytes: ${messageOf(err)}. ` +
-          `Nothing is resumed: the partial file is discarded and the next attempt restarts from zero.`,
-      );
-    }
-  }
-
-  /** Stream a response body into the `.part` file, returning the number of bytes written. */
-  async function streamToPart(res: Response): Promise<number> {
-    // Annotated rather than inferred: `Response.body` is typed `ReadableStream<any>`, and letting
-    // that `any` reach the write loop would silence every check on the chunks themselves.
-    const body: ReadableStream<Uint8Array> | null = res.body;
-    if (body === null) throw new TranscriptionError(`${modelUrl} answered with no body at all`);
-
-    const reader = body.getReader();
-    let written = 0;
-    try {
-      // "wx" rather than "w" on purpose: it makes the stale-`.part` removal above load-bearing
-      // instead of decorative. A leftover file fails the open loudly rather than being silently
-      // truncated, so the never-resume rule cannot be quietly lost in a later edit.
-      const handle = await fsStep(partPath, () => open(partPath, "wx"));
-      try {
-        for (;;) {
-          const chunk = await readChunk(() => reader.read(), written);
-          if (chunk.done) break;
-          // Streamed, never buffered: the whole point is not to hold 574 MB in memory on a NAS.
-          written += await fsStep(partPath, () => writeAll(handle, chunk.value));
-        }
-        await fsStep(partPath, () => handle.sync());
-      } finally {
-        // Swallowed on purpose: the explicit `sync` above is what surfaces a deferred write error,
-        // so a throw from `close` here could only replace the real failure with a worse one.
-        await handle.close().catch(() => undefined);
-      }
-    } finally {
-      // Releases the socket when the loop exited early; a no-op once the body is exhausted.
-      await reader.cancel().catch(() => undefined);
-    }
-    return written;
-  }
-
-  async function downloadModel(): Promise<string> {
-    try {
-      await mkdir(modelsDir, { recursive: true });
-    } catch (err) {
-      throw dirCreateError(err, modelsDir, "whisper model");
-    }
-    // Never resume. A `.part` here is the debris of a crash, and appending to it produces a model
-    // that is corrupt in a way whisper reports unintelligibly.
-    await unlink(partPath).catch(() => undefined);
-
-    let res: Response;
-    try {
-      res = await doFetch(modelUrl, { headers: IDENTITY_ENCODING });
-    } catch (err) {
-      throw new TranscriptionError(`could not reach ${modelUrl} to download the whisper model: ${messageOf(err)}`);
-    }
-
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => undefined);
-      throw new TranscriptionError(
-        `${modelUrl} returned HTTP ${res.status}, so the whisper model could not be downloaded. ` +
-          `A 404 means WHATSAPP_WHISPER_MODEL names a model this repository does not publish ` +
-          `(it is currently ${JSON.stringify(config.whisperModel)}).`,
-      );
-    }
-
-    const declared = declaredBytes(res);
-    logger.info(
-      { model: config.whisperModel, url: modelUrl, bytes: declared },
-      "transcribe: downloading the whisper model",
+  if (chain.every((backend) => !backend.configured())) {
+    logger.warn(
+      { backends: config.transcribeBackends },
+      "transcribe: no backend is configured; whatsapp_transcribe will fail until one is",
     );
-
-    let written: number;
-    try {
-      written = await streamToPart(res);
-      if (declared !== undefined && written !== declared) {
-        throw new TranscriptionError(
-          `the whisper model download is truncated: ${modelUrl} promised ${declared} bytes and delivered ${written}`,
-        );
-      }
-      await fsStep(modelPath, () => rename(partPath, modelPath));
-    } catch (err) {
-      // Leaving the `.part` behind would poison the next attempt's exclusive open.
-      await unlink(partPath).catch(() => undefined);
-      throw err;
-    }
-
-    logger.info({ model: config.whisperModel, path: modelPath, bytes: written }, "transcribe: whisper model ready");
-    return modelPath;
   }
 
-  async function ensureModel(): Promise<string> {
-    const existing = await stat(modelPath).catch(() => undefined);
-    if (existing?.isFile() === true && existing.size > 0) return modelPath;
-
-    // One download for however many callers arrive during it. `finally` clears the slot on failure
-    // as well as on success: a cached rejected promise would make every later call re-reject with
-    // the first failure forever, and the retry would never happen.
-    const pending = (inFlight ??= downloadModel().finally(() => {
-      inFlight = undefined;
-    }));
-    return await pending;
-  }
-
-  async function transcribeFile(path: string): Promise<string> {
-    const duration = await probeDuration(path);
-    if (duration !== undefined && duration > config.whisperMaxSeconds) {
-      throw new TranscriptionError(
-        `this recording is ${duration.toFixed(1)}s long, over the ${config.whisperMaxSeconds}s transcription ` +
-          `limit; raise WHATSAPP_WHISPER_MAX_SECONDS to transcribe recordings this long`,
-      );
+  /** The bytes to send, transcoding into the scratch directory only when there is a reason to. */
+  async function payloadOf(path: string, mimetype: string | undefined): Promise<{ data: Uint8Array; name: string }> {
+    const info = await stat(path).catch(() => undefined);
+    const bytes = info?.size ?? 0;
+    if (!needsTranscode(mimetype, bytes)) {
+      return { data: await readFile(path), name: "note.ogg" };
     }
-
-    const model = await ensureModel();
+    await mkdir(tmpDir, { recursive: true }).catch((err: unknown) => {
+      throw new TranscriptionError(`could not create the transcription scratch directory ${tmpDir}: ${String(err)}`);
+    });
+    const out = join(tmpDir, `transcribe-${randomUUID()}.ogg`);
     try {
-      await mkdir(tmpDir, { recursive: true });
-    } catch (err) {
-      throw dirCreateError(err, tmpDir, "transcription scratch");
-    }
-    const wav = join(tmpDir, `whisper-${randomUUID()}.wav`);
-    const timeoutMs = Math.max(WHISPER_MIN_TIMEOUT_MS, Math.ceil((duration ?? 0) * WHISPER_TIMEOUT_FACTOR) * 1000);
-
-    try {
-      await toWav16k(path, wav);
-      logger.info({ path, seconds: duration, timeoutMs }, "transcribe: running whisper");
-      const { stdout } = await runTool(
-        config.whisperBin,
-        ["-m", model, "-f", wav, "-t", String(config.whisperThreads), "-nt", "-l", "auto"],
-        timeoutMs,
-      );
-      const text = cleanTranscript(stdout.toString("utf8"));
-      if (text === "") throw new TranscriptionError("whisper found no speech in this recording");
-      logger.info({ path, chars: text.length }, "transcribe: whisper finished");
-      return text;
+      await toOpus16k(path, out);
+      return { data: await readFile(out), name: "note.ogg" };
     } finally {
-      // The data volume is not a scratch disk: a wav left here on every failure fills it up.
-      await unlink(wav).catch(() => undefined);
+      // The data volume is not a scratch disk: a leftover file on every failure fills it up.
+      await unlink(out).catch(() => undefined);
     }
   }
 
-  async function probeWhisper(): Promise<boolean> {
-    try {
-      await runTool(config.whisperBin, ["--help"], HELP_TIMEOUT_MS);
-      return true;
-    } catch {
-      // Deliberately swallowed: this is the readiness probe `whatsapp_health` calls, and a probe that
-      // throws would turn "transcription is unavailable" into "health checks are broken".
-      return false;
+  async function transcribeFile(path: string, opts: TranscribeOptions = {}): Promise<Transcript> {
+    const duration = await probeDuration(path).catch(() => undefined);
+    if (duration !== undefined && duration > config.transcribeMaxSeconds) {
+      throw new TranscriptionError(
+        `this recording is ${duration.toFixed(1)}s long, over the ${config.transcribeMaxSeconds}s ` +
+          "transcription limit; raise WHATSAPP_TRANSCRIBE_MAX_SECONDS to transcribe recordings this long",
+      );
     }
+
+    const lane = opts.lane ?? "interactive";
+    const allowed = LANE_BACKENDS[lane];
+    const eligible = chain.filter((backend) => allowed.has(backend.name) && backend.configured());
+    if (eligible.length === 0) {
+      throw new TranscriptionError(
+        `no transcription backend is available for the ${lane} lane. Configured: ` +
+          `${config.transcribeBackends.join(", ")}; the ${lane} lane may use ${[...allowed].join(", ")}.`,
+      );
+    }
+
+    const { data, name } = await payloadOf(path, opts.mimetype);
+    const input = {
+      data,
+      filename: name,
+      language: opts.language ?? null,
+      biasTerms: opts.biasTerms ?? [],
+    };
+
+    const failures: string[] = [];
+    for (const backend of eligible) {
+      try {
+        const result = await backend.transcribe(input);
+        // Charged whichever backend answered and whichever lane asked. Only RunPod's wall time is
+        // really billed by the second, but the ledger's own cold-burst rule is what turns that into
+        // a number — see `budget.ts`.
+        if (backend.name === "runpod") {
+          deps.ledger?.record({ submittedAtMs: result.submittedAtMs, completedAtMs: result.completedAtMs });
+        }
+        logger.info(
+          { backend: backend.name, model: result.model, chars: result.text.length, lane },
+          "transcribe: finished",
+        );
+        return { text: result.text, model: result.model, language: result.language };
+      } catch (err) {
+        if (!(err instanceof BackendError)) throw err;
+        failures.push(`${err.backend}: ${err.message}`);
+        logger.warn({ backend: err.backend, retryable: err.retryable, lane }, "transcribe: a backend failed");
+      }
+    }
+
+    // Every failure, not just the last: with a chain, the last one is usually the least informative
+    // — "MISTRAL_API_KEY is not set" tells an operator nothing about why the endpoint refused.
+    throw new TranscriptionError(`every transcription backend failed. ${failures.join(" | ")}`);
   }
 
-  function available(): Promise<boolean> {
-    const startedAtMs = Date.now();
-    // The *promise* is what is cached, not its value, so callers arriving while a probe is still
-    // running share it instead of each forking their own. Unlike `ensureModel`'s `inFlight`, caching
-    // it past settlement is safe here precisely because `probeWhisper` never rejects: there is no
-    // failure to make permanent, only a `false` that expires with the TTL like any other answer.
-    if (availability !== undefined && startedAtMs - availability.startedAtMs < availabilityTtlMs) {
-      return availability.probe;
+  async function available(): Promise<boolean> {
+    for (const backend of chain) {
+      if (backend.configured() && (await backend.healthy())) return true;
     }
-    const probe = probeWhisper();
-    availability = { startedAtMs, probe };
-    return probe;
+    return false;
   }
 
-  return { ensureModel, transcribeFile, available };
+  return { transcribeFile, available };
 }

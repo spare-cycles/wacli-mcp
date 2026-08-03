@@ -110,6 +110,7 @@ function rig(broken: { http?: boolean; conn?: boolean } = {}): Rig {
   } satisfies WhatsAppConnection;
   const alerter: Alerter = {
     onState: () => undefined,
+    notify: () => undefined,
     selfTest: () => Promise.resolve(),
     stop: () => {
       order.push("alerter");

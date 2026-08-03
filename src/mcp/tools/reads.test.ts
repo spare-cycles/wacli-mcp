@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { loadConfig } from "../../config.js";
 import type { MessageKind } from "../../db/messages.js";
+import { SCHEMA_VERSION } from "../../db/schema.js";
 import type { ToolContext } from "../context.js";
 import { decodeCursor } from "../cursor.js";
 import { harness, resultJson, resultPage, resultText } from "./harness.js";
@@ -92,8 +93,11 @@ void test("whatsapp_health reports the connection state and row counts without a
   assert.equal(data["connection"], "disconnected");
   assert.equal(typeof data["counts"], "object");
   assert.deepEqual(data["counts"], { chats: 1, messages: 1, contacts: 0 });
-  assert.equal(data["schema_version"], 1);
+  assert.equal(data["schema_version"], SCHEMA_VERSION);
   assert.equal(data["read_only"], false);
+  // `null`, not an all-zero object: "nothing queued" and "the feature is off" are different
+  // answers, and only one of them makes an empty queue worth investigating.
+  assert.equal(data["auto_transcribe"], null);
   assert.equal(data["needs_pairing"], false);
   assert.equal(data["self_id"], "33600000000@s.whatsapp.net");
   await h.close();
@@ -518,7 +522,7 @@ void test("whatsapp_messages_search returns transcript hits labelled as such", a
         { id: "T1", ts: 10, text: "hello bonjour written down" },
         { id: "V1", ts: 20, kind: "audio", text: null },
       ]);
-      ctx.messages.setTranscript(ALICE, "V1", "bonjour tout le monde");
+      ctx.messages.setTranscript(ALICE, "V1", "bonjour tout le monde", "test-model");
     },
   });
 
@@ -555,8 +559,8 @@ void test("a transcript hit is labelled as one even when the message carries tex
         { id: "C1", ts: 10, kind: "video", text: "voici la legende de ma video sans le mot" },
         { id: "E1", ts: 20, kind: "audio", text: "" },
       ]);
-      ctx.messages.setTranscript(ALICE, "C1", "bonjour tout le monde");
-      ctx.messages.setTranscript(ALICE, "E1", "bonjour les amis");
+      ctx.messages.setTranscript(ALICE, "C1", "bonjour tout le monde", "test-model");
+      ctx.messages.setTranscript(ALICE, "E1", "bonjour les amis", "test-model");
     },
   });
 

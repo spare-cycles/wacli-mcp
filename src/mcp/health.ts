@@ -22,6 +22,24 @@ export type HealthReport = {
   counts: { chats: number; messages: number; contacts: number };
   schema_version: number;
   transcription_available: boolean;
+  /**
+   * The background transcription lane, or `null` when the deployment does not run one.
+   *
+   * `null` rather than an all-zero object on purpose: "nothing queued" and "the feature is off" are
+   * different answers, and only one of them means an empty queue is worth investigating. The budget
+   * figures are here because a cap that has been hit is invisible from anywhere else — the tool
+   * still works, and only the background lane has quietly stopped.
+   */
+  auto_transcribe: {
+    enabled: boolean;
+    queued: number;
+    in_flight: number;
+    transcribed_last_hour: number;
+    budget_day: string;
+    budget_spent_usd: number;
+    budget_usd: number;
+    budget_exhausted: boolean;
+  } | null;
   read_only: boolean;
 };
 
@@ -36,6 +54,7 @@ export type HealthReport = {
 export async function buildHealth(ctx: ToolContext): Promise<HealthReport> {
   const snap = ctx.conn.snapshot();
   const nowSec = Math.floor(Date.now() / 1000);
+  const auto = ctx.autoTranscriber?.snapshot();
 
   return {
     ok: snap.state !== "logged_out",
@@ -56,6 +75,19 @@ export async function buildHealth(ctx: ToolContext): Promise<HealthReport> {
     counts: { chats: ctx.chats.count(), messages: ctx.messages.count(), contacts: ctx.contacts.count() },
     schema_version: ctx.meta.schemaVersion(),
     transcription_available: await ctx.transcriber.available(),
+    auto_transcribe:
+      auto === undefined
+        ? null
+        : {
+            enabled: auto.enabled,
+            queued: auto.queued,
+            in_flight: auto.inFlight,
+            transcribed_last_hour: auto.transcribedLastHour,
+            budget_day: auto.budget.day,
+            budget_spent_usd: auto.budget.spentUsd,
+            budget_usd: auto.budget.budgetUsd,
+            budget_exhausted: auto.budget.exhausted,
+          },
     read_only: ctx.config.readOnly,
   };
 }

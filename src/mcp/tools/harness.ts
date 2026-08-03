@@ -31,6 +31,7 @@ import { makeContactsRepo } from "../../db/contacts.js";
 import { makeMessagesRepo } from "../../db/messages.js";
 import { makeMetaRepo } from "../../db/meta.js";
 import { makeReactionsRepo } from "../../db/reactions.js";
+import { silentLogger } from "../../logger.js";
 import type { MediaFile, MediaStore } from "../../media/store.js";
 import type { Transcriber } from "../../media/transcribe.js";
 import {
@@ -139,10 +140,12 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
   };
 
   const transcriber: Transcriber = {
-    ensureModel: () => Promise.resolve(join(dir, "models", "x.bin")),
     transcribeFile: () => {
       transcribeCalls.n++;
-      return Promise.resolve("transcrit");
+      // A named model, not a placeholder: `whatsapp_transcribe` writes this into
+      // `messages.transcript_model`, and a test that asserted on an empty string would pass just as
+      // happily if the provenance were dropped on the way through.
+      return Promise.resolve({ text: "transcrit", model: "test-model", language: "fr" });
     },
     available: () => Promise.resolve(opts.transcriptionAvailable ?? true),
   };
@@ -159,6 +162,10 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
     sender,
     media,
     transcriber,
+    // Empty rather than the real builder: biasing is a hint, every backend may ignore it, and a
+    // tool test that depended on which terms came back would be asserting on `bias.ts` from the
+    // wrong file. `bias.test.ts` covers the extraction itself.
+    biasTermsFor: () => [],
     ...opts.overrides,
   };
 
@@ -187,12 +194,6 @@ export async function harness(opts: HarnessOptions = {}): Promise<Harness> {
  * A pino-shaped no-op. Tests assert on results, not on log lines, and a real pino instance would
  * write every `logger.info` to the test runner's stdout.
  */
-function silentLogger(): ToolContext["logger"] {
-  const noop = (): void => undefined;
-  const self = { info: noop, warn: noop, error: noop, debug: noop, trace: noop, fatal: noop, level: "silent" };
-  return { ...self, child: () => self } as unknown as ToolContext["logger"];
-}
-
 /**
  * Whatever `client.callTool` came back with.
  *
