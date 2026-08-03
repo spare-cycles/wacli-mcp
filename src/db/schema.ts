@@ -2,7 +2,7 @@ import type { Db } from "./client.js";
 
 export type Migration = { version: number; sql: string };
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const V1_SQL = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -83,7 +83,45 @@ CREATE TABLE auth_creds (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE auth_keys (type TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (type, id)) STRICT;
 `;
 
-export const MIGRATIONS: readonly Migration[] = [{ version: 1, sql: V1_SQL }];
+/**
+ * What moving transcription onto a GPU needs the store to know, and V1 had no way to say.
+ *
+ * Three columns, each of which an auto-transcribe gate is otherwise unimplementable without:
+ *
+ * 1. **`ptt`** — `kind` cannot identify a voice note. `audioMessage` maps to `"audio"`
+ *    (`whatsapp/ingest.ts`), which covers a forwarded song and a podcast attachment equally, and
+ *    transcribing those on arrival is exactly the waste the gates exist to prevent. Baileys'
+ *    `ptt` boolean is the discriminator and was never persisted.
+ * 2. **`duration_s`** — the length gate could otherwise only run *after* downloading the file and
+ *    probing it, which inverts the gate it exists to be: the whole point is to refuse before
+ *    spending anything. `audioMessage.seconds` is on the live message; this stores it.
+ * 3. **`transcript_model`** — without it, a whisper.cpp-era transcript, a Voxtral one and whatever
+ *    the bench picks next are indistinguishable in one bare `transcript` column, with no way to
+ *    know what is worth re-transcribing. Every row already in the store is a whisper.cpp one, and
+ *    this migration deliberately leaves those NULL rather than back-filling a guess.
+ *
+ * `ALTER TABLE … ADD COLUMN` is legal on a STRICT table, and adding a column does not disturb the
+ * FTS triggers above: all three name `text` and `transcript` explicitly, so neither the shadow
+ * table's shape nor the `INSERT … VALUES` in each trigger changes.
+ *
+ * The partial index is what the boot sweep reads. Partial rather than a plain index on `ptt`
+ * because the sweep only ever asks for the untranscribed ones, and the store is overwhelmingly
+ * text: indexing every row to find the handful that qualify would cost far more than it saves.
+ */
+const V2_SQL = `
+ALTER TABLE messages ADD COLUMN ptt INTEGER;
+ALTER TABLE messages ADD COLUMN duration_s INTEGER;
+ALTER TABLE messages ADD COLUMN transcript_model TEXT;
+
+CREATE INDEX messages_pending_transcript
+    ON messages (ts DESC)
+ WHERE ptt = 1 AND transcript IS NULL AND deleted_ts IS NULL;
+`;
+
+export const MIGRATIONS: readonly Migration[] = [
+  { version: 1, sql: V1_SQL },
+  { version: 2, sql: V2_SQL },
+];
 
 /** The `meta` table itself is created by migration 1, so its absence means version 0. */
 function currentVersion(db: Db): number {

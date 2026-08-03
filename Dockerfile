@@ -1,22 +1,21 @@
-# whatsapp-mcp container image — one Node 24 process, ffmpeg, pdftotext, and a prebuilt whisper.cpp.
+# whatsapp-mcp container image — one Node 24 process, ffmpeg and pdftotext.
 #
-# There is no compiler in this file. The server is TypeScript, storage is `node:sqlite` (built in),
-# and whisper.cpp arrives as binaries copied out of an upstream image — so the whole build is
-# `pnpm install && tsc` plus two `COPY`s. Deliberate: a whisper.cpp compile stage would cost minutes
-# per build and pull a C++ toolchain into a tree that otherwise has none.
+# There is no compiler in this file: the server is TypeScript and storage is `node:sqlite` (built
+# in), so the whole build is `pnpm install && tsc`.
 #
-# amd64 only, because the whisper.cpp image is amd64 only. That is the deployment target.
+# ⚠️ **whisper.cpp used to live here and is gone.** Transcription runs on a RunPod serverless
+# endpoint now (Voxtral Small 24B on an A100), so the prebuilt whisper.cpp stage, the ~200 MB of
+# binaries it copied in, `libgomp1` and `LD_LIBRARY_PATH` all left with it — along with the amd64-only
+# constraint that image imposed, which is why this now builds for arm64 too. What did NOT leave is
+# ffmpeg: it still transcodes a video's audio track before upload, and poppler-utils still backs
+# `pdftotext`.
 #
 # Build and run (mount a volume for the store; the first run pairs — see README.md):
 #   docker build -t whatsapp-mcp:latest .
 #   docker run --rm -p 8080:8080 -v whatsapp-data:/data/whatsapp \
 #     -e WHATSAPP_MCP_TOKEN=… -e WHATSAPP_PHONE_NUMBER=… whatsapp-mcp:latest
 
-# ── 1) whisper.cpp binaries (prebuilt, amd64) ────────────────────────────────
-# Pinned by digest: the :main tag moves. Ubuntu 22.04/glibc 2.35 -> bookworm/2.36 is forward-compatible.
-FROM ghcr.io/ggml-org/whisper.cpp@sha256:375cf0e9e4b5598454493878ce09c4de72ed3e4ed8f41e77a25e1acd9b4112b5 AS whisper
-
-# ── 2) Build the server ──────────────────────────────────────────────────────
+# ── 1) Build the server ──────────────────────────────────────────────────────
 FROM node:24-slim AS build
 RUN corepack enable
 WORKDIR /app
@@ -26,16 +25,13 @@ COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 RUN pnpm build && pnpm prune --prod
 
-# ── 3) Runtime ───────────────────────────────────────────────────────────────
+# ── 2) Runtime ───────────────────────────────────────────────────────────────
 FROM node:24-slim
-# ffmpeg: keyframes, wav conversion, voice notes. poppler-utils: pdftotext.
-# libgomp1: required by whisper-cli, absent from node:*-slim.
+# ffmpeg: keyframes, dimensions, durations, and the Opus transcode a video's audio track needs
+# before it is uploaded for transcription. poppler-utils: pdftotext.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg poppler-utils libgomp1 ca-certificates \
+ && apt-get install -y --no-install-recommends ffmpeg poppler-utils ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-# whisper-cli is dynamically linked against libwhisper/libggml* living beside it — copy the directory.
-COPY --from=whisper /app/build/bin /opt/whisper/bin
-ENV LD_LIBRARY_PATH=/opt/whisper/bin
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
@@ -43,7 +39,6 @@ COPY package.json ./
 RUN mkdir -p /data/whatsapp && chown -R node:node /data/whatsapp
 ENV NODE_ENV=production \
     WHATSAPP_DATA_DIR=/data/whatsapp \
-    WHATSAPP_WHISPER_BIN=/opt/whisper/bin/whisper-cli \
     PORT=8080
 USER node
 EXPOSE 8080

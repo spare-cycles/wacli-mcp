@@ -33,6 +33,9 @@ import { makeMetaRepo } from "./db/meta.js";
 import { makeReactionsRepo } from "./db/reactions.js";
 import { startHttp, type HttpHandle } from "./http.js";
 import { logger } from "./logger.js";
+import { makeAutoTranscriber, type AutoTranscriber } from "./media/autotranscribe.js";
+import { biasTermsFor } from "./media/bias.js";
+import { makeBudgetLedger } from "./media/budget.js";
 import { makeMediaStore } from "./media/store.js";
 import { makeTranscriber } from "./media/transcribe.js";
 import type { ToolContext } from "./mcp/context.js";
@@ -49,6 +52,8 @@ export type ShutdownDeps = {
   conn: WhatsAppConnection;
   alerter: Alerter;
   db: Db;
+  /** Absent when the deployment runs no background transcription. */
+  autoTranscriber?: AutoTranscriber | undefined;
   /** Seam: the real one is `process.exit`, which a test cannot call. */
   exit: (code: number) => void;
 };
@@ -84,6 +89,13 @@ export async function shutdown(deps: ShutdownDeps, signal: StopSignal): Promise<
   log.info({ signal }, "main: shutting down");
 
   await step(log, "http", () => deps.http.close());
+  // Before the connection, and before the database: a queued job that started after `closeDb` would
+  // write a transcript into a closed handle. Dropping the queue is the right loss — every job in it
+  // is still `transcript IS NULL` in the store, so the next boot's sweep picks it up.
+  await step(log, "autotranscribe", () => {
+    deps.autoTranscriber?.stop();
+    return Promise.resolve();
+  });
   await step(log, "connection", () => deps.conn.stop());
   await step(log, "alerts", () => {
     deps.alerter.stop();
@@ -137,7 +149,25 @@ export async function bootstrap(): Promise<void> {
   let live: WhatsAppConnection | undefined = undefined;
   const selfId = (): string | null => live?.snapshot().selfId ?? null;
 
-  const ingest = makeIngest({ db, chats, contacts, messages, reactions, logger, selfId });
+  /**
+   * The second cycle in the wiring, and it has the same shape as the first.
+   *
+   * `ingest` hands newly-stored voice notes to the auto-transcriber, and the auto-transcriber needs
+   * the media store and the transcriber — both of which need `conn`, which needs `ingest.attach`.
+   * A `let` plus a closure that reads it at call time resolves it, exactly as `selfId` does above.
+   */
+  let autoTranscriber: AutoTranscriber | undefined = undefined;
+
+  const ingest = makeIngest({
+    db,
+    chats,
+    contacts,
+    messages,
+    reactions,
+    logger,
+    selfId,
+    onVoiceNotes: (notes) => autoTranscriber?.enqueue(notes),
+  });
   const conn = makeConnection({ config, logger, auth, loadMessage, onSocket: ingest.attach });
   live = conn;
 
@@ -151,10 +181,29 @@ export async function bootstrap(): Promise<void> {
     sendFileDir: config.sendFileDir,
   });
   const media = makeMediaStore({ dir: config.mediaDir, messages, conn, logger });
-  const transcriber = makeTranscriber({ config, logger });
 
   const alerter = makeAlerter({ config, logger });
   conn.onStateChange(alerter.onState);
+
+  // Constructed before the transcriber, which charges every completed job against it, and shared
+  // with the auto-transcriber, which reads it as a gate. One ledger for both lanes: on-demand
+  // transcription costs the same dollars, and a cap that could not see it would under-report
+  // exactly when someone was using the tool heavily.
+  const ledger = makeBudgetLedger({ config, meta, logger, notify: alerter.notify });
+  const transcriber = makeTranscriber({ config, logger, ledger });
+  const chatBiasTerms = (chatId: string): readonly string[] => biasTermsFor(chatId, { messages, contacts });
+
+  if (config.autoTranscribe.enabled) {
+    autoTranscriber = makeAutoTranscriber({
+      config,
+      logger,
+      messages,
+      media,
+      transcriber,
+      ledger,
+      biasTermsFor: chatBiasTerms,
+    });
+  }
 
   const ctx: ToolContext = {
     config,
@@ -168,6 +217,8 @@ export async function bootstrap(): Promise<void> {
     sender,
     media,
     transcriber,
+    biasTermsFor: chatBiasTerms,
+    autoTranscriber,
   };
 
   const http = await startHttp({
@@ -177,14 +228,27 @@ export async function bootstrap(): Promise<void> {
     health: () => buildHealth(ctx),
   });
 
-  installProcessHandlers({ logger, http, conn, alerter, db, exit: (code) => process.exit(code) });
+  installProcessHandlers({ logger, http, conn, alerter, db, autoTranscriber, exit: (code) => process.exit(code) });
 
   // Fire and forget: it proves the ntfy token and the egress work before the first real incident,
   // and it must not delay the connection if ntfy is slow or down.
   void alerter.selfTest();
 
+  // After the server is listening and before the socket opens: the sweep reads SQLite and enqueues,
+  // so it needs nothing from WhatsApp, and doing it first means a restart mid-backlog resumes
+  // rather than waiting for the next voice note to arrive.
+  autoTranscriber?.sweep();
+
   await conn.start();
-  logger.info({ readOnly: config.readOnly, dataDir: config.dataDir }, "main: started");
+  logger.info(
+    {
+      readOnly: config.readOnly,
+      dataDir: config.dataDir,
+      transcribeBackends: config.transcribeBackends,
+      autoTranscribe: config.autoTranscribe.enabled,
+    },
+    "main: started",
+  );
 }
 
 export function installProcessHandlers(deps: ShutdownDeps, proc: ProcessEvents = process): void {

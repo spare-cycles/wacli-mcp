@@ -12,7 +12,10 @@ void test("defaults are applied", () => {
   assert.equal(c.port, 8080);
   assert.equal(c.httpPath, "/mcp");
   assert.equal(c.readOnly, false);
-  assert.equal(c.whisperModel, "large-v3-turbo-q5_0");
+  assert.deepEqual(c.transcribeBackends, ["runpod", "mistral"]);
+  assert.equal(c.transcribeMaxSeconds, 900);
+  // Off in code, on in the deployment: a fresh checkout must never start spending on a GPU.
+  assert.equal(c.autoTranscribe.enabled, false);
   assert.equal(c.videoKeyframes, 4);
   assert.equal(c.maxResultChars, 200_000);
   assert.equal(c.ntfy, undefined);

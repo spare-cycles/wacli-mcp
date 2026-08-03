@@ -202,7 +202,7 @@ void test("search still excludes revoked rows once the tombstone clause moved in
 void test("search finds transcripts and flags them", () => {
   const r = repo();
   r.upsert(msg({ id: "V1", kind: "audio", text: undefined }));
-  r.setTranscript("c", "V1", "on se retrouve demain");
+  r.setTranscript("c", "V1", "on se retrouve demain", "test-model");
   const hits = r.search("demain", {}, 10, 0);
   assert.equal(hits.length, 1);
   assert.equal(hits[0]?.matchedTranscript, true);
@@ -214,7 +214,7 @@ void test("a transcript hit on a message with an empty text is still a transcrip
   // only for NULL would call this a text hit and return a blank snippet.
   const r = repo();
   r.upsert(msg({ id: "V1", kind: "audio", text: "" }));
-  r.setTranscript("c", "V1", "on se retrouve demain");
+  r.setTranscript("c", "V1", "on se retrouve demain", "test-model");
   const hit = r.search("demain", {}, 10, 0)[0];
   assert.equal(hit?.matchedTranscript, true);
   assert.match(hit.snippet, /demain/);
@@ -227,7 +227,7 @@ void test("a caption that does not match leaves the transcript hit labelled as o
   // shape for this: real text of its own, and the words the caller searched for only in the speech.
   const r = repo();
   r.upsert(msg({ id: "V1", kind: "video", text: "voici la legende de ma video sans le mot" }));
-  r.setTranscript("c", "V1", "on se retrouve demain");
+  r.setTranscript("c", "V1", "on se retrouve demain", "test-model");
   const hit = r.search("demain", {}, 10, 0)[0];
   assert.equal(hit?.matchedTranscript, true, "the words are in the speech, not in the caption");
   assert.match(hit.snippet, /demain/, "a snippet that does not contain the hit is worse than no snippet");
@@ -240,7 +240,7 @@ void test("a marker character typed by a sender cannot fake a text match", () =>
   // words — the very mislabelling the marker rule replaced "is the snippet empty?" to prevent.
   const r = repo();
   r.upsert(msg({ id: "V1", kind: "video", text: "\u0001voici la legende de ma video sans le mot" }));
-  r.setTranscript("c", "V1", "on se retrouve demain");
+  r.setTranscript("c", "V1", "on se retrouve demain", "test-model");
   const hit = r.search("demain", {}, 10, 0)[0];
   assert.equal(hit?.matchedTranscript, true, "the words are in the speech; the SOH in the caption is not a match");
   assert.match(hit.snippet, /demain/);
@@ -254,7 +254,7 @@ void test("a marker in the column that did match costs the label rather than mis
   // spoken rather than typed, and unknown is worth more to it than confidently wrong.
   const r = repo();
   r.upsert(msg({ id: "V1", kind: "audio", text: undefined }));
-  r.setTranscript("c", "V1", "\u0001on se retrouve demain");
+  r.setTranscript("c", "V1", "\u0001on se retrouve demain", "test-model");
   const hit = r.search("demain", {}, 10, 0)[0];
   assert.equal(hit?.id, "V1", "the row is still found — only the attribution is withheld");
   assert.equal(hit.matchedTranscript, false);

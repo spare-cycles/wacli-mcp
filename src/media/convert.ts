@@ -269,13 +269,24 @@ export async function videoKeyframes(
 }
 
 /**
- * Re-encode any audio (including a video's audio track — hence `-vn`) as 16 kHz mono PCM, the only
- * input format whisper.cpp accepts.
+ * Re-encode any audio (including a video's audio track — hence `-vn`) as 16 kHz mono Opus.
+ *
+ * Opus rather than the 16 kHz PCM WAV this used to produce, because the audio no longer stays on
+ * this machine: it is base64'd into a JSON request against a 10 MB cap. WAV would inflate a
+ * two-minute recording to roughly 3.8 MB before encoding and 5 MB after, where 24 kbps Opus is
+ * about 360 kB — the difference between comfortably inside the cap and refused by it.
+ *
+ * **A WhatsApp voice note never reaches here.** It already arrives as ~16 kbps mono Ogg/Opus, so
+ * re-encoding it would spend a process to make it very slightly worse; `transcribe.ts` sends those
+ * bytes through untouched. This is for a video's audio track, or an audio file large enough to
+ * threaten the cap on its own.
  */
-export async function toWav16k(path: string, outPath: string): Promise<void> {
+export async function toOpus16k(path: string, outPath: string): Promise<void> {
   await runTool(
     FFMPEG,
-    ["-v", "error", "-y", "-i", path, "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", outPath],
+    // 24 kbps is above WhatsApp's own 16 kbps and well past the point where speech recognition
+    // stops caring; the ceiling here is the request limit, not fidelity.
+    ["-v", "error", "-y", "-i", path, "-vn", "-ar", "16000", "-ac", "1", "-c:a", "libopus", "-b:a", "24k", outPath],
     FFMPEG_TIMEOUT_MS,
   );
 }

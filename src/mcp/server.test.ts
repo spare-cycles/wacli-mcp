@@ -537,7 +537,7 @@ void test("whatsapp_download_media returns the cached transcript for an audio me
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "audio", "audio/ogg");
-      ctx.messages.setTranscript(CHAT, MSG, "bonjour, c'est un message vocal");
+      ctx.messages.setTranscript(CHAT, MSG, "bonjour, c'est un message vocal", "test-model");
     },
     overrides: { media: mediaAt(docPath, "audio/ogg") },
   });
@@ -693,7 +693,6 @@ void test("whatsapp_transcribe caches: a second call does not re-run whisper", a
 void test("whatsapp_transcribe reports why transcription failed, verbatim", async () => {
   const reason = "no speech was detected in this recording";
   const transcriber: Transcriber = {
-    ensureModel: () => Promise.resolve("/models/x.bin"),
     transcribeFile: () => Promise.reject(new TranscriptionError(reason)),
     available: () => Promise.resolve(true),
   };

@@ -16,6 +16,19 @@ export const logger: Logger = makeLogger();
 const URL_IN_TEXT = /\bhttps?:\/\/[^\s"'<>)\]]+/gi;
 
 /** Replace every absolute URL in `text` with a placeholder naming its host. */
+/**
+ * A logger that writes nothing, for tests.
+ *
+ * Lives here rather than in each suite because there are now several that need one, and a per-file
+ * copy is how a test ends up writing every `logger.info` to the runner's stdout: the pino default
+ * is not silent, and the mistake is invisible until the output is unreadable.
+ */
+export function silentLogger(): Logger {
+  const noop = (): void => undefined;
+  const self = { info: noop, warn: noop, error: noop, debug: noop, trace: noop, fatal: noop, level: "silent" };
+  return { ...self, child: () => self } as unknown as Logger;
+}
+
 export function scrubUrls(text: string): string {
   return text.replace(URL_IN_TEXT, (match) => {
     try {

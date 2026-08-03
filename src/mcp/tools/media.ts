@@ -150,9 +150,10 @@ async function videoAnswer(subject: Subject, ctx: ToolContext): Promise<ToolResu
 /**
  * The cached transcript when there is one, and otherwise the duration plus what to do about it.
  *
- * Transcribing here instead would make every download of a voice note spend a whisper run — minutes
- * of CPU on the machine this deploys to — for a model that may only have wanted to know how long it
- * is. `whatsapp_transcribe` is the tool that decides to pay that, and it writes its answer back here.
+ * Transcribing here instead would make every download of a voice note spend GPU seconds on a remote
+ * endpoint — and possibly wake a cold one — for a model that may only have wanted to know how long
+ * it is. `whatsapp_transcribe` is the tool that decides to pay that, and it writes its answer back
+ * here. With auto-transcription on, most notes arrive already transcribed and take the first branch.
  */
 async function audioAnswer(subject: Subject, ctx: ToolContext): Promise<ToolResult> {
   const transcript = subject.row.transcript;
@@ -259,10 +260,11 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
     "whatsapp_transcribe",
     {
       description:
-        "Transcribe a voice note or a video's audio track with whisper, and store the result so that " +
+        "Transcribe a voice note or a video's audio track, and store the result so that " +
         "whatsapp_messages_search can find the message by what was said in it. Answers instantly from the " +
-        "stored transcript when there is one; otherwise this is minutes of CPU, so call it on one " +
-        "message at a time rather than over a whole chat.",
+        "stored transcript when there is one — most recent voice notes are transcribed on arrival, so " +
+        "this is usually free. Otherwise it runs on a GPU that scales to zero, so the first call after a " +
+        "quiet period can take a minute or two while the endpoint starts.",
       inputSchema: { chat: chatSchema, message_id: messageIdSchema },
       annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -275,13 +277,20 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
           return textResult(row.transcript, ctx.config.maxResultChars);
 
         const file = await ctx.media.fetch(row.chatId, row.id);
-        const text = await ctx.transcriber.transcribeFile(file.path);
+        // The interactive lane: someone asked, so this may fall back to the paid API when the
+        // self-hosted endpoint is cold or down. The background lane may not — see `transcribe.ts`.
+        const result = await ctx.transcriber.transcribeFile(file.path, {
+          mimetype: file.mimetype,
+          lane: "interactive",
+          biasTerms: ctx.biasTermsFor(row.chatId),
+        });
         // Written through the repository rather than kept in memory: the update fires the FTS
-        // trigger, which is what puts the speech into the search index.
-        ctx.messages.setTranscript(row.chatId, row.id, text);
+        // trigger, which is what puts the speech into the search index. The model goes with it, so
+        // a transcript can later be told apart from one produced by whatever ran before it.
+        ctx.messages.setTranscript(row.chatId, row.id, result.text, result.model);
         // The whole transcript is stored; what comes back is capped like every other payload, and
         // `whatsapp_messages_search` still finds the message by anything said past the cut.
-        return textResult(text, ctx.config.maxResultChars);
+        return textResult(result.text, ctx.config.maxResultChars);
       } catch (err) {
         return failedResult("whatsapp_transcribe", err, ctx);
       }

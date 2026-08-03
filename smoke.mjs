@@ -10,11 +10,14 @@
  *
  *   1. The whole wiring, over HTTP, exactly as a model reaches it — Express, the bearer gate, the
  *      Streamable-HTTP session, the SDK's schema validation, the tool handlers, SQLite.
- *   2. **whisper.** `--transcribe` is the only exercise transcription and the ~574 MB model
- *      download ever get. Nothing in `src/**` runs whisper-cli: `media/transcribe.test.ts` drives a
- *      fake binary, because a real one is minutes of CPU per call. So a whisper regression — a
- *      missing shared library, a wrong `LD_LIBRARY_PATH`, a model URL that moved, a flag whisper.cpp
- *      renamed — is invisible until this script is run. Run it after every image change.
+ *   2. **The transcription endpoint.** `--transcribe` is the only exercise a real GPU job ever gets.
+ *      Nothing in `src/**` reaches RunPod: `media/transcribe.test.ts` drives a `fetch` mock, because
+ *      a real call costs GPU seconds and can take minutes on a cold worker. So an endpoint
+ *      regression — a rotated key, an endpoint id that changed, a worker image that will not boot, a
+ *      response field the worker renamed — is invisible until this script is run. Run it after every
+ *      change to either image, and after every `runpod-sync.py --apply`.
+ *
+ *      ⚠️ It costs money, and the first call of a quiet day pays the full cold start.
  *
  * Usage:
  *
@@ -91,7 +94,10 @@ async function main() {
   const unpaired = health.needs_pairing === true;
   if (unpaired) console.warn("  ! the server is waiting to be paired; writes and media will fail");
   if (!health.transcription_available && transcribe) {
-    console.warn("  ! transcription_available is false — whisper-cli or the model is missing");
+    console.warn(
+      "  ! transcription_available is false — no backend is reachable. Check WHATSAPP_RUNPOD_ENDPOINT_ID," +
+        " RUNPOD_API_KEY and MISTRAL_API_KEY, and that jobs are going to api.runpod.ai (not .io).",
+    );
   }
 
   // 2. Open a real MCP session over Streamable HTTP.
@@ -120,7 +126,8 @@ async function main() {
     const chats = await callTool(client, "whatsapp_chats_list", { limit: 5 });
     log("whatsapp_chats_list", "\n" + resultText(chats));
 
-    // 5. whisper, if asked. Minutes of CPU on a cold model — that is the point of it being opt-in.
+    // 5. A real transcription, if asked. A cold endpoint takes minutes and costs money — that is
+    //    the point of it being opt-in.
     if (transcribe) {
       log("whatsapp_transcribe", `${transcribe.chat} / ${transcribe.messageId} — this can take minutes`);
       const started = Date.now();
@@ -131,7 +138,7 @@ async function main() {
       const text = resultText(res);
       log("whatsapp_transcribe", `${Math.round((Date.now() - started) / 1000)}s, ${text.length} chars`);
       console.log(text);
-      assert.ok(text.trim().length > 0, "whisper returned an empty transcript");
+      assert.ok(text.trim().length > 0, "the transcription endpoint returned an empty transcript");
     }
   } finally {
     await client.close();

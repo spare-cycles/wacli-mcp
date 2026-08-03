@@ -58,17 +58,37 @@ are non-obvious enough to get broken by an edit that looks correct.
   which trusts `creds.registered` (set only on a completed pairing) rather than `creds.me`. Without
   it every missed pairing code costs a manual restart.
 
-- **`whisper-cli` is dynamically linked against libraries that live beside it.** `libwhisper.so.1`,
-  `libggml.so.0`, `libggml-base.so.0`, `libggml-cpu.so.0` all sit in the same directory, plus
-  `libgomp.so.1` from the system, which `node:*-slim` does not ship. Hence the Dockerfile copying the
-  whole `/app/build/bin` directory, `ENV LD_LIBRARY_PATH=/opt/whisper/bin`, and `libgomp1` in the
-  apt line. Copying just the binary produces a loader error at the first transcription, not at build
-  time. Verify after any image change:
-  ```bash
-  docker build -t whatsapp-mcp:test . && docker run --rm whatsapp-mcp:test /opt/whisper/bin/whisper-cli --help | head -3
-  ```
-  The whisper stage is pinned **by digest** — `:main` moves — and is amd64-only, which is why
-  `docker.yml` builds `linux/amd64` and nothing else.
+- ⚰️ **whisper.cpp is gone (2026-08-03), and with it the whole reason this image was amd64-only.**
+  Transcription ran in-process against a 574 MB model on a GPU-less VPS — minutes of CPU per voice
+  note. It now runs on a RunPod serverless endpoint (Voxtral Small 24B on vLLM; see
+  [`spare-cycles/transcribe-worker`](https://github.com/spare-cycles/transcribe-worker)) with
+  Mistral's API as fallback. The whisper stage, `LD_LIBRARY_PATH`, `libgomp1`, the `models/`
+  directory and `WHATSAPP_WHISPER_{BIN,MODEL,THREADS}` all left with it.
+
+- 🔴 **`api.runpod.ai` submits jobs; `api.runpod.io` manages endpoints.** Same `/v2` prefix,
+  different hosts, different auth scopes — and the management host answers a job with a **401**,
+  which reads exactly like a bad key. `media/backends/runpod.ts` pins the jobs host in a named
+  constant for this reason, and says so in the 401 branch.
+
+- **Two lanes, and the background one must never reach Mistral.** `whatsapp_transcribe` is
+  interactive and may fall back to the paid API; auto-transcription is background and may not.
+  Paying a vendor to transcribe a recording nobody asked about is not worth it — and it is also the
+  only path that would send conversation audio to a model vendor with nobody deciding to.
+  `LANE_BACKENDS` in `media/transcribe.ts` is the enforcement, and `transcribe.test.ts` asserts it
+  because no type can.
+
+- 🔴 **The flood guard is the ingest *path*, never the upsert's `type`.** `messaging-history.set`
+  passes `transcribe: false` (`whatsapp/ingest.ts`), which is what stops a re-pair's replay of
+  thousands of messages from becoming thousands of GPU jobs. Filtering on `type` instead looks
+  equivalent and is not: `messages.upsert` carries both `notify` **and** the offline `append` drain,
+  and `append` is legitimate recent traffic received while the process was down — dropping it would
+  silently skip real voice notes, with nothing anywhere reporting it.
+
+- **The budget ledger charges wall time plus one idle tail per cold burst, and over-counts on
+  purpose.** RunPod bills the cold start and the whole idle timeout, neither of which appears in a
+  job's response; a ledger built on the worker's `infer_s` would report cents while the console
+  reported ~$82/month. It persists through `meta`, so a restart does not reset the day —
+  `budget.test.ts` asserts exactly that, because a cap a crash loop can clear is not a cap.
 
 - **`node:sqlite` is experimental, so the Node version is a compatibility decision.** `engines.node`
   is `">=24"` and the image is `node:24-slim`; a Node major bump is a deliberate check that FTS5,
@@ -130,7 +150,9 @@ are non-obvious enough to get broken by an edit that looks correct.
 - **The media cache is never evicted** (v1 scope, documented in `README.md`). `WHATSAPP_MEDIA_DIR` grows
   monotonically, one sha256-named file per distinct attachment.
 
-- **`smoke.mjs` is the only coverage whisper and the 574 MB model download get.** It is manual, needs
-  a running server against a paired store, and is excluded from every gate. Run
-  `node smoke.mjs --transcribe <chat> <messageId>` after any change to the image or the media
-  pipeline.
+- **`smoke.mjs` is the only coverage a real GPU job gets.** The suite drives a `fetch` mock, so a
+  rotated key, a changed endpoint id, a worker image that will not boot or a renamed response field
+  are all invisible to it. `smoke.mjs` is manual, needs a running server against a paired store, and
+  is excluded from every gate. Run `node smoke.mjs --transcribe <chat> <messageId>` after any change
+  to either image, to the media pipeline, or after a `runpod-sync.py --apply`. ⚠️ It costs GPU
+  seconds, and the first call of a quiet day pays the full cold start.

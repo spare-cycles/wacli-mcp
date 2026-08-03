@@ -36,6 +36,17 @@ export type MessageRow = {
   deletedTs: number | null;
   mediaType: string | null;
   mediaSha: string | null;
+  /**
+   * True for a voice note, false for any other audio, null for a row stored before schema V2.
+   *
+   * `kind` cannot answer this: `audioMessage` maps to `"audio"` whether it is someone talking or a
+   * forwarded song. Everything that decides whether to spend a GPU on a recording keys on this.
+   */
+  ptt: boolean | null;
+  /** Declared seconds, from the envelope — so a length gate can run before the file is downloaded. */
+  durationS: number | null;
+  /** Which model produced `transcript`. NULL means the whisper.cpp era, before schema V2. */
+  transcriptModel: string | null;
 };
 
 export type MessageInput = {
@@ -49,8 +60,13 @@ export type MessageInput = {
   quotedId?: string | undefined;
   status?: string | undefined;
   mediaType?: string | undefined;
+  ptt?: boolean | undefined;
+  durationS?: number | undefined;
   raw?: Uint8Array | undefined;
 };
+
+/** A voice note with no transcript yet: what the boot sweep finds and the queue works through. */
+export type PendingTranscript = { chatId: string; id: string; ts: number; durationS: number | null };
 
 /**
  * The kinds that carry an attachment: what `hasMedia` selects, and what `media/store.ts` will
@@ -98,8 +114,31 @@ export type MessagesRepo = {
   markEdited: (chatId: string, id: string, text: string, ts: number) => void;
   markDeleted: (chatId: string, id: string, ts: number) => void;
   setStatus: (chatId: string, id: string, status: string) => void;
-  setTranscript: (chatId: string, id: string, transcript: string) => void;
+  /**
+   * Store a transcript together with the model that produced it.
+   *
+   * `model` is not optional. Making it so would let a caller store a transcript with no
+   * provenance, which is the exact state schema V2 exists to end — and the one caller that could
+   * plausibly want to (a test) is better served passing a name than being allowed to omit one.
+   */
+  setTranscript: (chatId: string, id: string, transcript: string, model: string) => void;
   setMedia: (chatId: string, id: string, sha: string, mediaType: string) => void;
+  /**
+   * Voice notes with no transcript, newest first, at or after `sinceTs`.
+   *
+   * Backs the boot sweep, so that a pod restart mid-backlog leaves no hole. `sinceTs` is the
+   * caller's recency window rather than a default here: this repository has no opinion about how
+   * old a recording has to be before transcribing it is a waste of money.
+   */
+  pendingTranscripts: (sinceTs: number, limit: number) => PendingTranscript[];
+  /**
+   * Whether this chat has anything I sent at or after `sinceTs`.
+   *
+   * The cheap proxy for "a conversation I actually take part in", which is what bounds
+   * auto-transcription to chats worth spending on. Broadcast lists and channels I never answer
+   * fail it, and that is the whole point.
+   */
+  hasOutboundSince: (chatId: string, sinceTs: number) => boolean;
   count: () => number;
   /**
    * The newest `ts` in the store, or `null` when it is empty.
@@ -130,6 +169,9 @@ type MessageRowRaw = {
   deleted_ts: number | null;
   media_type: string | null;
   media_sha: string | null;
+  ptt: number | null;
+  duration_s: number | null;
+  transcript_model: string | null;
 };
 
 type SearchRowRaw = MessageRowRaw & { snip_text: string | null; snip_transcript: string | null };
@@ -151,6 +193,12 @@ function toMessageRow(raw: MessageRowRaw): MessageRow {
     deletedTs: raw.deleted_ts,
     mediaType: raw.media_type,
     mediaSha: raw.media_sha,
+    // `null` is preserved rather than folded to `false`: a pre-V2 row is "we never recorded this",
+    // which is a different answer from "this is not a voice note", and the sweep treats them
+    // differently — an unknown row is left alone rather than transcribed on a guess.
+    ptt: raw.ptt === null ? null : raw.ptt !== 0,
+    durationS: raw.duration_s,
+    transcriptModel: raw.transcript_model,
   };
 }
 
@@ -201,12 +249,14 @@ function quoteFtsQuery(query: string): string {
 
 const SELECT_COLUMNS = `
   rowid, chat_id, id, sender_id, ts, from_me, kind, text, transcript,
-  quoted_id, status, edited_ts, deleted_ts, media_type, media_sha
+  quoted_id, status, edited_ts, deleted_ts, media_type, media_sha,
+  ptt, duration_s, transcript_model
 `;
 
 const SEARCH_COLUMNS = `
   m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text, m.transcript,
   m.quoted_id, m.status, m.edited_ts, m.deleted_ts, m.media_type, m.media_sha,
+  m.ptt, m.duration_s, m.transcript_model,
   snippet(messages_fts, 0, char(1), char(2), '…', 12) AS snip_text,
   snippet(messages_fts, 1, char(1), char(2), '…', 12) AS snip_transcript
 `;
@@ -279,8 +329,10 @@ function searchQuery(extraWhere: string): string {
 export function makeMessagesRepo(db: Db): MessagesRepo {
   const hasStmt = db.prepare("SELECT 1 FROM messages WHERE chat_id = ? AND id = ?");
   const insertStmt = db.prepare(`
-    INSERT INTO messages (chat_id, id, sender_id, ts, from_me, kind, text, quoted_id, status, media_type, raw)
-    VALUES (:chatId, :id, :senderId, :ts, :fromMe, :kind, :text, :quotedId, :status, :mediaType, :raw)
+    INSERT INTO messages
+      (chat_id, id, sender_id, ts, from_me, kind, text, quoted_id, status, media_type, ptt, duration_s, raw)
+    VALUES
+      (:chatId, :id, :senderId, :ts, :fromMe, :kind, :text, :quotedId, :status, :mediaType, :ptt, :durationS, :raw)
     ON CONFLICT (chat_id, id) DO UPDATE SET
       sender_id = excluded.sender_id,
       ts = excluded.ts,
@@ -290,6 +342,11 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
       quoted_id = COALESCE(excluded.quoted_id, messages.quoted_id),
       status = COALESCE(excluded.status, messages.status),
       media_type = COALESCE(excluded.media_type, messages.media_type),
+      -- COALESCE like every other field here: a redelivery whose envelope this build could not
+      -- read must never downgrade a row that already knows it is a voice note, because that would
+      -- take it out of the sweep's partial index and it would silently never be transcribed.
+      ptt = COALESCE(excluded.ptt, messages.ptt),
+      duration_s = COALESCE(excluded.duration_s, messages.duration_s),
       raw = COALESCE(excluded.raw, messages.raw)
   `);
   const getStmt = db.prepare(`SELECT ${SELECT_COLUMNS} FROM messages WHERE chat_id = ? AND id = ?`);
@@ -304,8 +361,19 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
   );
   const setStatusStmt = db.prepare("UPDATE messages SET status = :status WHERE chat_id = :chatId AND id = :id");
   const setTranscriptStmt = db.prepare(
-    "UPDATE messages SET transcript = :transcript WHERE chat_id = :chatId AND id = :id",
+    "UPDATE messages SET transcript = :transcript, transcript_model = :model WHERE chat_id = :chatId AND id = :id",
   );
+  const pendingTranscriptsStmt = db.prepare(`
+    SELECT chat_id, id, ts, duration_s FROM messages
+     WHERE ptt = 1 AND transcript IS NULL AND deleted_ts IS NULL AND ts >= :sinceTs
+     ORDER BY ts DESC
+     LIMIT :limit
+  `);
+  const hasOutboundSinceStmt = db.prepare(`
+    SELECT 1 FROM messages
+     WHERE chat_id = :chatId AND from_me = 1 AND ts >= :sinceTs
+     LIMIT 1
+  `);
   const setMediaStmt = db.prepare(
     "UPDATE messages SET media_sha = :mediaSha, media_type = :mediaType WHERE chat_id = :chatId AND id = :id",
   );
@@ -329,6 +397,8 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
       quotedId: m.quotedId ?? null,
       status: m.status ?? null,
       mediaType: m.mediaType ?? null,
+      ptt: m.ptt === undefined ? null : m.ptt ? 1 : 0,
+      durationS: m.durationS ?? null,
       raw: m.raw ?? null,
     });
     return !existed;
@@ -395,8 +465,22 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
     setStatusStmt.run({ chatId, id, status });
   }
 
-  function setTranscript(chatId: string, id: string, transcript: string): void {
-    setTranscriptStmt.run({ chatId, id, transcript });
+  function setTranscript(chatId: string, id: string, transcript: string, model: string): void {
+    setTranscriptStmt.run({ chatId, id, transcript, model });
+  }
+
+  function pendingTranscripts(sinceTs: number, limit: number): PendingTranscript[] {
+    const rows = pendingTranscriptsStmt.all({ sinceTs, limit }) as {
+      chat_id: string;
+      id: string;
+      ts: number;
+      duration_s: number | null;
+    }[];
+    return rows.map((row) => ({ chatId: row.chat_id, id: row.id, ts: row.ts, durationS: row.duration_s }));
+  }
+
+  function hasOutboundSince(chatId: string, sinceTs: number): boolean {
+    return hasOutboundSinceStmt.get({ chatId, sinceTs }) !== undefined;
   }
 
   function setMedia(chatId: string, id: string, sha: string, mediaType: string): void {
@@ -429,6 +513,8 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
     setStatus,
     setTranscript,
     setMedia,
+    pendingTranscripts,
+    hasOutboundSince,
     count,
     newestTs,
     unreadKeysUpTo,

@@ -9,11 +9,11 @@ surface keeps working while the socket is down, reconnecting, or waiting to be p
 download of a given attachment, need the connection to be live.
 
 There is no second process, no CLI to shell out to, no store lock and no IPC. The only subprocesses are `ffmpeg`,
-`ffprobe`, `pdftotext` and `whisper-cli`, each invoked on demand by the media pipeline.
+`ffprobe` and `pdftotext`, each invoked on demand by the media pipeline, plus a remote GPU endpoint for transcription.
 
 The media pipeline is the reason this is more than a message log. An inbound attachment is not handed to the model as a
 file path it cannot open: a photo comes back as an image block, downscaled to fit a context window; a video as evenly
-spaced keyframes plus its duration; a PDF as extracted text; a voice note as a transcript, produced by whisper.cpp and
+spaced keyframes plus its duration; a PDF as extracted text; a voice note as a transcript, produced on a remote GPU and
 written back into the search index — so `whatsapp_messages_search` finds a message by what was *said* in it.
 
 Transport is Streamable HTTP only, behind an optional bearer token.
@@ -32,7 +32,7 @@ read-only deployment does not advertise them, so a model never sees an ability i
 | `whatsapp_messages_search` | Full-text search over message text *and* voice-note transcripts, best matches first. Each hit carries a snippet and `matched_transcript`. | no |
 | `whatsapp_contacts_search` | Contacts by name, push name or phone number. | no |
 | `whatsapp_download_media` | An attachment in a form a model can consume: image, video keyframes, cached transcript, PDF text, or a cached path. Downloads once, reuses the cached copy after. | first fetch only |
-| `whatsapp_transcribe` | Transcribe a voice note or a video's audio with whisper, and store the transcript so search can find it. Instant on a second call. | first fetch only |
+| `whatsapp_transcribe` | Transcribe a voice note or a video's audio on a GPU endpoint, and store the transcript so search can find it. Instant on a second call — and usually on the first, since notes are transcribed as they arrive. | first fetch only |
 | `whatsapp_send_text` | Send a text message, optionally quoting an earlier one and @mentioning participants. | **yes** |
 | `whatsapp_send_file` | Send an image, video, voice note or document — bytes as base64 in `data`, or a server-side file via `path` (see `WHATSAPP_SEND_FILE_DIR`). | **yes** |
 | `whatsapp_react` | React with an emoji; an empty emoji removes the reaction. | **yes** |
@@ -70,10 +70,15 @@ state in the message, so a model can tell "retry in a moment" from "this will ne
   suite, which builds its media fixtures with them.
 - **`pdftotext`** (`poppler-utils`) — PDF text extraction. Its absence degrades one branch of `whatsapp_download_media`; the
   rest of the server is unaffected.
-- **`whisper-cli`** (whisper.cpp) — transcription only. Point `WHATSAPP_WHISPER_BIN` at it. Without it, `whatsapp_transcribe` fails
-  and `whatsapp_health` reports `transcription_available: false`; nothing else changes.
+- **A transcription endpoint.** Transcription runs on a **RunPod serverless GPU** (Voxtral Small 24B on vLLM, see
+  [`spare-cycles/transcribe-worker`](https://github.com/spare-cycles/transcribe-worker)), with Mistral's hosted API as a
+  fallback. Set `WHATSAPP_RUNPOD_ENDPOINT_ID` + `RUNPOD_API_KEY`, and/or `MISTRAL_API_KEY`. With neither,
+  `whatsapp_transcribe` fails and `whatsapp_health` reports `transcription_available: false`; nothing else changes.
 
-The Docker image ships all four. Locally, `apt install ffmpeg poppler-utils` covers everything but whisper.
+The Docker image ships ffmpeg and poppler-utils. Locally, `apt install ffmpeg poppler-utils` covers both.
+⚠️ **whisper.cpp is gone.** It ran in-process against a 574 MB model on a machine with no GPU — minutes of CPU per
+recording — and left with the `WHATSAPP_WHISPER_BIN` / `_MODEL` / `_THREADS` variables and the `models/` directory. Only
+`WHATSAPP_WHISPER_MAX_SECONDS` survives, as a deprecated alias for `WHATSAPP_TRANSCRIBE_MAX_SECONDS`.
 
 ## First run: pairing
 
@@ -111,21 +116,33 @@ Every variable is optional except where noted. Invalid numbers fall back to the 
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `WHATSAPP_DATA_DIR` | `/data/whatsapp` | The state directory. Holds `whatsapp.db` (store + credentials), `models/` (the whisper model) and `tmp/`. |
+| `WHATSAPP_DATA_DIR` | `/data/whatsapp` | The state directory. Holds `whatsapp.db` (store + credentials) and `tmp/`. |
 | `WHATSAPP_MEDIA_DIR` | `$WHATSAPP_DATA_DIR/media` | The content-addressed attachment cache. See the note on eviction below. |
 | `WHATSAPP_PHONE_NUMBER` | — | The account's number, E.164 digits without `+`. Required to pair; ignored once paired. Rejected at boot if malformed. |
 | `PORT` | `8080` | HTTP listen port, clamped to `[1, 65535]`. Binds `0.0.0.0`. |
 | `MCP_HTTP_PATH` | `/mcp` | Path the MCP endpoint is mounted on. `/health` is always at `/health` and always public. |
 | `WHATSAPP_MCP_TOKEN` | — | Bearer token guarding the MCP path. **Unset means the endpoint is unauthenticated**, which the server warns about once at boot. Compared in constant time; never logged, never echoed in a refusal. |
 | `WHATSAPP_MCP_READONLY` | off | `1`/`true`/`yes`/`on` unregisters the six write tools. The media tools stay: neither changes anything on WhatsApp. |
-| `WHATSAPP_WHISPER_BIN` | `whisper-cli` | Path to the whisper.cpp binary. |
-| `WHATSAPP_WHISPER_MODEL` | `large-v3-turbo-q5_0` | Model name. Fetched once, lazily, from Hugging Face into `$WHATSAPP_DATA_DIR/models/ggml-<model>.bin` — 574 MB for the default. |
-| `WHATSAPP_WHISPER_THREADS` | CPUs − 1 (min 1) | Threads passed to whisper, clamped to the CPU count. |
-| `WHATSAPP_WHISPER_MAX_SECONDS` | `900` | Recordings longer than this are refused rather than transcribed. Clamped to `[1, 14400]`. |
+| `WHATSAPP_TRANSCRIBE_BACKENDS` | `runpod,mistral` | Which backends to try, **in order**. `runpod` is the self-hosted endpoint, `mistral` the paid API. Flipping this to `mistral` alone is the documented lever for when the endpoint is down. An unknown name is dropped rather than failing the boot — this is an incident control. |
+| `WHATSAPP_RUNPOD_ENDPOINT_ID` | — | The RunPod serverless endpoint id. Jobs go to `https://api.runpod.ai/v2/<id>/…`. ⚠️ **`api.runpod.**io**` is the *management* API and answers 401 to a job — a failure that reads exactly like a bad key.** |
+| `RUNPOD_API_KEY` | — | Credential for that endpoint. |
+| `MISTRAL_API_KEY` | — | Credential for the fallback. Without it there is no fallback, which is a legitimate configuration: it is the only path that sends conversation audio to a model vendor. |
+| `WHATSAPP_TRANSCRIBE_MAX_SECONDS` | `900` | Recordings longer than this are refused rather than transcribed. Clamped to `[1, 14400]`. `WHATSAPP_WHISPER_MAX_SECONDS` is a deprecated alias, kept for one release. |
+| `WHATSAPP_TRANSCRIBE_TIMEOUT_MS` | `900000` | How long a job may take end to end, cold start included. Keep it in step with the endpoint's own `execution_timeout_ms`, or a job dies at whichever is lower. |
+| `RUNPOD_PRICE_PER_SECOND` | `0.000756` | A100 80 GB flex, $2.72/hr. Used only by the budget ledger. |
+| `RUNPOD_IDLE_TIMEOUT_SECONDS` | `120` | **Must match the endpoint's `idle_timeout`.** The ledger charges one of these per cold burst, because RunPod bills the idle tail and no job response can see it. |
 | `WHATSAPP_MAX_IMAGE_BYTES` | 5 MiB | Budget for an image block returned to the model; larger images are downscaled to fit. Clamped to `[1, 100 MiB]`. |
 | `WHATSAPP_MAX_UPLOAD_BYTES` | 64 MiB | Largest file `whatsapp_send_file` will send, whichever way the bytes arrived. Clamped to `[1, 256 MiB]`. It also sizes the HTTP body limit, which is this value plus base64 overhead plus 1 MiB of envelope — so raising it raises what an authenticated client may POST. |
 | `WHATSAPP_SEND_FILE_DIR` | — | The **one** directory `whatsapp_send_file`'s `path` argument may resolve inside. Unset disables `path` entirely, which is the default and the right one: a container serving a remote client has no legitimate caller for a server-side path, and left open, `path` is an arbitrary-file-read primitive that would hand `/proc/self/environ` — every secret in the process environment — to a WhatsApp conversation. When set, paths are resolved through symlinks and confined to it; a refusal never echoes the path it was asked to read. |
 | `WHATSAPP_VIDEO_KEYFRAMES` | `4` | Frames extracted per video, evenly spaced. Clamped to `[1, 16]`. |
+| `WHATSAPP_AUTOTRANSCRIBE` | off | Transcribe voice notes **as they arrive**, so `whatsapp_transcribe` answers from cache and a cold GPU is never in anyone's way. Off in code, on in the deployment: it spends money on recordings nobody asked about. |
+| `WHATSAPP_AUTOTRANSCRIBE_MAX_AGE` | `86400` | Anything older is history, not news. Bounds the offline drain after a long outage. |
+| `WHATSAPP_AUTOTRANSCRIBE_MAX_PER_HOUR` | `20` | A ceiling independent of the dollar cap, so a pricing mistake cannot become an unbounded burst. |
+| `WHATSAPP_AUTOTRANSCRIBE_MAX_SECONDS` | `300` | Checked against the stored `duration_s` **before the download** — which is why schema V2 persists it. |
+| `WHATSAPP_AUTOTRANSCRIBE_CHAT_WINDOW_DAYS` | `30` | A chat counts as mine if I sent something in it this recently. Keeps broadcast lists and shops off the bill. |
+| `WHATSAPP_AUTOTRANSCRIBE_CHATS` | — | Chat ids that bypass the window, for the conversation you only ever listen to. |
+| `WHATSAPP_AUTOTRANSCRIBE_DAILY_BUDGET_USD` | `2` | A **hard stop**, on deliberately over-counted spend. Breaching it stops the background lane until UTC midnight and fires an ntfy alert; `whatsapp_transcribe` keeps working. `0` means stop. |
+| `WHATSAPP_AUTOTRANSCRIBE_CONCURRENCY` | `2` | Background jobs in flight. Kept **below** the endpoint's worker ceiling: that gap is what guarantees an interactive call always has a worker to land on. |
 | `WHATSAPP_MCP_MAX_RESULT_CHARS` | `200000` | Every tool payload longer than this is truncated with a note naming the full length — JSON results, transcripts and extracted PDF text alike. Clamped to `[1000, 50000000]`. |
 | `NTFY_BASE_URL` | — | ntfy server for connection alerts. Alerting is all-or-nothing: it is off unless both this and `NTFY_TOPIC` are set. |
 | `NTFY_TOPIC` | — | The **incident** topic: disconnection, waiting-to-be-paired, logged-out, and the recovery that closes one of those. Recovery is deliberately not routed elsewhere — an operator who sees the alarm on this topic has to see the all-clear on it too. |
@@ -170,8 +187,8 @@ deliberately — a container healthcheck that needs the secret is a secret in th
 
 ## Docker
 
-The image is `node:24-slim` plus ffmpeg, poppler-utils, and whisper.cpp binaries copied out of
-`ghcr.io/ggml-org/whisper.cpp` (pinned by digest). There is no compiler in the build. **amd64 only**, because that
+The image is `node:24-slim` plus ffmpeg and poppler-utils. There is no compiler in the build. It used to be **amd64
+only**, because that
 upstream image publishes no other architecture.
 
 ```bash
@@ -186,9 +203,7 @@ docker run -d --name whatsapp-mcp -p 8080:8080 \
 docker logs -f whatsapp-mcp          # watch for the pairing code on the first run
 ```
 
-The image sets `WHATSAPP_DATA_DIR=/data/whatsapp`, `WHATSAPP_WHISPER_BIN=/opt/whisper/bin/whisper-cli`, `PORT=8080` and
-`LD_LIBRARY_PATH=/opt/whisper/bin` — that last one is load-bearing: `whisper-cli` is dynamically linked against
-`libwhisper.so` and three `libggml*.so` that live beside it. It runs as the unprivileged `node` user, so a bind mount
+The image sets `WHATSAPP_DATA_DIR=/data/whatsapp` and `PORT=8080`. It runs as the unprivileged `node` user, so a bind mount
 in place of the named volume must be writable by uid 1000. A `HEALTHCHECK` polls `/health` and fails only on a
 logged-out account.
 
@@ -223,7 +238,7 @@ pnpm test                                              # everything
 node --import tsx --test src/whatsapp/ingest.test.ts         # one file
 ```
 
-What the suite structurally cannot cover is the wiring end to end, and whisper. That is `smoke.mjs`:
+What the suite structurally cannot cover is the wiring end to end, and a real GPU job. That is `smoke.mjs`:
 
 ```bash
 node smoke.mjs                                         # health, session, 14 tools, whatsapp_chats_list
@@ -232,7 +247,8 @@ node smoke.mjs --transcribe <chatJid> <messageId>      # ... and a real transcri
 
 It runs against a **running server with a paired store** — a real account, real chats, real media — which no CI runner
 has and no fixture can fake, so it is manual by design and excluded from the lint and type gates. `--transcribe` is the
-only exercise whisper and the model download ever get; run it after any change to the image.
+only exercise a real transcription ever gets — it costs GPU seconds, and the first call of a quiet day pays the full
+cold start. Run it after any change to either image, and after every `runpod-sync.py --apply`.
 
 ## Two things to know
 

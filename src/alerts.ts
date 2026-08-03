@@ -37,6 +37,15 @@ import type { ConnectionState } from "./whatsapp/connection.js";
 export type Alerter = {
   /** Feed a connection state transition in. Never throws. */
   onState: (s: ConnectionState) => void;
+  /**
+   * Publish a one-off notice on the alert topic, for an incident this module does not itself watch.
+   *
+   * Exists so that the transcription budget's hard stop — which is a spending incident, not a
+   * connection one — reaches the same phone as everything else instead of growing a second ntfy
+   * client with its own copy of the token handling and the same "never let alerting take the socket
+   * down" rule. Fire-and-forget and never throws, exactly like `onState`.
+   */
+  notify: (title: string, message: string) => void;
   /** Publish a startup notice, proving the token and the egress work before the first real incident. */
   selfTest: () => Promise<void>;
   /** Cancel whatever is armed. Safe to call twice. */
@@ -285,6 +294,18 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
     }
   }
 
+  /**
+   * A one-off notice from elsewhere in the process. See `Alerter.notify`.
+   *
+   * Priority 4 and the `money_with_wings` tag, matching the down notice's urgency: the only caller
+   * today is a spending cap being hit, which is something to see now rather than in the morning.
+   * `void`, not awaited, because callers are synchronous paths that must not block on ntfy —
+   * `publish` already swallows every failure of its own.
+   */
+  function notify(title: string, message: string): void {
+    void publish({ title, message, priority: 4, tags: ["money_with_wings"], channel: "alert" });
+  }
+
   async function selfTest(): Promise<void> {
     await publish({
       title: "whatsapp-mcp started",
@@ -310,5 +331,5 @@ export function makeAlerter(deps: AlerterDeps): Alerter {
     alerted = false;
   }
 
-  return { onState, selfTest, stop };
+  return { onState, notify, selfTest, stop };
 }
