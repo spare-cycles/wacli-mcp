@@ -25,10 +25,15 @@ const MAX_FILENAME_BYTES = 255;
  * The Win32 device names, which the object manager resolves before any filesystem sees them.
  *
  * With or without an extension: `NUL.txt` is the null device, so writing a downloaded attachment to
- * it succeeds and keeps nothing. Only `COM1`–`COM9` and `LPT1`–`LPT9` are devices, which is why the
- * digit is not repeated — `COM10` is an ordinary file.
+ * it succeeds and keeps nothing. The list is Microsoft's, character for character (*Naming Files,
+ * Paths, and Namespaces*): `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9` and `LPT1`–`LPT9`, each of the
+ * numbered pair also spelled with the superscript digit — `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`,
+ * `LPT³` — which Win32 resolves to the same device. `\d` was one character too wide in both
+ * directions at once: it refused `COM0` and `LPT0`, which are ordinary files, and it missed the
+ * three superscripts, which are not. `COM10` is an ordinary file too, which is why the digit is not
+ * repeated.
  */
-const RESERVED_DEVICE = /^(?:con|prn|aux|nul|com\d|lpt\d)(?:\.|$)/i;
+const RESERVED_DEVICE = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i;
 
 const utf8 = new TextEncoder();
 
@@ -52,19 +57,33 @@ const utf8 = new TextEncoder();
  * - An unpaired surrogate is not text. It survives `JSON.parse('"\\ud800"')`, and `BinaryPayload`'s
  *   filename is a plain `string`, so it reaches here — where `encodeURIComponent` raises `URIError`
  *   on it. See `extendedFilenameValue`.
- * - A bidi control (U+202E RIGHT-TO-LEFT OVERRIDE and its eight siblings) reorders what is
- *   *rendered* without changing what is *stored*: `photo\u202egnp.exe` is displayed as
- *   `photoexe.png` by every bidi-aware file manager and terminal, which is the oldest filename
- *   spoof there is. Refusing it costs a name almost nothing — the header's plain parameter still
- *   carries the ASCII fold, `photo_gnp.exe` — because no legitimate filename needs explicit
- *   reordering; Arabic and Hebrew names render right-to-left from their own letters.
+ * - A bidi control reorders what is *rendered* without changing what is *stored*:
+ *   `photo\u202egnp.exe` is displayed as `photoexe.png` by every bidi-aware file manager and
+ *   terminal, which is the oldest filename spoof there is. `\p{Bidi_Control}` is **twelve** code
+ *   points, not the nine that argument covers, and the difference is worth knowing before anyone
+ *   trusts the class to be smaller than it is: five embeddings and overrides (U+202A–U+202E), four
+ *   isolates (U+2066–U+2069), and three directional *marks* — U+200E LRM, U+200F RLM, U+061C ALM.
+ *   All twelve are refused, and the marks are the ones the "no legitimate filename needs explicit
+ *   reordering" argument does not reach: a mark does not reorder a run, it sets the resolved
+ *   direction of the *neutral* characters beside it, which is something RTL users and RTL-aware
+ *   software insert routinely to fix digit and punctuation order inside an otherwise unambiguous
+ *   name. So refusing them has a real cost, measured rather than assumed: `مرحبا\u200f.pdf` keeps
+ *   only its fold, `filename="______.pdf"`, where `مرحبا.pdf` is carried whole. That is the trade,
+ *   and it is taken deliberately, for three reasons. A mark still reorders when the run beside it
+ *   is neutral or numeric — a leading RLM sets the direction a name like `\u200f2024.exe` resolves
+ *   in, and `exe.2024` is what renders. It is invisible, so a name carrying one is indistinguishable
+ *   to a reader from the same name without it, in either direction. And `createClient()` refuses the
+ *   same class on the way in, so narrowing here means narrowing what this package will *report* from
+ *   a third-party header too — a wider change than the one RTL name it buys back. A name is never
+ *   lost outright to this: the fold is still carried, which is the whole point of the fold.
  * - More than 255 UTF-8 bytes; see `MAX_FILENAME_BYTES`.
  *
  * **The rest of `\p{Cf}` is deliberately allowed**, and this is the trade to weigh before tightening
  * the line above: `\p{Cf}` also covers U+200D ZERO WIDTH JOINER, which is how a multi-person or
  * flag emoji is spelled, and a WhatsApp filename with an emoji in it is ordinary rather than
  * suspicious. Refusing the whole category to catch the overrides would lose those names outright.
- * `Bidi_Control` is the subset that has no legitimate use in a name, so it is the subset refused.
+ * `Bidi_Control` is the subset whose legitimate uses are narrow enough to give up, so it is the
+ * subset refused.
  *
  * Nothing else is refused. A quote, a semicolon, a space or an accent are ordinary data in a
  * filename; the header quoting they would break is the header's problem, solved where the header is

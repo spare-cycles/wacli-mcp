@@ -119,11 +119,25 @@ function isBinary(result: unknown): result is BinaryPayload {
  * That sanitising is lossy, so it is not the only thing written. When the real name differs and is
  * still a name a consumer can use, `filename*=` carries it percent-encoded (RFC 8187) — the
  * parameter that survives a `;`, a quote or an accent intact and inert, because a client decodes it
- * as a value and never re-parses it as parameters. A name that is not usable — a path, or one
- * carrying control characters — is not preserved anywhere: there is nothing there worth keeping,
- * and `createClient()` refuses it on arrival for the same reason. `extendedFilenameValue` applies
- * that rule itself rather than trusting this call site to have applied it, which is what keeps the
- * guard and the encoder from disagreeing about which names are safe to encode.
+ * as a value and never re-parses it as parameters. `extendedFilenameValue` applies that rule itself
+ * rather than trusting this call site to have applied it, which is what keeps the guard and the
+ * encoder from disagreeing about which names are safe to encode.
+ *
+ * The two parameters are judged **separately**, and that is the fix to a bug rather than a nicety.
+ * Gating the lossless parameter on the lossy one threw away 768 names the rule accepts: `nul;`
+ * folds to `nul`, a Win32 device, and `;` and `. ;` fold to nothing at all, so a name the encoder
+ * carries cleanly was answered with a bare `attachment` and no filename anywhere. `filename*=` on
+ * its own is legal RFC 6266 — `filename-parm` is the plain form **or** the ext-value form, never
+ * required to be both — and a parser that understands only the plain form is no worse off than it
+ * was with no filename at all. So the header has four shapes: neither parameter, one, the other, or
+ * both. The extended-only one is not a new way in: `extendedFilenameValue` emits nothing unless
+ * `isUsableFilename` accepts the name, and what it does emit is `encodeURIComponent` plus an escape
+ * of `!'()*`, whose entire output alphabet is `[A-Za-z0-9._~-]` and `%XX` — no `;`, no `=`, no
+ * quote, no backslash, no CR or LF, nothing non-ASCII. There is no character left in it for a
+ * lenient parser to read as a parameter boundary, which is exactly why this is the parameter the
+ * unrepresentable name goes into. A name whose *fold* is a device name is safer here than it was
+ * before, too: the plain `filename="nul"` that a Win32 client would have written to the null device
+ * is not emitted at all.
  *
  * Plain first, extended second, per RFC 6266 Appendix D: a parser that understands only the
  * fallback reads the fallback, and one that understands both prefers the extended.
@@ -137,8 +151,9 @@ function contentDisposition(disposition: string, filename: string | undefined): 
   const kind = disposition === "inline" ? "inline" : "attachment";
   if (filename === undefined) return kind;
   const plain = filename.replace(/[^ -~]/g, "_").replace(/["\\;/:]/g, "");
-  if (!isUsableFilename(plain)) return kind;
+  // Computed before the fold is judged, because the fold's verdict is not the name's.
   const extended = plain === filename ? undefined : extendedFilenameValue(filename);
+  if (!isUsableFilename(plain)) return extended === undefined ? kind : `${kind}; filename*=UTF-8''${extended}`;
   if (extended === undefined) return `${kind}; filename="${plain}"`;
   return `${kind}; filename="${plain}"; filename*=UTF-8''${extended}`;
 }

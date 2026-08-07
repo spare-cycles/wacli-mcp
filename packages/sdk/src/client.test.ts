@@ -461,6 +461,39 @@ void test("a name longer than any filesystem takes is not reported, whichever pa
   assert.equal(await readBack(`attachment; filename*=UTF-8''${"%C3%A9".repeat(200)}.pdf`), undefined);
 });
 
+void test("an unknown disposition type is no type at all, and never the inline half of the pair", async () => {
+  // The type is a whole `token`, and the match used to be a prefix — so `inlinexyz` was reported as
+  // `inline`, the half that says render this rather than saving it. RFC 6266 §4.2: "Unknown or
+  // unhandled disposition types SHOULD be handled by recipients the same way as `attachment`", and
+  // `undefined` is how this client already says "not one of the two" for `form-data`.
+  const dispositionOf = async (header: string): Promise<string | undefined> => {
+    const client = createClient({
+      baseUrl: "http://x",
+      fetch: () =>
+        Promise.resolve(
+          new Response(new Uint8Array([1]), {
+            status: 200,
+            headers: { "content-type": "application/pdf", "content-disposition": header },
+          }),
+        ),
+    });
+    return (await client.fetchMedia({ params: { chat: "c", id: "M1" }, query: {} })).disposition;
+  };
+  for (const header of [
+    'inlinexyz; filename="a.pdf"',
+    'inline-x; filename="a.pdf"',
+    "attachment-x",
+    "form-data; name=x",
+  ]) {
+    assert.equal(await dispositionOf(header), undefined, header);
+  }
+  // And the two real types still parse, with or without parameters, whitespace or case.
+  assert.equal(await dispositionOf("attachment"), "attachment");
+  assert.equal(await dispositionOf("attachment "), "attachment");
+  assert.equal(await dispositionOf('ATTACHMENT;filename="a.pdf"'), "attachment");
+  assert.equal(await dispositionOf('  inline ; filename="a.pdf"'), "inline");
+});
+
 // --- a deadline that fires after the headers ------------------------------------------------------------
 //
 // `AbortSignal.timeout` aborts the body stream as well as the connect, so these need a real socket:

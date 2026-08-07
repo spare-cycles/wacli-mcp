@@ -11,9 +11,64 @@ void test("the rule refuses exactly what the encoder cannot carry, over an adver
   // The throw escaped `implement()` and killed a media download that had already succeeded, on both
   // binary routes including the unauthenticated one. One string is not the bug; the guard and the
   // encoder disagreeing about their domain is, so this asserts the relationship rather than the
-  // string: over 40,000 names built from every character class either of them reacts to, the
-  // encoder never throws, it emits nothing for exactly the names the rule refuses, and what it does
-  // emit decodes back to the name it was given.
+  // string, over 40,000 names built from every character class either of them reacts to.
+  //
+  // What it proves, precisely, because the looser claim is what let it look stronger than it was:
+  // the encoder is **total** over the rule's domain — it never throws, for any input — its output is
+  // a strict subset of RFC 8187 `attr-char`, and what it emits decodes back to the name it was
+  // given. It emits for exactly the names the rule accepts, and that equality is checked against
+  // `documentedRule` below rather than against `isUsableFilename`: `extendedFilenameValue` *calls*
+  // `isUsableFilename`, so comparing the two is a tautology that can only fail by the encoder
+  // throwing, and six of the rule's seven clauses — including the `/` and `\` refusal that closes
+  // traversal — were invisible to it. Two limits of the corpus, so the next reader does not read
+  // more into it: names are 0–5 units long, so the 255-byte bound is unreachable from here and is
+  // pinned by its own test below, and roughly one case in six is the empty string.
+  //
+  // The rule as *documented*, spelled from the doc comment rather than from the implementation's
+  // regexes: code points and explicit sets, so a clause quietly dropped from either side is a
+  // disagreement here. It is deliberately a second spelling and not a second source of truth — no
+  // production code may import it, and where the two disagree the doc comment is the arbiter.
+  const BIDI_CONTROL = new Set([
+    0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069,
+  ]);
+  // ECMAScript `\s`, enumerated: the trailing run Win32 strips is `[\s.]`, and `\s` is more than a
+  // space — U+00A0 is in the corpus below precisely because `..\u00a0` trims to `..`.
+  const WHITESPACE = new Set([
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007,
+    0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff,
+  ]);
+  const DEVICES = new Set([
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    ..."123456789¹²³".split("").flatMap((d) => [`com${d}`, `lpt${d}`]),
+  ]);
+  const documentedRule = (name: string): boolean => {
+    // Bytes, not units. `name.length > 255` in the implementation is a short-circuit for the same
+    // condition — UTF-8 is never shorter than UTF-16 in units — so leaving it out here checks that.
+    if (new TextEncoder().encode(name).length > 255) return false;
+    let end = name.length;
+    while (end > 0) {
+      const unit = name.charCodeAt(end - 1);
+      if (unit !== 0x2e && !WHITESPACE.has(unit)) break;
+      end -= 1;
+    }
+    const trimmed = name.slice(0, end);
+    if (trimmed === "") return false;
+    if (DEVICES.has((trimmed.split(".")[0] ?? "").toLowerCase())) return false;
+    // `for…of` yields a lone surrogate as itself and a well-formed pair as one astral code point,
+    // which is exactly what `\p{Surrogate}` means under the `u` flag.
+    for (const character of name) {
+      const code = character.codePointAt(0) ?? 0;
+      if (character === "/" || character === "\\" || character === ":") return false;
+      if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return false; // \p{Cc}
+      if (code >= 0xd800 && code <= 0xdfff) return false;
+      if (BIDI_CONTROL.has(code)) return false;
+    }
+    return true;
+  };
+
   // Every class either function reacts to, one unit at a time — an array rather than a spread
   // string, so a lone surrogate stays lone instead of being recombined by code-point iteration.
   const alphabet = [
@@ -52,6 +107,12 @@ void test("the rule refuses exactly what the encoder cannot carry, over an adver
     "\u00ad", // the rest of \p{Cf}, which is deliberately allowed
     "\u00a0",
     "..",
+    "nul",
+    "con",
+    "aux",
+    "com1",
+    "com0",
+    "\u00b9", // device stems, so the reserved-name clause is reachable from this corpus at all
   ];
   // Deterministic: a fuzz that reruns a different corpus reports a different suite every time.
   let state = 0x2545f491;
@@ -70,7 +131,12 @@ void test("the rule refuses exactly what the encoder cannot carry, over an adver
     let name = "";
     for (let unit = next() % 6; unit > 0; unit -= 1) name += alphabet[next() % alphabet.length] ?? "";
     const encoded = extendedFilenameValue(name);
-    assert.equal(encoded !== undefined, isUsableFilename(name), `encoder and rule disagree on ${JSON.stringify(name)}`);
+    assert.equal(
+      encoded !== undefined,
+      documentedRule(name),
+      `encoder and documented rule disagree on ${JSON.stringify(name)}`,
+    );
+    assert.equal(isUsableFilename(name), documentedRule(name), `rule and its doc disagree on ${JSON.stringify(name)}`);
     if (encoded === undefined) continue;
     usable += 1;
     assert.match(encoded, attrChar, `${JSON.stringify(name)} encoded outside attr-char`);
@@ -112,12 +178,27 @@ void test("a colon is a path separator too, on the two platforms that read it as
 });
 
 void test("a Win32 device name is not a file, so it is not a filename", () => {
-  // Writing an attachment to `NUL.txt` succeeds and keeps nothing; `CON` is the console.
-  for (const name of ["CON", "nul", "NUL.txt", "com1", "LPT9.pdf", "aux", "CON "]) {
-    assert.equal(isUsableFilename(name), false, name);
+  // Writing an attachment to `NUL.txt` succeeds and keeps nothing; `CON` is the console. The list is
+  // Microsoft's, and `\d` was neither half of it: it refused `COM0` and `LPT0`, which are ordinary
+  // files, and missed `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³`, which Win32 resolves to the
+  // same devices as their ASCII spellings.
+  for (const name of [
+    "CON",
+    "nul",
+    "NUL.txt",
+    "com1",
+    "LPT9.pdf",
+    "aux",
+    "CON ",
+    "COM\u00b9",
+    "lpt\u00b3.txt",
+    "COM\u00b2",
+  ]) {
+    assert.equal(isUsableFilename(name), false, JSON.stringify(name));
   }
-  // Only the nine numbered devices, and only as the whole stem.
-  for (const name of ["com10", "console.txt", "nullify.pdf", "aux-2024.pdf"]) {
+  // Only the nine numbered devices, and only as the whole stem. `com0` names nothing on Win32, so
+  // refusing it cost an ordinary name its filename for a device that does not exist.
+  for (const name of ["com10", "console.txt", "nullify.pdf", "aux-2024.pdf", "com0.pdf", "lpt0.txt", "com0"]) {
     assert.equal(isUsableFilename(name), true, name);
   }
 });
@@ -125,12 +206,34 @@ void test("a Win32 device name is not a file, so it is not a filename", () => {
 void test("a bidi override is refused and a zero-width joiner is not, which is the trade", () => {
   // `photo\u202egnp.exe` renders as `photoexe.png` in any bidi-aware UI while ending in `.exe`.
   // Refusing all of `\p{Cf}` would take the ZWJ with it, and a WhatsApp filename with a
-  // multi-person emoji in it is ordinary — so the refusal is scoped to the reordering controls.
+  // multi-person emoji in it is ordinary — so the refusal is scoped to `Bidi_Control`.
   for (const name of ["photo\u202egnp.exe", "a\u200fb.pdf", "a\u2066b.pdf", "a\u061cb.pdf"]) {
     assert.equal(isUsableFilename(name), false, JSON.stringify(name));
   }
   assert.equal(isUsableFilename("👨\u200d👩\u200d👧.png"), true);
   assert.equal(isUsableFilename("soft\u00adhyphen.pdf"), true);
+});
+
+void test("Bidi_Control is twelve code points, and all twelve are what the trade gives up", () => {
+  // The doc comment used to call it "U+202E and its eight siblings", which is three short: the
+  // class also carries the directional *marks* LRM, RLM and ALM, and those are not reordering
+  // controls — an RTL user inserts one to fix digit and punctuation order in a name that needs no
+  // reordering at all. The trade is taken anyway and the cost is real, so the class is enumerated
+  // here rather than described: whichever way a later round decides it, the comment and the runtime
+  // cannot drift apart without this failing.
+  const controls: number[] = [];
+  for (let code = 0; code <= 0x10ffff; code += 1) {
+    if (/\p{Bidi_Control}/u.test(String.fromCodePoint(code))) controls.push(code);
+  }
+  assert.deepEqual(
+    controls,
+    [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069],
+  );
+  for (const code of controls)
+    assert.equal(isUsableFilename(`a${String.fromCodePoint(code)}b.pdf`), false, code.toString(16));
+  // And the cost, measured rather than assumed: an RTL name with a mark keeps only its ASCII fold.
+  assert.equal(isUsableFilename("مرحبا.pdf"), true);
+  assert.equal(isUsableFilename("مرحبا\u200f.pdf"), false);
 });
 
 void test("a name is bounded at 255 UTF-8 bytes, because that is what a consumer can write", () => {
@@ -147,10 +250,16 @@ void test("a name is bounded at 255 UTF-8 bytes, because that is what a consumer
 void test("the bound is checked before the trim, so a huge name is refused rather than chewed on", () => {
   // `[\s.]+$` backtracks quadratically: a 60 KB run of trailing dots takes 1.4 s to trim and the
   // name is refused at the end of it anyway. The order of the two checks is the only thing between
-  // a sender's filename and a CPU stall, and it is invisible in the verdict — hence a clock. The
-  // margin is four orders of magnitude, so the budget is generous rather than tight.
+  // a sender's filename and a CPU stall, and it is invisible in the verdict — hence a clock.
+  //
+  // The budget is set from the *mutation* margin, not the pass margin, because that is the number the
+  // assertion's value depends on. Measured on an M4 Pro: the two calls below take 0.06 ms as written
+  // — the length check refuses both before any regex runs — and 1367 ms with the bound and the trim
+  // swapped back, which is the mutation this test exists to catch. 500 ms left that mutant failing
+  // by only 2.8x, the whole margin in the one direction hardware erodes; 50 ms fails it by ~27x and
+  // still leaves the passing path three orders of magnitude of headroom for a slower CI box.
   const started = performance.now();
   assert.equal(isUsableFilename(".".repeat(60_000) + "a"), false);
   assert.equal(isUsableFilename("é".repeat(60_000)), false);
-  assert.ok(performance.now() - started < 500, `${performance.now() - started}ms to refuse two oversized names`);
+  assert.ok(performance.now() - started < 50, `${performance.now() - started}ms to refuse two oversized names`);
 });

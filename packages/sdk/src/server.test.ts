@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import { createClient } from "./client.js";
 import { ApiError } from "./errors.js";
+import { isUsableFilename } from "./filename.js";
 import { routes, type BinaryPayload, type Route } from "./routes.js";
 import { implement, type Handlers, type RawRequest, type RawResponse } from "./server.js";
 
@@ -370,6 +371,80 @@ void test("a name the quoted parameter cannot carry is carried by the extended o
   // A name that is not a name is preserved nowhere, and one that is nothing at all names nothing.
   assert.equal(await dispositionFor("../../etc/passwd"), 'attachment; filename="....etcpasswd"');
   assert.equal(await dispositionFor(".."), "attachment");
+});
+
+void test("a name whose ASCII fold collapses is carried by the extended parameter alone", async () => {
+  // The lossless parameter used to be gated on the lossy one: `contentDisposition` returned before
+  // `extended` was computed whenever the fold was unusable, so a name the rule accepts and the
+  // encoder carries cleanly was answered with a bare `attachment` and no filename anywhere. Three
+  // ways to reach that — the fold is a Win32 device (`nul;` folds to `nul`), the fold trims to
+  // nothing (`. ;` folds to `. `), or the fold is empty outright (`;`) — and 768 names lost to it.
+  // `filename*=` on its own is legal RFC 6266: `filename-parm` is the plain form *or* the ext-value
+  // form, never required to be both, and a parser that reads only the plain form is no worse off
+  // than it was with no filename at all. Both halves are asserted, because a header the client
+  // cannot read back is not a name carried either.
+  const carried: Record<string, string> = {
+    "nul;": "nul%3B",
+    "aux;": "aux%3B",
+    "CON;": "CON%3B",
+    ". ;": ".%20%3B",
+    "; .": "%3B%20.",
+    ";": "%3B",
+  };
+  for (const [name, encoded] of Object.entries(carried)) {
+    assert.equal(await dispositionFor(name), `attachment; filename*=UTF-8''${encoded}`, name);
+    assert.equal(await roundTrip(name), name, name);
+  }
+});
+
+void test("no name the rule accepts is dropped from the header, over a corpus rather than six examples", async () => {
+  // Six examples pin six names; the invariant is that the two parameters are judged separately, so
+  // it is asserted as one. Every name `isUsableFilename` accepts reaches the client — through
+  // whichever parameter can carry it — and every header is one of the four legal shapes. The
+  // alphabet is the one `filename.test.ts` fuzzes the rule with, plus the device stems, because the
+  // device clause is what made the fold's verdict differ from the name's.
+  const alphabet = [
+    "a",
+    "é",
+    "😀",
+    ".",
+    " ",
+    "%",
+    "'",
+    "/",
+    "\\",
+    ":",
+    ";",
+    '"',
+    "\u0000",
+    "\u202e",
+    "\ud800",
+    "..",
+    "nul",
+    "com1",
+    "com0",
+    "aux",
+  ];
+  let state = 0x2545f491;
+  const next = (): number => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return state >>> 0;
+  };
+  const shape = /^attachment(?:; filename="[^";\\]*")?(?:; filename\*=UTF-8''[A-Za-z0-9._~%-]+)?$/;
+  let carried = 0;
+  for (let i = 0; i < 3_000; i += 1) {
+    let name = "";
+    for (let unit = next() % 5; unit > 0; unit -= 1) name += alphabet[next() % alphabet.length] ?? "";
+    const header = await dispositionFor(name);
+    assert.ok(header !== undefined && shape.test(header), `${JSON.stringify(name)} -> ${JSON.stringify(header)}`);
+    if (!isUsableFilename(name)) continue;
+    carried += 1;
+    assert.equal(await roundTrip(name), name, `${JSON.stringify(name)} lost from ${header}`);
+  }
+  // The corpus has to reach the accepting branch, or a rule that refused everything would pass this.
+  assert.ok(carried > 300, `${carried} of 3000 accepted`);
 });
 
 /** The filename `createClient()` reads back out of the header `implement()` wrote for `filename`. */

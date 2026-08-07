@@ -222,7 +222,14 @@ function decodeExtended(parameter: Parameter | undefined): string | undefined {
  */
 function parseDisposition(header: string | null): { filename?: string; disposition?: "inline" | "attachment" } {
   if (header === null) return {};
-  const kind = /^\s*(inline|attachment)/i.exec(header)?.[1]?.toLowerCase();
+  // A prefix match read `inlinexyz` as `inline`, and `inline` is the unsafe half of the pair: it is
+  // the one that says render this rather than saving it. RFC 6266 §4.2 — "Unknown or unhandled
+  // disposition types SHOULD be handled by recipients the same way as `attachment`" — so an
+  // unrecognised type has to come back as no type at all, which is what a caller already gets for
+  // `form-data`, and which is the direction `contentDisposition()` narrows in on the write side.
+  // The type is a whole `token`, so the match ends where the parameters begin: `attachment` and
+  // `attachment ` with no parameters still match, `inline-x; filename="a.pdf"` no longer does.
+  const kind = /^\s*(inline|attachment)\s*(?:;|$)/i.exec(header)?.[1]?.toLowerCase();
   const parameters = parseParameters(header);
   const extended = decodeExtended(parameters.get("filename*"));
   const plain = parameters.get("filename")?.value;
