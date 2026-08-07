@@ -211,16 +211,37 @@ token into the DOM.
 It is a real security surface: an unauthenticated route serving conversation attachments. It gets
 the same posture as `WHATSAPP_SEND_FILE_DIR`.
 
-- The token is an HMAC-SHA256 over exactly `(chatId, messageId, representation, exp)`, keyed by a
-  secret derived via HKDF from `WHATSAPP_API_TOKEN`. Rotating the API token invalidates every
-  outstanding link, which is the correct behaviour. When no API token is configured — the API is
-  then presumably behind a private network — the key is 32 random bytes generated at boot, so links
-  do not survive a restart. That is stated rather than silent, because a link that dies on deploy
-  is surprising exactly once.
-- Constant-time comparison, as with the bearer gate.
+**Token format.** A MAC verifies data, it does not carry it, so the token must be self-describing
+or the download route has nothing to resolve. It is three dot-separated base64url parts:
+
+```
+v1.<payload>.<mac>
+```
+
+`payload` is a compact JSON record `{ s, r, m, f, e }` — the cached file's **sha256**, the
+representation, the mimetype, the download filename, and the expiry in Unix seconds. `mac` is
+HMAC-SHA256 over the literal bytes `"v1." + payload`, keyed by a secret derived via HKDF from
+`WHATSAPP_API_TOKEN`.
+
+Verification order is fixed: parse the version, recompute the MAC and compare in constant time,
+*then* check `e` against the clock. Checking expiry first would answer a forged token with a
+different error than a stale one, which is a distinguishing oracle for free.
+
+**The payload names a sha256, never a JID.** The obvious encoding — chat id plus message id — puts
+a phone number in a URL whose entire purpose is being shared with someone who may not be entitled
+to it. Keying on the content hash carries no identity at all. The cost is that `as=link` must
+resolve and cache the attachment at mint time rather than at fetch time, which is the better
+failure mode anyway: a link that cannot be produced fails immediately, in front of the caller,
+instead of 404-ing for whoever it was sent to.
+
+- Rotating `WHATSAPP_API_TOKEN` invalidates every outstanding link, which is the correct behaviour.
+  When no API token is configured — the API is then presumably behind a private network — the key is
+  32 random bytes generated at boot, so links do not survive a restart. Stated rather than silent,
+  because a link that dies on deploy is surprising exactly once.
 - Short TTL, `WHATSAPP_MEDIA_LINK_TTL` (default 900 s).
-- The token names a message, not a path, so traversal is not expressible.
-- The URL is never logged, on either side.
+- The token resolves to a content hash inside the media cache, not to a path, so traversal is not
+  expressible: a sha256 that names no cached file is a 404, not a filesystem read.
+- The URL is never logged, on either side. It is a credential.
 
 ### 5.3 Why not S3
 
@@ -319,10 +340,18 @@ upgrade.
   shape and the error code.
 - **MCP.** The existing tool tests, with `ToolContext`'s repositories replaced by a stubbed client.
   Assertions on output JSON are unchanged — that is the migration's proof.
-- **End-to-end, and this is the one that matters.** A test that boots the real API over a temp SQLite
-  with the existing `whatsapp/fixtures.ts` fake socket, then drives the real MCP tools against it
-  through the real SDK client. Without it, nothing stops the stubbed client from drifting away from
-  the real one, and both suites would stay green while the pair was broken.
+- **End-to-end, and this is the one that matters.** A test that boots the real API over a temp
+  SQLite and a real listener, then drives the real MCP tools against it through the real SDK
+  client. The socket seam already exists and is the one to use: `ConnectionDeps.makeSocket` is an
+  injectable Baileys factory, documented as "injectable so tests never open a websocket", and the
+  `WAMessage` envelopes in `whatsapp/fixtures.ts` are what gets pushed through it into
+  `ingest.attach`. Note that `fixtures.ts` supplies *messages*, not a socket — the fake socket is
+  the thing this test has to build, and it is the only genuinely new test infrastructure in the
+  whole split.
+
+  Without this test, nothing stops the stubbed client of the MCP suite from drifting away from the
+  real API: both suites would stay green while the pair was broken. That is the failure mode the
+  split introduces and the only one no type can catch.
 - **`smoke.mjs`** gains an API-only mode and keeps its MCP mode, so each image can be smoke-tested
   alone. It remains manual and outside every gate.
 
