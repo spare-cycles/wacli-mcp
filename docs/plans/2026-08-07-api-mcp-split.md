@@ -83,15 +83,34 @@ Read this before Task 1; it will save you an hour of confusion.
   pin `node:24-slim`.
 - **The host `ffmpeg` (Homebrew 8.1.2) has no webp encoder at all.** `ffmpeg -encoders | grep webp`
   returns nothing. The media test fixtures are built with real ffmpeg, so on the host the suite is
-  **already red before any change**: 379 pass, 103 fail (≈51 distinct, each printed twice), confined
-  entirely to `src/media/convert.test.ts` and `src/mcp/server.test.ts`.
+  **already red before any change**, with failures confined entirely to `src/media/convert.test.ts`
+  and `src/mcp/server.test.ts`.
 - **The authoritative verification is a container**, which has libwebp and Node 24:
 
 ```bash
-docker run --rm -v "$PWD":/w -w /w node:24-slim bash -c '
-  apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg poppler-utils >/dev/null
-  corepack enable && pnpm install --frozen-lockfile && pnpm -r run test'
+docker run --rm -e CI=true \
+  -v "$PWD":/w -v /w/node_modules -v /w/packages/api/node_modules \
+  -w /w node:24-slim bash -c '
+    apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg poppler-utils >/dev/null
+    corepack enable
+    pnpm config set store-dir /tmp/pnpm-store
+    pnpm install --frozen-lockfile && pnpm -r run test'
 ```
+
+Two details are not optional. **`-e CI=true`**: without it pnpm aborts with
+`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` whenever a host `node_modules` exists in the mount.
+**`store-dir` outside the mount**: otherwise the run leaves a ~136 MB `.pnpm-store/` inside the repo,
+which a subsequent `git add -A` will happily commit.
+
+### The expected count
+
+**430 tests, 429 pass, 0 fail, 1 skipped.** This is measured, not derived — Task 1's implementer ran
+the pre-split commit through the same container and got exactly this, then the same after the move.
+
+An earlier draft of this plan said "482 pass, 0 fail" and was **wrong**: it added the host's 379
+passes to its 103 *printed* failure lines, when 103 is the doubled count the plan itself flags as
+"≈51 distinct, each printed twice". 379 + 51 = 430. Every task that cites a pass count inherits this
+figure; if you see 482 anywhere, it is stale.
 
 Never claim green from a host run of the media or server suites.
 
@@ -185,7 +204,7 @@ in-process MCP. Tasks 17–18 ship.
 Task 12, so at the end of *this* task both packages have a `package.json` and a `tsconfig.json`
 whose `include` is `src/**/*.ts` — and no `src/` at all. `tsc` treats that as a hard error,
 `TS18003: No inputs were found in config file`, not a graceful zero-file pass. Task 1's own
-"482 pass, 0 fail" gate and Global Constraint 15 would both fail on the very first task. A
+gate (see Baseline) and Global Constraint 15 would both fail on the very first task. A
 one-line `export {};` in each costs nothing and Task 2 / Task 12 overwrite it.
 
 Both halves of this were verified empirically on `node:24-slim`, the image's exact runtime, rather
@@ -336,10 +355,9 @@ RUN pnpm install --frozen-lockfile && pnpm -r run build
 - [ ] **Step 2: Verify the gate is still green, in the container**
 
 Run: the container command from the Baseline section.
-Expected: **482 pass, 0 fail.** (The host baseline's 379 pass / 103 fail sums to the same 482; the
-container has libwebp, so every one of the 103 ffmpeg-dependent failures now passes.) Do **not**
-expect the host's 379/103 split to reappear here — if it does, you are not running in the container.
-Any other failure means the move broke something.
+Expected: **430 tests, 429 pass, 0 fail, 1 skipped** — the figure from the Baseline section, which
+was measured against the pre-split commit in the same container, so it is a true before/after
+comparison rather than a prediction. Any deviation means the move was not content-neutral.
 
 - [ ] **Step 3: Verify baileys is not reachable from mcp or sdk**
 
@@ -361,6 +379,11 @@ git commit -m "refactor: convert to a pnpm workspace, move the server into packa
 ### Task 2: SDK error taxonomy and domain schemas
 
 **Files:**
+- Create: **`packages/sdk/tsconfig.build.json`** and repoint the sdk `build` script at it. Task 1
+  deliberately gave the sdk no build config because it had no tests; this task adds the first two,
+  and without the split config `tsc -p tsconfig.json` compiles them into `dist/`, which
+  `files: ["dist"]` then publishes. Mirror the other packages:
+  `{ "extends": "./tsconfig.json", "include": ["src/**/*.ts"], "exclude": ["src/**/*.test.ts"] }`
 - Create: `packages/sdk/src/errors.ts`, `packages/sdk/src/schemas/common.ts`,
   `packages/sdk/src/schemas/domain.ts`, `packages/sdk/src/schemas/media.ts`
 - Test: `packages/sdk/src/errors.test.ts`, `packages/sdk/src/schemas/domain.test.ts`
@@ -1686,8 +1709,8 @@ from `ConnectionUnavailableError`'s "WhatsApp connection unavailable".
 - Create: `packages/mcp/src/tools/harness.ts`, `packages/mcp/src/tools/reads.test.ts`,
   `packages/mcp/src/server.test.ts`
 - Create (**e2e — in its own package; see below, the location is load-bearing**):
-  `packages/e2e/package.json`, `packages/e2e/tsconfig.json`, `packages/e2e/eslint.config.js`,
-  `packages/e2e/src/fake-socket.ts`, `packages/e2e/src/mcp-over-api.test.ts`
+  `packages/e2e/src/fake-socket.ts`, `packages/e2e/src/mcp-over-api.test.ts` — the package itself
+  was created in Task 1 and is named **`whatsapp-e2e`**; use that name in `--filter` invocations
 - Delete: `packages/api/src/mcp/tools/{harness,reads.test,...}` as they are superseded
 
 **The e2e test needs a fourth package, and the reason is Global Constraint 1.** Three placements
@@ -1977,6 +2000,10 @@ Named here so they are visible omissions rather than oversights:
 1. **The SDK release workflow.** `packages/sdk` is made *publishable* in Task 1 (manifest fields), but
    no CI publish job and no versioning policy are in scope. Spec §2 leans on registry publication to
    justify the monorepo, so this needs a follow-up before an external consumer exists.
+   ⚠️ **Needs a human decision before any publish:** Task 1 set `license: "MIT"` on the SDK because
+   the field is required to publish, but the repo has **no `LICENSE` file** and the old root manifest
+   declared no license, so nothing was inherited. That is an unsourced legal choice, not a technical
+   one, and it should be confirmed or corrected rather than shipped by default.
 2. **Deployment migration for existing installs** is covered in Task 18's README upgrade section and
    Task 17's compose file, but no automated migration exists — an operator follows prose.
 3. **Published image architecture.** Stays amd64-only; only the stale whisper.cpp comment is fixed.
