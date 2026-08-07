@@ -104,7 +104,11 @@ void test("a transcript is mined too, so names learned by ear reinforce themselv
   const r = rig();
   t.after(r.close);
   const id = say(r.messages, "ok");
-  r.messages.setTranscript(CHAT, id, "salut c'est Ludivine, on se voit chez Ludivine demain", "voxtral");
+  r.messages.setTranscript(CHAT, id, {
+    text: "salut c'est Ludivine, on se voit chez Ludivine demain",
+    model: "voxtral",
+    language: "fr",
+  });
 
   assert.ok(r.terms().includes("Ludivine"));
 });

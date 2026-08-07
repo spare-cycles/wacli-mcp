@@ -47,6 +47,13 @@ export type MessageRow = {
   durationS: number | null;
   /** Which model produced `transcript`. NULL means the whisper.cpp era, before schema V2. */
   transcriptModel: string | null;
+  /**
+   * The language `transcript` was spoken in, as the backend reported it.
+   *
+   * NULL for a row stored before schema V3, and equally for a backend that named no language — the
+   * two are not worth telling apart, because neither is a language anything may act on.
+   */
+  transcriptLanguage: string | null;
 };
 
 export type MessageInput = {
@@ -102,6 +109,15 @@ export type MessageListFilter = MessageFilter & {
 
 export type SearchHit = MessageRow & { matchedTranscript: boolean; snippet: string };
 
+/**
+ * What `setTranscript` persists.
+ *
+ * Structurally the transcribers' `Transcript` (`media/transcribe.ts`), restated here rather than
+ * imported: `db` sits below `media`, and importing upwards — even a type — would make the
+ * dependency circular. A caller hands over what its backend returned, unchanged.
+ */
+export type TranscriptInput = { text: string; model: string; language: string | null };
+
 export type MessagesRepo = {
   /** Returns true when the row was newly inserted, false when it updated an existing one.
    *  Task 8 depends on this to avoid double-counting unread on a redelivery. */
@@ -115,13 +131,19 @@ export type MessagesRepo = {
   markDeleted: (chatId: string, id: string, ts: number) => void;
   setStatus: (chatId: string, id: string, status: string) => void;
   /**
-   * Store a transcript together with the model that produced it.
+   * Store a transcript together with the provenance that came with it.
    *
-   * `model` is not optional. Making it so would let a caller store a transcript with no
-   * provenance, which is the exact state schema V2 exists to end — and the one caller that could
-   * plausibly want to (a test) is better served passing a name than being allowed to omit one.
+   * Taken as one object rather than as loose arguments because that is the shape the transcribers
+   * already return (`Transcript` in `media/transcribe.ts`): a caller passes what it was given
+   * instead of unpacking it, and a field added to a transcript later cannot be silently dropped by
+   * a call site that simply never passed it.
+   *
+   * `model` is not optional. Making it so would let a caller store a transcript with no provenance,
+   * which is the exact state schema V2 exists to end — and the one caller that could plausibly want
+   * to (a test) is better served passing a name than being allowed to omit one. `language` *is*
+   * nullable, because a backend genuinely may not report one.
    */
-  setTranscript: (chatId: string, id: string, transcript: string, model: string) => void;
+  setTranscript: (chatId: string, id: string, transcript: TranscriptInput) => void;
   setMedia: (chatId: string, id: string, sha: string, mediaType: string) => void;
   /**
    * Voice notes with no transcript, newest first, at or after `sinceTs`.
@@ -172,6 +194,7 @@ type MessageRowRaw = {
   ptt: number | null;
   duration_s: number | null;
   transcript_model: string | null;
+  transcript_language: string | null;
 };
 
 type SearchRowRaw = MessageRowRaw & { snip_text: string | null; snip_transcript: string | null };
@@ -199,6 +222,7 @@ function toMessageRow(raw: MessageRowRaw): MessageRow {
     ptt: raw.ptt === null ? null : raw.ptt !== 0,
     durationS: raw.duration_s,
     transcriptModel: raw.transcript_model,
+    transcriptLanguage: raw.transcript_language,
   };
 }
 
@@ -250,13 +274,13 @@ function quoteFtsQuery(query: string): string {
 const SELECT_COLUMNS = `
   rowid, chat_id, id, sender_id, ts, from_me, kind, text, transcript,
   quoted_id, status, edited_ts, deleted_ts, media_type, media_sha,
-  ptt, duration_s, transcript_model
+  ptt, duration_s, transcript_model, transcript_language
 `;
 
 const SEARCH_COLUMNS = `
   m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text, m.transcript,
   m.quoted_id, m.status, m.edited_ts, m.deleted_ts, m.media_type, m.media_sha,
-  m.ptt, m.duration_s, m.transcript_model,
+  m.ptt, m.duration_s, m.transcript_model, m.transcript_language,
   snippet(messages_fts, 0, char(1), char(2), '…', 12) AS snip_text,
   snippet(messages_fts, 1, char(1), char(2), '…', 12) AS snip_transcript
 `;
@@ -361,7 +385,9 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
   );
   const setStatusStmt = db.prepare("UPDATE messages SET status = :status WHERE chat_id = :chatId AND id = :id");
   const setTranscriptStmt = db.prepare(
-    "UPDATE messages SET transcript = :transcript, transcript_model = :model WHERE chat_id = :chatId AND id = :id",
+    `UPDATE messages
+        SET transcript = :transcript, transcript_model = :model, transcript_language = :language
+      WHERE chat_id = :chatId AND id = :id`,
   );
   const pendingTranscriptsStmt = db.prepare(`
     SELECT chat_id, id, ts, duration_s FROM messages
@@ -465,8 +491,8 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
     setStatusStmt.run({ chatId, id, status });
   }
 
-  function setTranscript(chatId: string, id: string, transcript: string, model: string): void {
-    setTranscriptStmt.run({ chatId, id, transcript, model });
+  function setTranscript(chatId: string, id: string, t: TranscriptInput): void {
+    setTranscriptStmt.run({ chatId, id, transcript: t.text, model: t.model, language: t.language });
   }
 
   function pendingTranscripts(sinceTs: number, limit: number): PendingTranscript[] {

@@ -2,7 +2,7 @@ import type { Db } from "./client.js";
 
 export type Migration = { version: number; sql: string };
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const V1_SQL = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -118,9 +118,31 @@ CREATE INDEX messages_pending_transcript
  WHERE ptt = 1 AND transcript IS NULL AND deleted_ts IS NULL;
 `;
 
+/**
+ * The language the transcript was spoken in, which the backends already knew and the store threw away.
+ *
+ * Every transcription backend returns a language alongside the text (`media/backends/types.ts`),
+ * and the media contract's `as=transcript` representation is `{ text, model, language }` — but the
+ * persist path had nowhere to put it, so the field could never be anything but absent. This is the
+ * column that lets it be answered from the store rather than by re-transcribing.
+ *
+ * NULL is a real answer here, not just a pre-V3 artefact: not every backend detects a language, and
+ * a defaulted `"en"` would be indistinguishable from one actually recognised. Existing rows are left
+ * NULL for the same reason V2 left `transcript_model` alone — nothing recorded it, and a back-filled
+ * guess is worse than an honest unknown.
+ *
+ * As with V2, `ALTER TABLE … ADD COLUMN` on a STRICT table leaves the FTS triggers untouched: all
+ * three name `text` and `transcript` explicitly, so neither the shadow table's shape nor the
+ * `INSERT … VALUES` in each trigger changes.
+ */
+const V3_SQL = `
+ALTER TABLE messages ADD COLUMN transcript_language TEXT;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, sql: V1_SQL },
   { version: 2, sql: V2_SQL },
+  { version: 3, sql: V3_SQL },
 ];
 
 /** The `meta` table itself is created by migration 1, so its absence means version 0. */

@@ -537,7 +537,11 @@ void test("whatsapp_download_media returns the cached transcript for an audio me
   const h = await serverHarness({
     seed: (ctx) => {
       seedMedia(ctx, "audio", "audio/ogg");
-      ctx.messages.setTranscript(CHAT, MSG, "bonjour, c'est un message vocal", "test-model");
+      ctx.messages.setTranscript(CHAT, MSG, {
+        text: "bonjour, c'est un message vocal",
+        model: "test-model",
+        language: "fr",
+      });
     },
     overrides: { media: mediaAt(docPath, "audio/ogg") },
   });

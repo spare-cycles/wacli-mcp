@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
-import { closeDb, openDb } from "./client.js";
+import { closeDb, type Db, openDb } from "./client.js";
 import { MIGRATIONS, SCHEMA_VERSION } from "./schema.js";
 
 const dir = mkdtempSync(join(tmpdir(), "whatsapp-db-"));
@@ -16,11 +16,22 @@ function fresh(name: string) {
   return openDb(join(dir, `${name}.db`));
 }
 
+/**
+ * The version the store records for itself.
+ *
+ * `node:sqlite` hands back `unknown` per row, and `meta` is our own single-row write — so the shape
+ * is ours to assert once, here, rather than at every call site below.
+ */
+function storedVersion(db: Db): number {
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
+  assert.ok(row !== undefined, "an opened store always records its schema version");
+  return Number(row.value);
+}
+
 void test("opens in WAL and records the schema version", () => {
   const db = fresh("wal");
   assert.equal((db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode, "wal");
-  const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
-  assert.equal(Number(row.value), SCHEMA_VERSION);
+  assert.equal(storedVersion(db), SCHEMA_VERSION);
   closeDb(db);
 });
 
@@ -28,10 +39,7 @@ void test("migrations are idempotent across reopen", () => {
   const path = join(dir, "idem.db");
   closeDb(openDb(path));
   const db = openDb(path); // must not throw
-  assert.equal(
-    Number((db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }).value),
-    SCHEMA_VERSION,
-  );
+  assert.equal(storedVersion(db), SCHEMA_VERSION);
   closeDb(db);
 });
 
@@ -96,16 +104,19 @@ void test("transcripts are searchable alongside text", () => {
 });
 
 /**
- * A V1 store, built by running only the first migration — which is what an already-deployed
- * instance's database is. Everything below then upgrades it the way a rollout does.
+ * A store frozen at `upTo`, built by running only the migrations up to that version — which is what
+ * an already-deployed instance's database is. Everything below then upgrades it the way a rollout
+ * does.
  */
-function v1Store(name: string): string {
+function storeAt(name: string, upTo: number): string {
   const path = join(dir, `${name}.db`);
   const db = new DatabaseSync(path);
-  const v1 = MIGRATIONS.find((m) => m.version === 1);
-  assert.ok(v1 !== undefined);
-  db.exec(v1.sql);
-  db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', '1')").run();
+  const applied = MIGRATIONS.filter((m) => m.version <= upTo);
+  // Guards the fixture itself: a store claiming to be V2 while having run one migration would make
+  // every test below assert against a shape no deployment ever had.
+  assert.equal(applied.length, upTo);
+  for (const m of applied) db.exec(m.sql);
+  db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(String(upTo));
   db.prepare("INSERT INTO chats (id, is_group) VALUES (?, 0)").run("c");
   db.prepare("INSERT INTO messages (chat_id, id, sender_id, ts, from_me, kind, transcript) VALUES (?,?,?,?,?,?,?)").run(
     "c",
@@ -120,13 +131,10 @@ function v1Store(name: string): string {
   return path;
 }
 
-void test("V1 upgrades to V2 without disturbing the rows already in it", () => {
-  const db = openDb(v1Store("v1-to-v2"));
+void test("V1 upgrades to the current schema without disturbing the rows already in it", () => {
+  const db = openDb(storeAt("v1-upgrade", 1));
 
-  assert.equal(
-    Number((db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }).value),
-    2,
-  );
+  assert.equal(storedVersion(db), SCHEMA_VERSION);
   const row = db.prepare("SELECT ptt, duration_s, transcript_model, transcript FROM messages WHERE id='OLD'").get() as {
     ptt: number | null;
     duration_s: number | null;
@@ -147,22 +155,58 @@ void test("FTS still finds a pre-V2 transcript after the migration", () => {
   // Adding a column rewrites nothing, but the FTS shadow table is content-less and its triggers
   // name `text` and `transcript` explicitly — so this is the assertion that says the migration did
   // not quietly invalidate the search index for every message already stored.
-  const db = openDb(v1Store("v1-fts"));
+  const db = openDb(storeAt("v1-fts", 1));
   const hits = db.prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?").all("whisper");
   assert.equal(hits.length, 1);
   closeDb(db);
 });
 
-void test("V2 is applied once, however often the store is reopened", () => {
-  const path = v1Store("v2-idem");
+void test("every migration is applied once, however often the store is reopened", () => {
+  const path = storeAt("v1-idem", 1);
   closeDb(openDb(path));
-  // A second `ALTER TABLE ADD COLUMN` would throw "duplicate column name"; this is what proves the
+  // A second `ALTER TABLE … ADD COLUMN` would throw "duplicate column name"; this is what proves the
   // version check, and not luck, is what stops it running twice.
   const db = openDb(path);
-  assert.equal(
-    Number((db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }).value),
-    SCHEMA_VERSION,
+  assert.equal(storedVersion(db), SCHEMA_VERSION);
+  closeDb(db);
+});
+
+void test("V2 upgrades to V3 without losing a transcript already stored", () => {
+  const db = openDb(storeAt("v2-to-v3", 2));
+
+  assert.equal(storedVersion(db), SCHEMA_VERSION, "an old store is brought all the way forward, not one step");
+  const row = db.prepare("SELECT transcript, transcript_language FROM messages WHERE id='OLD'").get() as {
+    transcript: string;
+    transcript_language: string | null;
+  };
+  assert.equal(row.transcript, "un vieux transcript whisper");
+  // NULL rather than a guess, for the same reason V2 left `transcript_model` alone: nothing in the
+  // store records what language a pre-V3 transcript was spoken in, and "unknown" is the truth.
+  assert.equal(row.transcript_language, null);
+  closeDb(db);
+});
+
+void test("V3 is applied once, however often a V2 store is reopened", () => {
+  const path = storeAt("v3-idem", 2);
+  closeDb(openDb(path));
+  const db = openDb(path); // must not throw "duplicate column name: transcript_language"
+  assert.equal(storedVersion(db), SCHEMA_VERSION);
+  closeDb(db);
+});
+
+void test("a transcript written after the V3 migration still reaches the FTS index", () => {
+  // The new column is added to the table three FTS triggers hang off. Had `ADD COLUMN` disturbed
+  // them, the store would keep accepting transcripts and silently stop indexing them — no error,
+  // ever, which is the one failure mode an external-content index makes unobservable.
+  const db = openDb(storeAt("v3-fts", 2));
+  db.prepare("UPDATE messages SET transcript = ?, transcript_language = ? WHERE id = 'OLD'").run(
+    "on se retrouve demain",
+    "fr",
   );
+  assert.equal(db.prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?").all("demain").length, 1);
+  // And the superseded text left the index rather than lingering as a phantom hit, which is the
+  // half of the UPDATE trigger a plain "can I find the new words?" check would not notice losing.
+  assert.equal(db.prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?").all("whisper").length, 0);
   closeDb(db);
 });
 

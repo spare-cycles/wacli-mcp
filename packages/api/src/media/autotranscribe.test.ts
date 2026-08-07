@@ -328,7 +328,7 @@ void test("a queued note that someone transcribes first is dropped rather than r
   r.auto.enqueue([seedNote(r.messages, "slow"), seedNote(r.messages, "v1")]);
   assert.equal(r.auto.snapshot().queued, 1);
 
-  r.messages.setTranscript(CHAT, "v1", "déjà fait", "interactive-model");
+  r.messages.setTranscript(CHAT, "v1", { text: "déjà fait", model: "interactive-model", language: "fr" });
   release();
   await settle();
 

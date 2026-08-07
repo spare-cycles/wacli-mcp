@@ -522,7 +522,7 @@ void test("whatsapp_messages_search returns transcript hits labelled as such", a
         { id: "T1", ts: 10, text: "hello bonjour written down" },
         { id: "V1", ts: 20, kind: "audio", text: null },
       ]);
-      ctx.messages.setTranscript(ALICE, "V1", "bonjour tout le monde", "test-model");
+      ctx.messages.setTranscript(ALICE, "V1", { text: "bonjour tout le monde", model: "test-model", language: "fr" });
     },
   });
 
@@ -559,8 +559,8 @@ void test("a transcript hit is labelled as one even when the message carries tex
         { id: "C1", ts: 10, kind: "video", text: "voici la legende de ma video sans le mot" },
         { id: "E1", ts: 20, kind: "audio", text: "" },
       ]);
-      ctx.messages.setTranscript(ALICE, "C1", "bonjour tout le monde", "test-model");
-      ctx.messages.setTranscript(ALICE, "E1", "bonjour les amis", "test-model");
+      ctx.messages.setTranscript(ALICE, "C1", { text: "bonjour tout le monde", model: "test-model", language: "fr" });
+      ctx.messages.setTranscript(ALICE, "E1", { text: "bonjour les amis", model: "test-model", language: "fr" });
     },
   });
 

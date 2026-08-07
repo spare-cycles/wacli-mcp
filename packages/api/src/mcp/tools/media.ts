@@ -285,9 +285,10 @@ export function registerMediaTools(server: McpServer, ctx: ToolContext): void {
           biasTerms: ctx.biasTermsFor(row.chatId),
         });
         // Written through the repository rather than kept in memory: the update fires the FTS
-        // trigger, which is what puts the speech into the search index. The model goes with it, so
-        // a transcript can later be told apart from one produced by whatever ran before it.
-        ctx.messages.setTranscript(row.chatId, row.id, result.text, result.model);
+        // trigger, which is what puts the speech into the search index. The whole result goes with
+        // it — the model, so a transcript can later be told apart from one produced by whatever ran
+        // before it, and the language, so `as=transcript` can answer without re-transcribing.
+        ctx.messages.setTranscript(row.chatId, row.id, result);
         // The whole transcript is stored; what comes back is capped like every other payload, and
         // `whatsapp_messages_search` still finds the message by anything said past the cut.
         return textResult(result.text, ctx.config.maxResultChars);

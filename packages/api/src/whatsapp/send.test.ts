@@ -153,11 +153,12 @@ function materialize(id: string, spec: FakeRow): { row: MessageRow; raw: Uint8Ar
     deletedTs: spec.deleted === true ? fx.FIXTURE_TS + 1 : null,
     mediaType: null,
     mediaSha: null,
-    // Schema V2. `null` rather than `false` for `ptt`: these fixtures are text messages, which
+    // Schema V2/V3. `null` rather than `false` for `ptt`: these fixtures are text messages, which
     // carry no audio facts at all, and that is a different statement from "not a voice note".
     ptt: null,
     durationS: null,
     transcriptModel: null,
+    transcriptLanguage: null,
   };
   const raw =
     spec.quotable === false
