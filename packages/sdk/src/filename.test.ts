@@ -253,13 +253,22 @@ void test("the bound is checked before the trim, so a huge name is refused rathe
   // a sender's filename and a CPU stall, and it is invisible in the verdict — hence a clock.
   //
   // The budget is set from the *mutation* margin, not the pass margin, because that is the number the
-  // assertion's value depends on. Measured on an M4 Pro: the two calls below take 0.06 ms as written
-  // — the length check refuses both before any regex runs — and 1367 ms with the bound and the trim
-  // swapped back, which is the mutation this test exists to catch. 500 ms left that mutant failing
-  // by only 2.8x, the whole margin in the one direction hardware erodes; 50 ms fails it by ~27x and
-  // still leaves the passing path three orders of magnitude of headroom for a slower CI box.
-  const started = performance.now();
+  // assertion's value depends on. As written the two calls below cost 0.66 ms of CPU — the length
+  // check refuses both before any regex runs — and 1366 ms with the bound and the trim swapped back,
+  // which is the mutation this test exists to catch. 50 ms fails that mutant by ~27x.
+  //
+  // It measures **CPU** time, not wall time, and that is load-bearing rather than fastidious. The
+  // timed region does essentially no work, so a wall clock here measures the scheduler, not the
+  // computation: under CFS quota throttling (a container with `cpu: 500m`, ordinary on Kubernetes
+  // runners) an exhausted quota freezes the whole cgroup until the next 100 ms period — measured
+  // excursions of 80 ms at `--cpus=0.5` and 98 ms at `--cpus=0.25`, against a 50 ms budget, while
+  // p99 stayed at 0.03 ms. `process.cpuUsage()` does not advance while descheduled, so it keeps the
+  // sensitivity the budget was tightened for without the flake — whose failure message would have
+  // read as a security regression rather than as noise.
+  const started = process.cpuUsage();
   assert.equal(isUsableFilename(".".repeat(60_000) + "a"), false);
   assert.equal(isUsableFilename("é".repeat(60_000)), false);
-  assert.ok(performance.now() - started < 50, `${performance.now() - started}ms to refuse two oversized names`);
+  const spent = process.cpuUsage(started);
+  const ms = (spent.user + spent.system) / 1000;
+  assert.ok(ms < 50, `${ms}ms of CPU to refuse two oversized names`);
 });
