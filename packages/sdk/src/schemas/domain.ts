@@ -113,11 +113,24 @@ export const Chat = z.object({
   /**
    * The one timestamp here that is **not** `epochSeconds`.
    *
-   * It is a deadline, not an observation, and WhatsApp's "muted forever" is expressed as a Long so
-   * large that `toEpochSeconds` (`whatsapp/ingest.ts:212-215`, called at `:600`) divides it by 1000
-   * and still lands far above the threshold. Bounding this field would refuse a row the API really
-   * stores, and a client that cannot parse a chat list because one chat is muted forever is a worse
-   * outcome than an unbounded number.
+   * It is a deadline rather than an observation, and it is left unbounded because the failure modes
+   * are asymmetric: bounding it risks refusing a whole chat page over a single row, while leaving it
+   * unbounded merely forgoes a sanity check on one field.
+   *
+   * The values it must tolerate come from `toEpochSeconds` (`whatsapp/ingest.ts:212-215`, called at
+   * `:600`), which divides anything `>= 1e11` by 1000. WhatsApp's "muted forever" is widely held to
+   * be a very large Long, which would survive that division and land above the threshold — but that
+   * is external knowledge, not something this repo evidences: nothing under `packages/api/src` names
+   * or tests a forever sentinel, and Baileys only forwards the value. The exemption is safe under
+   * either premise, since a `-1` sentinel makes `toEpochSeconds` return `undefined` and the field
+   * lands `null`.
+   *
+   * ⚠️ `.int()` is therefore the only remaining constraint here, and which zod major is installed
+   * decides what that means. A `Long.MAX` sentinel divides to 9223372036854776, above
+   * `Number.MAX_SAFE_INTEGER`. zod v3's `.int()` checks `Number.isInteger` and accepts it; **zod v4
+   * replaced that with `Number.isSafeInteger` and would reject the exact row this exemption exists
+   * to admit** — reintroducing the page-wide failure through a dependency bump rather than a schema
+   * edit. The `^3.25.76` pin cannot resolve to 4.x, so this is a note for whoever does that upgrade.
    */
   mutedUntil: z.number().int().nullable(),
   participantCount: z.number().int().nullable(),
