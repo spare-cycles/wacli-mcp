@@ -451,7 +451,14 @@ returns `z.infer<schema>` and the client `.parse`s the response.
 Express, middleware order and the auth gate. `Handlers` being an exhaustive mapped type over
 `Routes` is what makes a missing handler a compile error — do not weaken it to `Partial`.
 
-The full route list (17 operations) is spec §4. Every one must appear in `routes.ts`.
+The full route list is spec §4, with one **deliberate deviation**: spec §5.1's single
+`GET /v1/media/:chat/:id?as=…` is split into one route per representation (Task 9). A single route
+whose `response` is `JsonResponse | BinaryResponse` makes `HandlerResult<R>` evaluate to `never` —
+`R["response"]` is an indexed access, not a naked type parameter, so the union distributes over
+neither conditional branch. The alternatives were a distributive helper returning a union the caller
+must narrow at runtime (which defeats a typed SDK) or separate entries. Separate entries also keep
+the `method + path` uniqueness invariant, which query-param routing cannot: Express does not route
+on `?as=`. That makes **23 operations**; every one must appear in `routes.ts`.
 
 **Client behaviour:**
 - Request bodies and queries are validated before send.
@@ -817,57 +824,70 @@ void test("reads answer while the socket is down", async () => {
 - Test: `packages/api/src/rest/handlers/media.test.ts`
 
 **Interfaces — Consumes:** `MediaStore.fetch/pathFor`, Task 5's conversions, Task 6's signer.
-**Produces:** `GET /v1/media/:chat/:id` (representation-selected) and `GET /v1/media/dl/:token`.
+**Produces:** seven media routes plus the signed download.
 
-Representation → response, exactly as spec §5.1:
+Representation → route. This replaces spec §5.1's single `?as=` endpoint, for the typing reason in
+Task 3; the representations themselves are unchanged.
 
-| `as` | response | produced by |
+| route | response | produced by |
 | --- | --- | --- |
-| `raw` (default) | binary, `disposition=attachment\|inline` | `MediaStore.fetch` |
-| `link` | JSON `{ url, expiresAt, mimeType, bytes, filename }` | Task 6 signer |
-| `jpeg` | binary | `imageJpeg` |
-| `keyframes` | JSON `{ durationSec, frames: [{ index, atSec, mimeType, data }] }` | `keyframes`, base64 |
-| `text` | JSON `{ text, truncated }` | `pdfExtract` |
-| `transcript` | JSON `{ text, model, language } \| null` | `MessageRow` (Task 4) |
-| `meta` | JSON | row + `probeDimensions`/`probeDuration` |
+| `GET /v1/media/:chat/:id` | binary, `?disposition=attachment\|inline` | `MediaStore.fetch` |
+| `GET /v1/media/:chat/:id/jpeg` | binary | `imageJpeg` |
+| `GET /v1/media/:chat/:id/link` | JSON `{ url, expiresAt, mimeType, bytes, filename }` | Task 6 signer |
+| `GET /v1/media/:chat/:id/keyframes` | JSON `{ durationSec, frames: [{ index, atSec, mimeType, data }] }` | `keyframes`, base64 |
+| `GET /v1/media/:chat/:id/text` | JSON `{ text, truncated }` | `pdfExtract` |
+| `GET /v1/media/:chat/:id/transcript` | JSON `{ text, model, language } \| null` | `MessageRow` (Task 4) |
+| `GET /v1/media/:chat/:id/meta` | JSON | row + `probeDimensions`/`probeDuration` |
+| `GET /v1/media/dl/:token` | binary, public | Task 6 signer |
 
-`as=link` **must resolve and cache the attachment at mint time**, so a link that cannot be produced
+Each route has exactly one response kind, so each SDK client method has one concrete return type and
+no caller narrows anything.
+
+`MediaRepresentation` (Task 2) survives as the enum stamped into a signed token's payload — the token
+still has to say which representation it points at — it is simply no longer a query parameter.
+
+`/link` **must resolve and cache the attachment at mint time**, so a link that cannot be produced
 fails in front of the caller rather than 404-ing for whoever it was sent to. That is also what lets
 the token key on a sha256 instead of a chat id.
 
-`as=transcript` reads cache only and never spends money. Triggering transcription is a separate
+`/transcript` reads cache only and never spends money. Triggering transcription is a separate
 write route (Task 10) — that is what preserves the two-lane rule, since the lane is a property of
 the call site.
 
-`maxBytes` / `maxEdge` / `frames` are optional; the API's configured values are both the defaults
-and the ceilings, so a client cannot request a 4K strip.
+`maxBytes` / `maxEdge` / `frames` are optional query parameters on the routes that use them; the
+API's configured values are both the defaults and the ceilings, so a client cannot request a 4K strip.
 
 - [ ] **Step 1: Write the failing test**
 
 ```ts
 void test("a signed link round-trips to the bytes, without a bearer token", async () => {
-  const { url } = await api.getJson(`/v1/media/${CHAT}/${MSG}?as=link`);
+  const { url } = await api.getJson(`/v1/media/${CHAT}/${MSG}/link`);
   const res = await fetch(url);                      // no Authorization header
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "image/jpeg");
 });
 
-void test("as=keyframes returns indexed frames, not one binary blob", async () => {
-  const body = await api.getJson(`/v1/media/${CHAT}/${VIDEO}?as=keyframes&frames=3`);
+void test("/keyframes returns indexed frames, not one binary blob", async () => {
+  const body = await api.getJson(`/v1/media/${CHAT}/${VIDEO}/keyframes?frames=3`);
   assert.equal(body.frames.length, 3);
   assert.deepEqual(body.frames.map((f) => f.index), [0, 1, 2]);
 });
 
-void test("as=transcript never triggers transcription", async () => {
+void test("/transcript never triggers transcription", async () => {
   const { calls } = transcriberSpy();
-  await api.getJson(`/v1/media/${CHAT}/${AUDIO}?as=transcript`);
+  await api.getJson(`/v1/media/${CHAT}/${AUDIO}/transcript`);
   assert.equal(calls, 0);
 });
 
 void test("a cache miss with the socket down is media_unavailable, not a hang", async () => {
   const api = await testApi({ connectionState: "disconnected" });
-  const res = await api.get(`/v1/media/${CHAT}/${UNCACHED}?as=raw`);
+  const res = await api.get(`/v1/media/${CHAT}/${UNCACHED}`);
   assert.equal(res.status, 503);
+});
+
+void test("the raw route can be forced to download rather than render", async () => {
+  const res = await api.get(`/v1/media/${CHAT}/${MSG}?disposition=attachment`);
+  assert.match(res.headers.get("content-disposition") ?? "", /^attachment; filename=/);
 });
 ```
 
@@ -1075,9 +1095,10 @@ Tool → SDK call mapping:
 | `whatsapp_transcribe` | `transcribe` |
 | the six writes | the matching write routes |
 
-`whatsapp_download_media` branches by media kind, exactly as today: image → `as=jpeg` → one image
-block; video → `as=keyframes` (already base64) plus `as=transcript`; audio → `as=transcript` else
-`as=meta` with the same fixed pointer text; PDF → `as=text`; anything else → `as=link`. **The
+`whatsapp_download_media` branches by media kind, exactly as today, each branch calling the one
+media route that serves it: image → `fetchMediaJpeg` → one image block; video → `fetchMediaKeyframes`
+(already base64) plus `fetchMediaTranscript`; audio → `fetchMediaTranscript`, else `fetchMediaMeta`
+with the same fixed pointer text; PDF → `fetchMediaText`; anything else → `fetchMediaLink`. **The
 document branch is the one deliberate output change**: `extra.path` becomes `extra.url`. One SDK
 call per branch — never fetch bytes to inspect them.
 
@@ -1281,3 +1302,6 @@ These were resolved without the human, who was unavailable, and should be review
 5. ESLint uses a **shared base plus a per-package config**, not one root config.
 6. `packages/api` gets a `whatsapp-api` `bin`, symmetric with the MCP's.
 7. Published image architecture stays **amd64-only**; only the stale comment is fixed.
+8. **Spec §5.1's single `?as=` media endpoint became seven sub-path routes.** Forced by the type
+   system, not preference: one route carrying both a JSON and a binary response makes
+   `HandlerResult<R>` resolve to `never`. The representations and their payloads are unchanged.
