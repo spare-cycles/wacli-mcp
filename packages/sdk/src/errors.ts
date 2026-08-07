@@ -118,12 +118,23 @@ export type ApiErrorOptions = {
   /** Overrides the code's fallback name with the original throw's `name`, straight off the wire. */
   name?: string | undefined;
   details?: Record<string, unknown> | undefined;
+  /**
+   * The `x-request-id` the failed request carried.
+   *
+   * A first-class field rather than a key inside `details`: `details` is whatever the peer put in
+   * the error body, and this is the one thing on an `ApiError` the *local* process knows. It is
+   * also the only correlation an `ApiUnreachableError` can ever have — there is no body to read a
+   * key out of when nothing answered.
+   */
+  requestId?: string | undefined;
 };
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode;
   readonly status: number;
   readonly details: Record<string, unknown> | undefined;
+  /** Set by `createClient`; `undefined` on an error raised in-process, which has no request. */
+  readonly requestId: string | undefined;
 
   constructor(code: ApiErrorCode, message: string, options: ApiErrorOptions = {}) {
     super(message);
@@ -132,6 +143,7 @@ export class ApiError extends Error {
     this.status = options.status ?? spec.status;
     this.name = options.name ?? spec.name;
     this.details = options.details;
+    this.requestId = options.requestId;
   }
 }
 
@@ -294,8 +306,13 @@ const UNDESCRIBED = "the API reported an error with no message";
  *
  * Total: a body that is not a wire error at all still yields an `ApiError`, because the alternative
  * is a `ZodError` escaping the client and telling the model about a field it never asked for.
+ *
+ * `requestId` is the caller's own `x-request-id`, not something read out of the body: it is what
+ * lets a failure logged on this side be found in the other side's log. It never travels back onto
+ * the wire — `errorToWire` leaves it out, because the API already knows the id of the request it is
+ * answering and echoing a client-supplied string into a response body invites a caller to trust it.
  */
-export function errorFromWire(status: number, body: unknown): ApiError {
+export function errorFromWire(status: number, body: unknown, requestId?: string): ApiError {
   const parsed = lenientWireError.safeParse(body);
   const wire = parsed.success ? parsed.data.error : undefined;
   const raw = wire?.code;
@@ -309,6 +326,7 @@ export function errorFromWire(status: number, body: unknown): ApiError {
     // An empty name is treated as absent: it would render as ": message", which names nothing.
     name: wire?.name === "" ? undefined : wire?.name,
     details: wire?.details,
+    requestId,
   });
 }
 

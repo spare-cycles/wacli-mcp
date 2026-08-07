@@ -59,24 +59,40 @@ export type RouteBinding = {
 };
 
 /**
+ * Every issue in a `ZodError`, rendered as `path: shape` and joined — the failing fields, never the
+ * values they carried.
+ *
+ * A body can carry base64 file bytes and a query can carry a search term, so Global Constraint 5
+ * applies to a validation message as much as to a log line. Zod's own messages are shapes
+ * ("Expected number, received nan") with exactly one exception: `invalid_enum_value` echoes the
+ * received string back. That one is rewritten from the schema's own `options`, which makes the
+ * guarantee real rather than merely observed — the next enum-typed field added to a request schema
+ * inherits it instead of quietly breaking it.
+ */
+function describeIssues(error: z.ZodError): string {
+  return error.issues
+    .map((issue) => {
+      const message =
+        issue.code === "invalid_enum_value"
+          ? `expected one of ${issue.options.map((option) => String(option)).join(" | ")}`
+          : issue.message;
+      return issue.path.length === 0 ? message : `${issue.path.join(".")}: ${message}`;
+    })
+    .join("; ");
+}
+
+/**
  * Parse one part of a request, or refuse it as `bad_request`.
  *
  * A `ZodError` escaping here would reach the API's error middleware as an unrecognised throw and be
  * reported as `internal`/500 — a server-fault status for an argument the caller got wrong, and the
  * wrong retry advice. `BadRequestError` carries the name `"Error"`, which is what every bare
  * validation throw in this codebase renders as today, so the model-visible text does not change.
- *
- * The message names the failing paths and never the values: a body can carry base64 file bytes, and
- * a query can carry a search term. Zod's own issue messages are shapes ("Expected number, received
- * nan"), not contents.
  */
 function parsePart(schema: z.ZodTypeAny, value: unknown, part: string): unknown {
   const parsed = schema.safeParse(value);
   if (parsed.success) return parsed.data;
-  const detail = parsed.error.issues
-    .map((issue) => (issue.path.length === 0 ? issue.message : `${issue.path.join(".")}: ${issue.message}`))
-    .join("; ");
-  throw new BadRequestError(`invalid ${part}: ${detail}`);
+  throw new BadRequestError(`invalid ${part}: ${describeIssues(parsed.error)}`);
 }
 
 /** A JSON handler's result is whatever its schema infers; a binary one's is always this shape. */
@@ -88,14 +104,39 @@ function isBinary(result: unknown): result is BinaryPayload {
  * A filename that is safe to quote inside a header value.
  *
  * Quotes would end the quoted-string early and a CR or LF would split the header, so both classes
- * go. Every non-printable and non-ASCII byte goes with them rather than being percent-encoded: this
- * is the `filename=` fallback, the parameter a client uses when it has nothing better, and mangling
- * an accented character in a download name is a far smaller cost than emitting a header value that
+ * go. A backslash goes with them: inside an HTTP quoted-string it is a quoted-pair, so a strict
+ * parser reads `back\slash.pdf` as `backslash.pdf` and a name *ending* in one escapes the closing
+ * quote outright — and the filename is chosen by the WhatsApp sender, so it is attacker-influenced.
+ *
+ * Every non-printable and non-ASCII byte goes too, rather than being percent-encoded: this is the
+ * `filename=` fallback, the parameter a client uses when it has nothing better, and mangling an
+ * accented character in a download name is a far smaller cost than emitting a header value that
  * Node refuses to send at all.
  */
 function headerSafe(filename: string): string {
-  return filename.replace(/[^ -~]/g, "_").replaceAll('"', "");
+  return filename.replace(/[^ -~]/g, "_").replace(/["\\]/g, "");
 }
+
+/** The one thing about `implement()` that is a policy rather than a contract. */
+export type ImplementOptions = {
+  /**
+   * Check each JSON handler's result against its route's response schema before writing it.
+   *
+   * Off by default, and the default is the decision, not an omission. The client `.parse`s every
+   * JSON response on the way in, so a handler that answers a millisecond timestamp — a `number`,
+   * therefore invisible to `tsc`, and refused by `epochSeconds`'s `lt(1e11)` — is already caught;
+   * the only question is *where*. On, the failure is a 500 next to the handler that caused it. Off,
+   * it is a `ZodError` in the MCP, one process away from the bug, with the API logging nothing.
+   *
+   * The reason it is not simply on: the API is a product surface with consumers other than this
+   * SDK's client, and turning a response those consumers accept today into a 500 is a behaviour
+   * change nobody asked for. As a development and test switch it costs them nothing.
+   *
+   * The validated value is discarded and the handler's own result is written, so a schema that
+   * strips unknown keys cannot make the response differ between the two settings.
+   */
+  validateResponses?: boolean | undefined;
+};
 
 /**
  * Turn a fully typed handler map into bindings the API can mount.
@@ -103,7 +144,7 @@ function headerSafe(filename: string): string {
  * Iterating `routes` rather than `handlers` is deliberate: the table is the source of truth for what
  * exists, and the mapped type already guarantees the map has an entry for every key.
  */
-export function implement(handlers: Handlers): RouteBinding[] {
+export function implement(handlers: Handlers, options: ImplementOptions = {}): RouteBinding[] {
   // Widened from the table's 24 literal entry types to their common supertype. `routes` satisfies
   // this by construction, so it is an assignment and not an assertion — and without it every
   // `route.params` below would read a property off a union of which two thirds of the members do
@@ -151,10 +192,22 @@ export function implement(handlers: Handlers): RouteBinding[] {
               filename === undefined ? disposition : `${disposition}; filename="${headerSafe(filename)}"`,
             );
           }
-          res.status(200).send(result.bytes);
+          res.status(route.successStatus ?? 200).send(result.bytes);
           return;
         }
-        res.status(200).json(result);
+
+        if (options.validateResponses === true) {
+          const checked = route.response.schema.safeParse(result);
+          if (!checked.success) {
+            // A plain `Error`, so the API's middleware reports `internal`/500: the handler is at
+            // fault, not the caller. The issues are rendered the same value-free way a refused
+            // request is — a response carries message text, and this text is logged.
+            throw new Error(
+              `the handler for ${key} answered a result its route's schema refuses: ${describeIssues(checked.error)}`,
+            );
+          }
+        }
+        res.status(route.successStatus ?? 200).json(result);
       },
     };
   });

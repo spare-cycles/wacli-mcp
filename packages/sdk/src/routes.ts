@@ -92,6 +92,18 @@ export type Route = {
    * therefore on the generated client — while staying reachable without a token.
    */
   auth: "bearer" | "public" | "signed";
+  /**
+   * The 2xx a successful handler produces. Defaults to 200; `sendText` and `sendFile` set 201,
+   * because they create a resource. Without this field `implement()` has no way to express what
+   * the write table pins, and would write 200 for every JSON route. Nothing the MCP does observes
+   * the difference — the client treats any 2xx as success — but the API is a product surface with
+   * other consumers, and a create that answers 200 is a small lie in the contract.
+   *
+   * Narrower than the plan's `number`: `implement()` always writes a body, and a 204 under
+   * `res.json(result)` would be a no-content status carrying content. The three listed are the
+   * only ones this seam can honestly produce.
+   */
+  successStatus?: 200 | 201 | 202;
 };
 
 /**
@@ -283,6 +295,8 @@ export const routes = {
     body: SendTextBody,
     response: { kind: "json", schema: SendResult },
     auth: "bearer",
+    // A message was created, and the response names it. The other six writes act on one that exists.
+    successStatus: 201,
   },
 
   sendFile: {
@@ -291,6 +305,7 @@ export const routes = {
     body: SendFileBody,
     response: { kind: "json", schema: SendResult },
     auth: "bearer",
+    successStatus: 201,
   },
 
   editMessage: {

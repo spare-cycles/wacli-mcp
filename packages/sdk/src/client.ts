@@ -10,7 +10,7 @@ import type { z } from "zod";
 
 import { ApiError, ApiUnreachableError, BadRequestError, errorFromWire } from "./errors.js";
 import type { BinaryPayload, HandlerResult, Route } from "./routes.js";
-import { routes, type Routes } from "./routes.js";
+import { routes, type RouteKey, type Routes } from "./routes.js";
 
 /**
  * The parts of a request a route actually declares.
@@ -42,8 +42,30 @@ export type ClientOptions = {
   token?: string | undefined;
   /** Injectable so tests drive the client without a listener. */
   fetch?: typeof globalThis.fetch | undefined;
-  /** Per request, via `AbortSignal.timeout`. Omitted means no deadline of the client's own. */
+  /** The default deadline for every route, via `AbortSignal.timeout`. Omitted means none. */
   timeoutMs?: number | undefined;
+  /**
+   * Per-route overrides, keyed by operation name, resolved as `timeoutMsByRoute[key] ?? timeoutMs`.
+   *
+   * `transcribe` legitimately outlives the shared deadline: the API's `transcribeTimeoutMs` defaults
+   * to 900 000 ms while `requestTimeoutMs` clamps at 300 000, so a single number either abandons a
+   * transcription that is still running or lets a listing hang for a quarter of an hour. One client
+   * with an override beats two, which would duplicate the token, the base URL and the request-id
+   * policy, and beats a deadline-applying `fetch` wrapper, which hides the number from the config
+   * that owns it.
+   */
+  timeoutMsByRoute?: Partial<Record<RouteKey, number>> | undefined;
+  /**
+   * Where each request's `x-request-id` comes from. Defaults to `crypto.randomUUID`.
+   *
+   * A factory here rather than a field on the call input: the input type is generated from the route
+   * table, and `getHealth` declares nothing and so takes no argument at all — an optional `requestId`
+   * would make `client.getHealth({})` compile, which the contract pins as an error. A caller holding
+   * its own correlation id closes over it (or over the `AsyncLocalStorage` that holds it), and
+   * whatever this returns is both what the API logs and what a thrown `ApiError` carries back on
+   * `requestId`.
+   */
+  requestIdFactory?: (() => string) | undefined;
 };
 
 /** What a client method is handed at runtime, once the types have been erased. */
@@ -86,15 +108,69 @@ function queryString(query: unknown): string {
   return rendered === "" ? "" : `?${rendered}`;
 }
 
-/** `attachment; filename="x.pdf"` → the two fields `BinaryPayload` carries. */
+/**
+ * `attachment; filename="x.pdf"` → the two fields `BinaryPayload` carries.
+ *
+ * Only the extended `filename*=` parameter is percent-encoded (RFC 5987); the plain `filename=` is
+ * literal, and `implement()` writes it literally. Decoding it would turn `50% off invoice.pdf` — a
+ * name the WhatsApp sender chose, so an externally reachable one — into a `URIError` thrown *after*
+ * a 200 with the bytes already in hand, and a `URIError` is neither an `ApiError` nor anything the
+ * MCP can classify.
+ *
+ * The quoted form is matched as a quoted string rather than scanned to the first `;`, because a `;`
+ * inside quotes is ordinary data: `filename="a;b.pdf"` was reported to the caller as `a`.
+ *
+ * Nothing here throws. A malformed `filename*=` from a third-party proxy falls back to the plain
+ * parameter, and to no filename when there is none: the bytes are already downloaded, and losing
+ * the name is a far smaller failure than losing them.
+ */
 function parseDisposition(header: string | null): { filename?: string; disposition?: "inline" | "attachment" } {
   if (header === null) return {};
   const kind = /^\s*(inline|attachment)/i.exec(header)?.[1]?.toLowerCase();
-  const filename = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header)?.[1];
+  const plain = /filename=\s*(?:"([^"]*)"|([^;]+))/i.exec(header);
+  // The charset and language tags RFC 5987 puts before the value: `UTF-8''`, `UTF-8'en'`.
+  const extended = /filename\*=\s*(?:[\w-]+'[^']*')?"?([^";]+)"?/i.exec(header)?.[1];
+  let decoded: string | undefined;
+  if (extended !== undefined) {
+    try {
+      decoded = decodeURIComponent(extended);
+    } catch {
+      decoded = undefined;
+    }
+  }
+  // The extended parameter wins when it decodes, per RFC 6266; an empty name is no name.
+  const filename = decoded ?? plain?.[1] ?? plain?.[2]?.trim();
   return {
-    ...(filename === undefined ? {} : { filename: decodeURIComponent(filename) }),
+    ...(filename === undefined || filename === "" ? {} : { filename }),
     ...(kind === "inline" || kind === "attachment" ? { disposition: kind } : {}),
   };
+}
+
+/**
+ * One transport step — the `fetch` itself, or a read of the body it answered with.
+ *
+ * Every one of them fails the same way and means the same thing, which is why they share a guard.
+ * DNS, ECONNREFUSED and TLS reject at the `fetch`; `AbortSignal.timeout` aborts the *body stream*
+ * as well as the connect, so a deadline that fires once the headers have arrived rejects at the
+ * read instead, and a truncated response rejects there identically. All of them say the same thing:
+ * no complete answer. So all of them are `api_unreachable` and never `not_connected` — one says the
+ * backend is down, the other says WhatsApp is, and the MCP surfaces them differently. None of them
+ * may escape as a raw `TimeoutError`, which nothing downstream has a branch for.
+ *
+ * `schema.parse` deliberately stays outside: a `ZodError` there is the peer breaking the contract,
+ * and calling that an unreachable API would hide a real bug.
+ */
+async function transport<T>(step: () => Promise<T>, shown: string, requestId: string): Promise<T> {
+  try {
+    return await step();
+  } catch (err) {
+    throw new ApiUnreachableError(
+      err instanceof Error
+        ? `could not reach the API at ${shown}: ${err.message}`
+        : `could not reach the API at ${shown}`,
+      { requestId },
+    );
+  }
 }
 
 /**
@@ -103,16 +179,20 @@ function parseDisposition(header: string | null): { filename?: string; dispositi
  * The body is read as text and then parsed, never `res.json()` directly: an HTML error page from a
  * reverse proxy would make `.json()` throw, and a `SyntaxError` about an unexpected `<` tells nobody
  * anything. `errorFromWire` is total over whatever comes out, including `undefined`.
+ *
+ * The read and the parse fail for different reasons and are handled differently: a read that fails
+ * is the stream dying under a deadline, which `transport` reports as `api_unreachable`; a parse that
+ * fails is a body that was never a wire error, which degrades to `undefined` and keeps the status.
  */
-async function errorFromResponse(res: Response): Promise<ApiError> {
+async function errorFromResponse(res: Response, shown: string, requestId: string): Promise<ApiError> {
+  const text = await transport(() => res.text(), shown, requestId);
   let body: unknown;
   try {
-    const text = await res.text();
     body = text === "" ? undefined : (JSON.parse(text) as unknown);
   } catch {
     body = undefined;
   }
-  return errorFromWire(res.status, body);
+  return errorFromWire(res.status, body, requestId);
 }
 
 /**
@@ -144,16 +224,18 @@ function withoutCredentials(baseUrl: string): string {
  * at the bug; inbound, the peer broke the contract, and no error *code* honestly describes that —
  * `bad_request` would claim an HTTP refusal that never happened.
  *
- * Every request carries an `x-request-id`. The split turned one greppable log stream into two, and
- * without a shared id an MCP-side tool failure caused by an API-side 500 cannot be tied to its
- * cause. It costs a header and a UUID; recovering the correlation afterwards costs an afternoon.
+ * Every request carries an `x-request-id`, and every `ApiError` thrown out of here carries the same
+ * value on `requestId`. The split turned one greppable log stream into two, and a header nobody can
+ * read back joins nothing: the id has to reach the caller for an MCP-side tool failure to be tied
+ * to the API-side 500 that caused it. `requestIdFactory` is how a caller supplies its own instead.
  */
 export function createClient(opts: ClientOptions): WhatsAppApiClient {
   const doFetch = opts.fetch ?? globalThis.fetch;
   const base = opts.baseUrl.replace(/\/+$/, "");
   const shown = withoutCredentials(base);
+  const newRequestId = opts.requestIdFactory ?? (() => crypto.randomUUID());
 
-  const call = async (route: Route, input: CallInput): Promise<unknown> => {
+  const call = async (route: Route, timeoutMs: number | undefined, input: CallInput): Promise<unknown> => {
     // Annotated `unknown` rather than left inferred: `ZodTypeAny["parse"]` answers `any`, and an
     // `any` flowing into the URL and the body is the one place this module could silently send
     // something the table never described.
@@ -161,8 +243,15 @@ export function createClient(opts: ClientOptions): WhatsAppApiClient {
     const query: unknown = route.query === undefined ? undefined : route.query.parse(input.query);
     const body: unknown = route.body === undefined ? undefined : route.body.parse(input.body);
 
+    // Built before the request, and outside every guard below: `queryString` refuses a value a URL
+    // cannot carry with a `BadRequestError`, and that is a caller bug. Inside the guard it would be
+    // rebranded as an unreachable API — the one misclassification the whole taxonomy exists to
+    // prevent, reported as a downed backend.
+    const url = `${base}${fillPath(route.path, params)}${queryString(query)}`;
+
+    const requestId = newRequestId();
     const headers: Record<string, string> = {
-      "x-request-id": crypto.randomUUID(),
+      "x-request-id": requestId,
       // What this route actually answers. Asking for JSON on the raw download would let a strict
       // server answer 406 for a request the contract says is well formed.
       accept: route.response.kind === "binary" ? "*/*" : "application/json",
@@ -174,35 +263,41 @@ export function createClient(opts: ClientOptions): WhatsAppApiClient {
       method: route.method,
       headers,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      ...(opts.timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(opts.timeoutMs) }),
+      ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
     };
 
-    let res: Response;
-    try {
-      res = await doFetch(`${base}${fillPath(route.path, params)}${queryString(query)}`, init);
-    } catch (err) {
-      // DNS, ECONNREFUSED, TLS, an abort from `timeoutMs` — no HTTP exchange happened, so this is
-      // `api_unreachable` and never `not_connected`. The two mean different things: one says the
-      // backend is down, the other says WhatsApp is, and the MCP surfaces them differently.
-      throw new ApiUnreachableError(
-        err instanceof Error
-          ? `could not reach the API at ${shown}: ${err.message}`
-          : `could not reach the API at ${shown}`,
-      );
-    }
-
-    if (!res.ok) throw await errorFromResponse(res);
+    const res = await transport(() => doFetch(url, init), shown, requestId);
+    if (!res.ok) throw await errorFromResponse(res, shown, requestId);
 
     if (route.response.kind === "binary") {
       const payload: BinaryPayload = {
-        bytes: new Uint8Array(await res.arrayBuffer()),
+        bytes: new Uint8Array(await transport(() => res.arrayBuffer(), shown, requestId)),
         mimeType: res.headers.get("content-type") ?? "application/octet-stream",
         ...parseDisposition(res.headers.get("content-disposition")),
       };
       return payload;
     }
-    return route.response.schema.parse(await res.json());
+
+    const text = await transport(() => res.text(), shown, requestId);
+    let payload: unknown;
+    try {
+      payload = JSON.parse(text) as unknown;
+    } catch {
+      // The success path's answer to what the error path already handles: a 200 carrying an HTML
+      // captive portal or an ingress default page is a broken reply, not a `SyntaxError` about a
+      // stray angle bracket. The body itself is not quoted back — a success body is chat content.
+      throw new ApiError(
+        "internal",
+        `the API answered ${res.status} with a body that is not JSON (content-type: ${res.headers.get("content-type") ?? "none"})`,
+        { status: res.status, requestId },
+      );
+    }
+    return route.response.schema.parse(payload);
   };
+
+  // Resolved once per route rather than once per request: `opts` cannot change, so the lookup is a
+  // property of the client, not of the call.
+  const perRoute: Record<string, number | undefined> = opts.timeoutMsByRoute ?? {};
 
   // The one cast in this module, and the same one `implement()` makes for the same reason:
   // `Object.entries` erases the correlation between a key and its route, which is not expressible
@@ -210,7 +305,10 @@ export function createClient(opts: ClientOptions): WhatsAppApiClient {
   // `(input?) => Promise<unknown>`; `WhatsAppApiClient` is what says which input and which result
   // belongs to which key, and it is checked at every call site.
   const methods = Object.fromEntries(
-    Object.entries(routes).map(([key, route]) => [key, async (input: CallInput = {}) => await call(route, input)]),
+    Object.entries(routes).map(([key, route]) => {
+      const timeoutMs = perRoute[key] ?? opts.timeoutMs;
+      return [key, async (input: CallInput = {}) => await call(route, timeoutMs, input)];
+    }),
   );
   return methods as unknown as WhatsAppApiClient;
 }

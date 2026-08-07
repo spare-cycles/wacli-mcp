@@ -1,8 +1,9 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
+import { createClient } from "./client.js";
 import { ApiError } from "./errors.js";
-import { routes, type BinaryPayload } from "./routes.js";
+import { routes, type BinaryPayload, type Route } from "./routes.js";
 import { implement, type Handlers, type RawRequest, type RawResponse } from "./server.js";
 
 // --- fixtures -------------------------------------------------------------------------------------
@@ -303,4 +304,152 @@ void test("a handler reads the parsed parts its route declares, and undefined fo
   const { res } = capture();
   await one.handle(request({ query: { limit: "7" } }), res);
   assert.deepEqual(seen, { limit: 7, params: undefined });
+});
+
+// --- the status a create answers with -----------------------------------------------------------------
+
+void test("the two creates answer 201 and every other write answers 200", async () => {
+  const statusOf = async (path: string, method: string, body?: unknown): Promise<number | undefined> => {
+    const { res, written } = capture();
+    await binding(path, method).handle(request({ params: { chat: "c@s.whatsapp.net", id: "M1" }, body }), res);
+    return written.status;
+  };
+  // The table is the single source of truth for this, not a status hand-written next to a mount.
+  assert.equal(await statusOf("/v1/messages", "POST", { recipient: "Marie", text: "hi" }), 201);
+  assert.equal(await statusOf("/v1/messages/file", "POST", { recipient: "Marie", path: "/tmp/a.pdf" }), 201);
+  assert.equal(await statusOf("/v1/messages/:chat/:id", "PATCH", { text: "fixed" }), 200);
+  assert.equal(await statusOf("/v1/messages/:chat/:id", "DELETE"), 200);
+  assert.equal(await statusOf("/v1/messages/:chat/:id/transcribe", "POST"), 200);
+  assert.equal(await statusOf("/v1/chats", "GET"), 200);
+});
+
+void test("every route in the table declares a status implement() can actually write", () => {
+  // `successStatus` is narrower than the plan's `number` on purpose: `implement()` always writes a
+  // body, and a 204 would be a no-content status carrying content.
+  const table: Record<string, Route> = routes;
+  for (const [key, route] of Object.entries(table)) {
+    const status = route.successStatus ?? 200;
+    assert.ok(status >= 200 && status < 300, `${key} answers ${status}`);
+  }
+});
+
+// --- what the header carries, and what the client reads back out of it ----------------------------------
+
+/** The `content-disposition` a binary route writes for a given filename. */
+async function dispositionFor(filename: string): Promise<string | undefined> {
+  const named: Handlers = { ...handlers, fetchMedia: record({ ...bytes, filename }) };
+  const one = implement(named).find((b) => b.path === "/v1/media/:chat/:id");
+  assert.ok(one);
+  const { res, written } = capture();
+  await one.handle(request({ params: { chat: "c", id: "M1" } }), res);
+  return written.headers["content-disposition"];
+}
+
+void test("a backslash is stripped, because inside a quoted string it escapes the next character", async () => {
+  // `\` is printable ASCII, so the non-ASCII sweep left it. A trailing one escaped the closing
+  // quote outright and a strict parser read `back\slash.pdf` as `backslash.pdf` — and the filename
+  // is chosen by the WhatsApp sender.
+  assert.equal(await dispositionFor("back\\slash.pdf"), 'attachment; filename="backslash.pdf"');
+  assert.equal(await dispositionFor("evil\\"), 'attachment; filename="evil"');
+});
+
+void test("what implement() writes into the header is what createClient() reads back out", async () => {
+  // The two halves of the contract disagreeing is what made a `%` in a filename throw `URIError`
+  // after a 200. Only a round trip catches that again: the client's own suite pins the parse, this
+  // pins that the parse is of what this package actually emits.
+  for (const name of ["photo.jpg", "50% off invoice.pdf", "100%.png", "a;b.pdf", "rapport (final).pdf"]) {
+    const header = await dispositionFor(name);
+    assert.ok(header);
+    const client = createClient({
+      baseUrl: "http://x",
+      fetch: () =>
+        Promise.resolve(
+          new Response(new Uint8Array([1]), {
+            status: 200,
+            headers: { "content-type": "image/jpeg", "content-disposition": header },
+          }),
+        ),
+    });
+    const payload = await client.fetchMedia({ params: { chat: "c", id: "M1" }, query: {} });
+    assert.equal(payload.filename, name, header);
+  }
+});
+
+// --- the refusal that must not echo what it refused -------------------------------------------------------
+
+void test("an enum refusal names the options the schema allows, never the value it received", async () => {
+  const { res } = capture();
+  await assert.rejects(
+    () =>
+      binding("/v1/media/:chat/:id").handle(
+        request({ params: { chat: "c", id: "M1" }, query: { disposition: "sideways-s3cret-value" } }),
+        res,
+      ),
+    (err: unknown) => {
+      assert.ok(err instanceof ApiError);
+      // Zod's own `invalid_enum_value` message ends "…, received 'sideways-s3cret-value'". Every
+      // other issue kind describes a shape; this one quotes the input, and a query can carry a
+      // search term.
+      assert.doesNotMatch(err.message, /sideways-s3cret-value/);
+      assert.match(err.message, /disposition: expected one of inline \| attachment/);
+      return true;
+    },
+  );
+});
+
+// --- the response check that is off by default --------------------------------------------------------------
+
+void test("a millisecond timestamp is written straight out by default, and refused when asked for", async () => {
+  const drifted: Handlers = {
+    ...handlers,
+    // A `number`, so `tsc` is happy; `epochSeconds`'s lt(1e11) is the only thing that says otherwise.
+    listChats: record({
+      nextCursor: null,
+      items: [
+        {
+          id: "c",
+          name: null,
+          isGroup: false,
+          lastMessageTs: 1_700_000_000_000,
+          unreadCount: 0,
+          archived: false,
+          mutedUntil: null,
+          participantCount: null,
+        },
+      ],
+    }),
+  };
+
+  const lenient = implement(drifted).find((b) => b.path === "/v1/chats");
+  assert.ok(lenient);
+  const { res: out, written } = capture();
+  await lenient.handle(request({ query: {} }), out);
+  // The default: the API answers 200 and the client one process away raises the ZodError.
+  assert.equal(written.status, 200);
+
+  const checked = implement(drifted, { validateResponses: true }).find((b) => b.path === "/v1/chats");
+  assert.ok(checked);
+  const { res: strict } = capture();
+  await assert.rejects(
+    () => checked.handle(request({ query: {} }), strict),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      // A plain Error, so the middleware reports internal/500: the handler is at fault, not the caller.
+      assert.ok(!(err instanceof ApiError));
+      assert.match(err.message, /the handler for listChats/);
+      assert.match(err.message, /items\.0\.lastMessageTs/);
+      return true;
+    },
+  );
+});
+
+void test("the checked path writes the handler's own result, not the parsed one", async () => {
+  const { res, written } = capture();
+  const one = implement(handlers, { validateResponses: true }).find((b) => b.path === "/v1/capabilities");
+  assert.ok(one);
+  await one.handle(request(), res);
+  // Same object identity: a schema that strips unknown keys cannot make the response differ
+  // between the two settings.
+  assert.equal(written.body, capabilities);
+  assert.equal(written.status, 200);
 });

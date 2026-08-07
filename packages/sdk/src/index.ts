@@ -99,7 +99,7 @@ export type {
 } from "./routes.js";
 
 export { implement } from "./server.js";
-export type { Handler, Handlers, RawRequest, RawResponse, RouteBinding } from "./server.js";
+export type { Handler, Handlers, ImplementOptions, RawRequest, RawResponse, RouteBinding } from "./server.js";
 
 export { createClient } from "./client.js";
 export type { ClientMethod, ClientOptions, WhatsAppApiClient } from "./client.js";
