@@ -429,6 +429,11 @@ export class RecipientNotFoundError extends ApiError {}
 export class MediaUnavailableError extends ApiError {}
 export class MessageNotFoundError extends ApiError {}
 export class ConversionError extends ApiError {}
+// `media/transcribe.ts:91-93`, `override name = "TranscriptionError"`. Thrown for an over-long
+// recording, no configured backend, or every backend failing. Absent from an earlier draft of this
+// list even though the toApiError table below already mapped it — without the class, every failed
+// transcription renders `ApiError: …` instead.
+export class TranscriptionError extends ApiError {}
 export class NotConnectedError extends ApiError {}
 // The four `whatsapp/send.ts` throws. Easy to miss because they never appear in a tool signature —
 // they surface only through `describeError`, which is exactly why omitting them breaks output.
@@ -479,16 +484,19 @@ renderings today.
 | `mcp/cursor.ts:13` — `CursorError`, thrown by `decodeCursor` for every paginated read | `CursorError: ` |
 | `mcp/tools/reads.ts:172` — the `kind`/`has_media` contradiction | `Error: ` |
 
-The wire carries a code; the SDK must reconstruct the **name** as well as the message. So
-`errorFromWire` needs an explicit `name` on the wire envelope, or a code-to-name table covering
-these. Concretely: add `invalid_cursor` mapped to a class whose `name` is `"CursorError"`, and give
-`bad_request` a class that sets `this.name = "Error"` when the API reports the failure originated
-from a bare throw. That last one is ugly, and it is the price of "every other byte stays identical" —
-the alternative is to declare these a fourth documented exception, which is a decision, not an
-oversight. **This plan takes the byte-identical route.**
-
-The API side must therefore send the original `name`: extend the wire envelope to
+The wire carries a code; the SDK must reconstruct the **name** as well as the message. That is
+precisely why the envelope carries `name` explicitly:
 `{ error: { code, name, message, details? } }`. Without `name` on the wire this is unimplementable.
+
+**Because `name` travels on the wire, the code does not have to encode it**, and an earlier draft's
+suggestion of an `invalid_cursor` code is therefore redundant and is dropped. `CursorError` maps to
+`bad_request` — matching the `toApiError` table below and Task 8's test, which asserts
+`error.code === "bad_request"` for a malformed cursor — while `error.name` carries the literal
+`"CursorError"` so `describeError` still renders `CursorError: …`. Same mechanism for the bare
+throws: code `bad_request`, `name: "Error"`.
+
+One code, many names, is the right factoring here: the code is what a client branches on, the name
+is what the model reads. Conflating them would mint a wire code per legacy class name.
 
 #### The translation layer, and why nothing works without it
 
@@ -556,7 +564,11 @@ export const Message = z.object({
   id: z.string(), chat: z.string(), ts: z.number().int(), fromMe: z.boolean(),
   sender: z.object({ id: z.string(), name: z.string() }),
   kind: z.enum(MESSAGE_KINDS), text: z.string().nullable(), transcript: z.string().nullable(),
-  quotedId: z.string().nullable(), status: z.string(),
+  // `status` is nullable, and this is not cosmetic: `MessageRow.status` is `string | null`
+  // (`db/messages.ts:34`, written `?? null` at `:398`) and `presentMessage` passes it through
+  // unmodified (`mcp/result.ts:135`), so `"status": null` already appears in today's tool output.
+  // A non-nullable schema here would reject real rows and break Global Constraint 2.
+  quotedId: z.string().nullable(), status: z.string().nullable(),
   edited: z.boolean(), deleted: z.boolean(),
   media: z.object({ type: z.string().nullable(), cached: z.boolean() }).nullable(),
   reactionCount: z.number().int(),
