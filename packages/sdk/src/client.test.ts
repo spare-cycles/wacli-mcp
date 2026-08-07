@@ -232,6 +232,26 @@ void test("the unreachable message names the API without naming a credential in 
   );
 });
 
+void test("the appended transport detail is redacted too, not only the base URL", async () => {
+  // The sentence was sanitised and then `err.message` was appended raw, which put the whole request
+  // URL back into it: the platform `fetch` echoes that URL for a credentialed base and for an
+  // unparseable one, and it carries both the base's password and — on the signed-media route — a
+  // path token that is itself the credential. The real `fetch` is deliberate: a stub cannot produce
+  // the two messages that leak, and both of these reject before a socket is opened.
+  for (const baseUrl of ["http://someone:hunter2@127.0.0.1:1", "not a url"]) {
+    await assert.rejects(
+      () => createClient({ baseUrl }).fetchSignedMedia({ params: { token: "v1.SIGNEDMEDIA" } }),
+      (err: unknown) => {
+        assert.ok(err instanceof ApiUnreachableError);
+        assert.doesNotMatch(err.message, /hunter2/, err.message);
+        assert.doesNotMatch(err.message, /someone/, err.message);
+        assert.doesNotMatch(err.message, /SIGNEDMEDIA/, err.message);
+        return true;
+      },
+    );
+  }
+});
+
 void test("a timeout is a transport failure, because AbortSignal.timeout rejects the fetch", async () => {
   const client = createClient({
     baseUrl: "http://x",
@@ -366,6 +386,37 @@ void test("a malformed filename* falls back rather than throwing on a download t
   // same `URIError` the plain parameter used to. Losing the name beats losing the bytes.
   assert.equal(await readBack(`attachment; filename="ok.pdf"; filename*=UTF-8''bad%zz.pdf`), "ok.pdf");
   assert.equal(await readBack(`attachment; filename*=UTF-8''bad%zz.pdf`), undefined);
+});
+
+void test("a `;` inside the quoted filename does not smuggle a second parameter", async () => {
+  // The sender chooses the filename, `headerSafe` did not strip `;`, and a `;` inside a quoted
+  // string is ordinary data — so an unscoped `filename*=` search found a parameter *inside* the
+  // plain parameter's value and percent-decoded it, which is how `../../etc/passwd`, an embedded
+  // quote, a CR/LF and a NUL all came back out of a name those characters had been removed from.
+  // These are the headers a server that does not sanitise `;` writes; the value is data, not a
+  // parameter, and is reported verbatim.
+  const smuggled = (payload: string): string => `attachment; filename="a; filename*=UTF-8''${payload}"`;
+  assert.equal(
+    await readBack(smuggled("%2E%2E%2F%2E%2E%2Fetc%2Fpasswd")),
+    `a; filename*=UTF-8''%2E%2E%2F%2E%2E%2Fetc%2Fpasswd`,
+  );
+  assert.equal(await readBack(smuggled("%22evil%22.exe")), `a; filename*=UTF-8''%22evil%22.exe`);
+  assert.equal(await readBack(smuggled("line%0Ainjected")), `a; filename*=UTF-8''line%0Ainjected`);
+  assert.equal(await readBack(smuggled("nul%00.pdf")), `a; filename*=UTF-8''nul%00.pdf`);
+  // The same payloads as a real second parameter still decode: scoping the search is not disabling it.
+  assert.equal(await readBack(`attachment; filename="a"; filename*=UTF-8''%C3%A9t%C3%A9.pdf`), "été.pdf");
+});
+
+void test("a decoded name that is a path or carries control characters is not reported as a name", async () => {
+  // Checked whichever parameter it arrived in: a consumer writes this to a filesystem or renders it.
+  assert.equal(await readBack(`attachment; filename*=UTF-8''%2E%2E%2F%2E%2E%2Fetc%2Fpasswd`), undefined);
+  assert.equal(await readBack(`attachment; filename*=UTF-8''nul%00.pdf`), undefined);
+  assert.equal(await readBack(`attachment; filename*=UTF-8''line%0Ainjected`), undefined);
+  assert.equal(await readBack(`attachment; filename*=UTF-8''%2E%2E`), undefined);
+  assert.equal(await readBack('attachment; filename="../../etc/passwd"'), undefined);
+  assert.equal(await readBack('attachment; filename="back\\slash.pdf"'), undefined);
+  // And an unusable extended value falls back to a usable plain one rather than losing the name.
+  assert.equal(await readBack(`attachment; filename="safe.pdf"; filename*=UTF-8''%2E%2E%2Fetc%2Fpasswd`), "safe.pdf");
 });
 
 // --- a deadline that fires after the headers ------------------------------------------------------------

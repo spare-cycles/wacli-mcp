@@ -255,8 +255,12 @@ void test("a filename with no disposition is served attachment, never inline", a
   const one = implement(named).find((b) => b.path === "/v1/media/:chat/:id");
   assert.ok(one);
   await one.handle(request({ params: { chat: "c", id: "M1" } }), res);
-  // The quote is stripped rather than escaped: it would otherwise end the quoted string early.
-  assert.equal(written.headers["content-disposition"], 'attachment; filename="invoice.pdf"');
+  // The quote is stripped from the quoted parameter — it would otherwise end the string early —
+  // and the real name rides along in the extended one, which is not re-parsed for parameters.
+  assert.equal(
+    written.headers["content-disposition"],
+    `attachment; filename="invoice.pdf"; filename*=UTF-8''in%22voice.pdf`,
+  );
 });
 
 void test("a route with no filename and no disposition sets no content-disposition at all", async () => {
@@ -325,11 +329,13 @@ void test("the two creates answer 201 and every other write answers 200", async 
 
 void test("every route in the table declares a status implement() can actually write", () => {
   // `successStatus` is narrower than the plan's `number` on purpose: `implement()` always writes a
-  // body, and a 204 would be a no-content status carrying content.
+  // body, and a 204 would be a no-content status carrying content. So the three writable statuses
+  // are named rather than a 2xx range asserted — a range admits the 204 this exists to exclude, and
+  // a guard that stays green under the mutation it guards against reports nothing.
   const table: Record<string, Route> = routes;
   for (const [key, route] of Object.entries(table)) {
     const status = route.successStatus ?? 200;
-    assert.ok(status >= 200 && status < 300, `${key} answers ${status}`);
+    assert.ok([200, 201, 202].includes(status), `${key} answers ${status}`);
   }
 });
 
@@ -348,30 +354,64 @@ async function dispositionFor(filename: string): Promise<string | undefined> {
 void test("a backslash is stripped, because inside a quoted string it escapes the next character", async () => {
   // `\` is printable ASCII, so the non-ASCII sweep left it. A trailing one escaped the closing
   // quote outright and a strict parser read `back\slash.pdf` as `backslash.pdf` — and the filename
-  // is chosen by the WhatsApp sender.
+  // is chosen by the WhatsApp sender. It is not carried in the extended parameter either: a `\` is
+  // a path separator, so the name it would preserve is one no consumer should be handed.
   assert.equal(await dispositionFor("back\\slash.pdf"), 'attachment; filename="backslash.pdf"');
   assert.equal(await dispositionFor("evil\\"), 'attachment; filename="evil"');
 });
+
+void test("a name the quoted parameter cannot carry is carried by the extended one instead", async () => {
+  // Stripping is lossy and `;` now has to go — it separates one parameter from the next, so leaving
+  // it inside the quoted value is what let a sender-chosen name smuggle a `filename*=` of its own.
+  // Dropping the character silently would just lose the name a different way, so the real one goes
+  // into the parameter that is percent-encoded and therefore cannot be re-read as parameters.
+  assert.equal(await dispositionFor("a;b.pdf"), `attachment; filename="ab.pdf"; filename*=UTF-8''a%3Bb.pdf`);
+  assert.equal(await dispositionFor("été.pdf"), `attachment; filename="_t_.pdf"; filename*=UTF-8''%C3%A9t%C3%A9.pdf`);
+  // A name that is not a name is preserved nowhere, and one that is nothing at all names nothing.
+  assert.equal(await dispositionFor("../../etc/passwd"), 'attachment; filename="....etcpasswd"');
+  assert.equal(await dispositionFor(".."), "attachment");
+});
+
+/** The filename `createClient()` reads back out of the header `implement()` wrote for `filename`. */
+async function roundTrip(filename: string): Promise<string | undefined> {
+  const header = await dispositionFor(filename);
+  assert.ok(header);
+  const client = createClient({
+    baseUrl: "http://x",
+    fetch: () =>
+      Promise.resolve(
+        new Response(new Uint8Array([1]), {
+          status: 200,
+          headers: { "content-type": "image/jpeg", "content-disposition": header },
+        }),
+      ),
+  });
+  return (await client.fetchMedia({ params: { chat: "c", id: "M1" }, query: {} })).filename;
+}
 
 void test("what implement() writes into the header is what createClient() reads back out", async () => {
   // The two halves of the contract disagreeing is what made a `%` in a filename throw `URIError`
   // after a 200. Only a round trip catches that again: the client's own suite pins the parse, this
   // pins that the parse is of what this package actually emits.
-  for (const name of ["photo.jpg", "50% off invoice.pdf", "100%.png", "a;b.pdf", "rapport (final).pdf"]) {
+  for (const name of ["photo.jpg", "50% off invoice.pdf", "100%.png", "a;b.pdf", "rapport (final).pdf", "été.pdf"]) {
+    assert.equal(await roundTrip(name), name, name);
+  }
+});
+
+void test("a filename that smuggles a second parameter round-trips as data, not as a parameter", async () => {
+  // The sender picks this string. `headerSafe` did not strip `;`, the client's `filename*=` search
+  // was not scoped to a parameter boundary and its result won unconditionally, so the header below
+  // was written with the payload inside the quoted value and read back out percent-decoded:
+  // `../../etc/passwd`, an embedded quote, a CR/LF and a NUL, all of them characters the write side
+  // removes precisely because they are not the sender's to choose. Both sides are fixed, so both
+  // are asserted: nothing inside the quoted value can be read as a parameter, and the name that
+  // comes back is the one that went in.
+  for (const payload of ["%2E%2E%2F%2E%2E%2Fetc%2Fpasswd", "%22evil%22.exe", "line%0Ainjected", "nul%00.pdf"]) {
+    const name = `a; filename*=UTF-8''${payload}`;
     const header = await dispositionFor(name);
     assert.ok(header);
-    const client = createClient({
-      baseUrl: "http://x",
-      fetch: () =>
-        Promise.resolve(
-          new Response(new Uint8Array([1]), {
-            status: 200,
-            headers: { "content-type": "image/jpeg", "content-disposition": header },
-          }),
-        ),
-    });
-    const payload = await client.fetchMedia({ params: { chat: "c", id: "M1" }, query: {} });
-    assert.equal(payload.filename, name, header);
+    assert.match(header, /^attachment; filename="[^";]*"; filename\*=UTF-8''[^";]+$/);
+    assert.equal(await roundTrip(name), name, header);
   }
 });
 

@@ -14,6 +14,7 @@
 import type { z } from "zod";
 
 import { BadRequestError } from "./errors.js";
+import { isUsableFilename } from "./filename.js";
 import type { BinaryPayload, HandlerResult, Route } from "./routes.js";
 import { routes, type RouteKey, type Routes } from "./routes.js";
 
@@ -101,20 +102,42 @@ function isBinary(result: unknown): result is BinaryPayload {
 }
 
 /**
- * A filename that is safe to quote inside a header value.
+ * The `content-disposition` value for a binary payload.
  *
- * Quotes would end the quoted-string early and a CR or LF would split the header, so both classes
- * go. A backslash goes with them: inside an HTTP quoted-string it is a quoted-pair, so a strict
- * parser reads `back\slash.pdf` as `backslash.pdf` and a name *ending* in one escapes the closing
- * quote outright — and the filename is chosen by the WhatsApp sender, so it is attacker-influenced.
+ * The plain `filename=` parameter is an HTTP quoted-string and the filename is chosen by the
+ * WhatsApp sender, so every character that means something to the parser rather than to the reader
+ * goes: a quote would end the string early, a backslash is a quoted-pair that escapes the next
+ * character — or the closing quote, for a name ending in one — and a CR or LF would split the
+ * header. So does `;`, and that one is not header injection but *parameter* injection: a name of
+ * `a; filename*=UTF-8''%2E%2E%2F%2E%2E%2Fetc%2Fpasswd` is one filename to a spec-correct parser and
+ * two parameters to a lenient one, and the second decodes back to `../../etc/passwd`. A `/` goes
+ * too, because a name with one in it is a path. Every non-printable and non-ASCII byte becomes `_`
+ * rather than being escaped: this parameter is the fallback a client uses when it has nothing
+ * better, and Node refuses to send a header value carrying them at all.
  *
- * Every non-printable and non-ASCII byte goes too, rather than being percent-encoded: this is the
- * `filename=` fallback, the parameter a client uses when it has nothing better, and mangling an
- * accented character in a download name is a far smaller cost than emitting a header value that
- * Node refuses to send at all.
+ * That sanitising is lossy, so it is not the only thing written. When the real name differs and is
+ * still a name a consumer can use, `filename*=` carries it percent-encoded (RFC 5987) — the
+ * parameter that survives a `;`, a quote or an accent intact and inert, because a client decodes it
+ * as a value and never re-parses it as parameters. A name that is not usable — a path, or one
+ * carrying control characters — is not preserved anywhere: there is nothing there worth keeping,
+ * and `createClient()` refuses it on arrival for the same reason.
+ *
+ * Plain first, extended second, per RFC 6266 Appendix D: a parser that understands only the
+ * fallback reads the fallback, and one that understands both prefers the extended.
  */
-function headerSafe(filename: string): string {
-  return filename.replace(/[^ -~]/g, "_").replace(/["\\]/g, "");
+function contentDisposition(disposition: "inline" | "attachment", filename: string | undefined): string {
+  if (filename === undefined) return disposition;
+  const plain = filename.replace(/[^ -~]/g, "_").replace(/["\\;/]/g, "");
+  if (!isUsableFilename(plain)) return disposition;
+  if (plain === filename || !isUsableFilename(filename)) return `${disposition}; filename="${plain}"`;
+  // `encodeURIComponent` leaves `!'()*` alone — legal in a URI component, not in RFC 5987's
+  // `attr-char`, and `'` in particular is the delimiter the charset and language tags are written
+  // with, so an apostrophe in a name would look like the end of one.
+  const encoded = encodeURIComponent(filename).replace(
+    /['()!*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `${disposition}; filename="${plain}"; filename*=UTF-8''${encoded}`;
 }
 
 /** The one thing about `implement()` that is a policy rather than a contract. */
@@ -185,12 +208,7 @@ export function implement(handlers: Handlers, options: ImplementOptions = {}): R
           if (result.filename !== undefined || result.disposition !== undefined) {
             // `attachment` when only a filename was given: of the two, it is the one that cannot
             // turn an attachment into a rendered document.
-            const disposition = result.disposition ?? "attachment";
-            const filename = result.filename;
-            res.header(
-              "content-disposition",
-              filename === undefined ? disposition : `${disposition}; filename="${headerSafe(filename)}"`,
-            );
+            res.header("content-disposition", contentDisposition(result.disposition ?? "attachment", result.filename));
           }
           res.status(route.successStatus ?? 200).send(result.bytes);
           return;

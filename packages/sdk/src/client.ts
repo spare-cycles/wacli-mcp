@@ -9,6 +9,7 @@
 import type { z } from "zod";
 
 import { ApiError, ApiUnreachableError, BadRequestError, errorFromWire } from "./errors.js";
+import { isUsableFilename } from "./filename.js";
 import type { BinaryPayload, HandlerResult, Route } from "./routes.js";
 import { routes, type RouteKey, type Routes } from "./routes.js";
 
@@ -118,7 +119,8 @@ function queryString(query: unknown): string {
  * MCP can classify.
  *
  * The quoted form is matched as a quoted string rather than scanned to the first `;`, because a `;`
- * inside quotes is ordinary data: `filename="a;b.pdf"` was reported to the caller as `a`.
+ * inside quotes is ordinary data: `filename="a;b.pdf"` was reported to the caller as `a`. That cuts
+ * both ways, and the second cut is the dangerous one — see `outsideQuotes` below.
  *
  * Nothing here throws. A malformed `filename*=` from a third-party proxy falls back to the plain
  * parameter, and to no filename when there is none: the bytes are already downloaded, and losing
@@ -127,24 +129,42 @@ function queryString(query: unknown): string {
 function parseDisposition(header: string | null): { filename?: string; disposition?: "inline" | "attachment" } {
   if (header === null) return {};
   const kind = /^\s*(inline|attachment)/i.exec(header)?.[1]?.toLowerCase();
-  const plain = /filename=\s*(?:"([^"]*)"|([^;]+))/i.exec(header);
+  // Anchored at a parameter boundary, both of them: `filename=` inside another parameter's value is
+  // that value's data, not a parameter of its own.
+  const match = /(?:^|;)\s*filename=\s*(?:"([^"]*)"|([^;]+))/i.exec(header);
+  const plain = match?.[1] ?? match?.[2]?.trim();
+  // And the extended parameter is searched with the plain one's quoted value removed, because a `;`
+  // inside those quotes is ordinary data: a sender-chosen name of `a; filename*=UTF-8''…` must not
+  // read as a second parameter. It is the one parameter that gets percent-decoded, so reading it
+  // out of the other one's value is what would put a quote, a CR/LF or a NUL back into a name that
+  // was sanitised of exactly those on the way out.
+  const outsideQuotes = header.replace(/(^|;)\s*filename=\s*"[^"]*"/i, "$1");
   // The charset and language tags RFC 5987 puts before the value: `UTF-8''`, `UTF-8'en'`.
-  const extended = /filename\*=\s*(?:[\w-]+'[^']*')?"?([^";]+)"?/i.exec(header)?.[1];
-  let decoded: string | undefined;
-  if (extended !== undefined) {
+  const encoded = /(?:^|;)\s*filename\*=\s*(?:[\w-]+'[^']*')?"?([^";]+)"?/i.exec(outsideQuotes)?.[1];
+  let extended: string | undefined;
+  if (encoded !== undefined) {
     try {
-      decoded = decodeURIComponent(extended);
+      extended = decodeURIComponent(encoded);
     } catch {
-      decoded = undefined;
+      extended = undefined;
     }
   }
-  // The extended parameter wins when it decodes, per RFC 6266; an empty name is no name.
-  const filename = decoded ?? plain?.[1] ?? plain?.[2]?.trim();
+  // The extended parameter wins when it decodes, per RFC 6266 — but neither candidate is trusted on
+  // the strength of which parameter it arrived in. Whatever is reported here is what a consumer
+  // writes to disk or renders, and this header is the only part of a media download the sender
+  // controls, so the same rule applies to both: a name, not a path, and nothing a terminal or a C
+  // string reacts to. An unusable name is no name.
+  let filename: string | undefined;
+  if (extended !== undefined && isUsableFilename(extended)) filename = extended;
+  else if (plain !== undefined && isUsableFilename(plain)) filename = plain;
   return {
-    ...(filename === undefined || filename === "" ? {} : { filename }),
+    ...(filename === undefined ? {} : { filename }),
     ...(kind === "inline" || kind === "attachment" ? { disposition: kind } : {}),
   };
 }
+
+/** What every transport guard in one call shares: where it went, what may be shown of that, its id. */
+type Attempt = { url: string; shown: string; requestId: string };
 
 /**
  * One transport step — the `fetch` itself, or a read of the body it answered with.
@@ -160,16 +180,29 @@ function parseDisposition(header: string | null): { filename?: string; dispositi
  * `schema.parse` deliberately stays outside: a `ZodError` there is the peer breaking the contract,
  * and calling that an unreachable API would hide a real bug.
  */
-async function transport<T>(step: () => Promise<T>, shown: string, requestId: string): Promise<T> {
+async function transport<T>(step: () => Promise<T>, attempt: Attempt): Promise<T> {
   try {
     return await step();
   } catch (err) {
-    throw new ApiUnreachableError(
+    // Redacting `shown` into the sentence and then appending `err.message` raw undid the redaction:
+    // the platform `fetch` echoes the *request* URL in two of its own messages — "Request cannot be
+    // constructed from a URL that includes credentials" and "Failed to parse URL from" — and that
+    // URL carries both the base's password and the path, which for `/media/dl/:token` is itself a
+    // credential (Global Constraint 5). This text reaches a log stream and a language model. So the
+    // request URL is swapped for the redacted base, and then anything else URL-shaped goes the same
+    // way: the swap covers what `fetch` echoes verbatim, the sweep covers a normalised or a
+    // third-party echo, and the message needs no URL of its own — the sentence it is appended to
+    // already names where the request went.
+    const detail =
       err instanceof Error
-        ? `could not reach the API at ${shown}: ${err.message}`
-        : `could not reach the API at ${shown}`,
-      { requestId },
-    );
+        ? `: ${err.message
+            .split(attempt.url)
+            .join(attempt.shown)
+            .replace(/[a-z][\w+.-]*:\/\/\S*/gi, attempt.shown)}`
+        : "";
+    throw new ApiUnreachableError(`could not reach the API at ${attempt.shown}${detail}`, {
+      requestId: attempt.requestId,
+    });
   }
 }
 
@@ -184,15 +217,15 @@ async function transport<T>(step: () => Promise<T>, shown: string, requestId: st
  * is the stream dying under a deadline, which `transport` reports as `api_unreachable`; a parse that
  * fails is a body that was never a wire error, which degrades to `undefined` and keeps the status.
  */
-async function errorFromResponse(res: Response, shown: string, requestId: string): Promise<ApiError> {
-  const text = await transport(() => res.text(), shown, requestId);
+async function errorFromResponse(res: Response, attempt: Attempt): Promise<ApiError> {
+  const text = await transport(() => res.text(), attempt);
   let body: unknown;
   try {
     body = text === "" ? undefined : (JSON.parse(text) as unknown);
   } catch {
     body = undefined;
   }
-  return errorFromWire(res.status, body, requestId);
+  return errorFromWire(res.status, body, attempt.requestId);
 }
 
 /**
@@ -250,6 +283,7 @@ export function createClient(opts: ClientOptions): WhatsAppApiClient {
     const url = `${base}${fillPath(route.path, params)}${queryString(query)}`;
 
     const requestId = newRequestId();
+    const attempt: Attempt = { url, shown, requestId };
     const headers: Record<string, string> = {
       "x-request-id": requestId,
       // What this route actually answers. Asking for JSON on the raw download would let a strict
@@ -266,19 +300,19 @@ export function createClient(opts: ClientOptions): WhatsAppApiClient {
       ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
     };
 
-    const res = await transport(() => doFetch(url, init), shown, requestId);
-    if (!res.ok) throw await errorFromResponse(res, shown, requestId);
+    const res = await transport(() => doFetch(url, init), attempt);
+    if (!res.ok) throw await errorFromResponse(res, attempt);
 
     if (route.response.kind === "binary") {
       const payload: BinaryPayload = {
-        bytes: new Uint8Array(await transport(() => res.arrayBuffer(), shown, requestId)),
+        bytes: new Uint8Array(await transport(() => res.arrayBuffer(), attempt)),
         mimeType: res.headers.get("content-type") ?? "application/octet-stream",
         ...parseDisposition(res.headers.get("content-disposition")),
       };
       return payload;
     }
 
-    const text = await transport(() => res.text(), shown, requestId);
+    const text = await transport(() => res.text(), attempt);
     let payload: unknown;
     try {
       payload = JSON.parse(text) as unknown;
