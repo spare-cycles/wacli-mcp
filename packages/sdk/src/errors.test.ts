@@ -80,7 +80,7 @@ const LIVE_THROWS = [
     site: "whatsapp/recipient.ts:137",
     code: "ambiguous_recipient",
     name: "AmbiguousRecipientError",
-    message: '3 chats or contacts are named "ada"',
+    message: '"ada" matches 3 chats or contacts; re-send with pick set to one of:\n  1. Ada Lovelace',
     ctor: AmbiguousRecipientError,
   },
   {
@@ -108,7 +108,7 @@ const LIVE_THROWS = [
     site: "whatsapp/send.ts:357",
     code: "send_path_refused",
     name: "SendPathError",
-    message: "sending a file by path is disabled: WHATSAPP_SEND_FILE_DIR is not set",
+    message: "sending a file by path is disabled; set WHATSAPP_SEND_FILE_DIR to the directory files may be read from",
     ctor: SendPathError,
   },
   {

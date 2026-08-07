@@ -61,13 +61,19 @@ void test("an unlisted kind is refused rather than passed through as a string", 
   for (const kind of MESSAGE_KINDS) assert.ok(Message.safeParse({ ...MESSAGE, kind }).success, kind);
 });
 
-void test("text, transcript, quotedId and media are nullable, not optional", () => {
+void test("text, transcript, quotedId, status and media are nullable, not optional", () => {
   // Nullable and absent are different answers, and the presenter always emits the key. An optional
   // field would let a row omit `transcript` and read as "not transcribable" instead of "not yet".
-  const bare = { ...MESSAGE, text: null, transcript: null, quotedId: null, media: null };
+  const bare = { ...MESSAGE, text: null, transcript: null, quotedId: null, status: null, media: null };
   assert.ok(Message.safeParse(bare).success);
   const { text: _text, ...withoutText } = MESSAGE;
   assert.ok(!Message.safeParse(withoutText).success);
+});
+
+void test("status is nullable, because a message WhatsApp sent no receipt for has none", () => {
+  // `MessageRow.status` is `string | null` and `presentMessage` passes it through unchanged, so
+  // `"status": null` is already in today's tool output. A non-nullable schema would reject it.
+  assert.equal(Message.parse({ ...MESSAGE, status: null }).status, null);
 });
 
 // --- the two extensions ---------------------------------------------------------------------------

@@ -53,7 +53,17 @@ export const Message = z.object({
   text: z.string().nullable(),
   transcript: z.string().nullable(),
   quotedId: z.string().nullable(),
-  status: z.string(),
+  /**
+   * Nullable, and this is a deliberate divergence from the plan's `z.string()`.
+   *
+   * `MessageRow.status` is `string | null` (`db/messages.ts:34`, `:167`, and `:398` writes
+   * `m.status ?? null`) and `presentMessage` passes it through unmodified (`mcp/result.ts:135`), so
+   * today's tool output already contains `"status": null` for any row WhatsApp never sent a receipt
+   * for. A non-nullable schema could only accept that by inventing a placeholder, which changes
+   * what the model reads; nullable accepts every value the plan's version does, plus the one the
+   * data actually produces.
+   */
+  status: z.string().nullable(),
   edited: z.boolean(),
   deleted: z.boolean(),
   media: z.object({ type: z.string().nullable(), cached: z.boolean() }).nullable(),
