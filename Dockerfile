@@ -49,11 +49,19 @@ WORKDIR /app
 # unresolvable at runtime. The copy is narrowed to exactly what `packages/api/dist/main.js` can
 # reach: no package's `src/` ships, which is what keeps the 27 `*.test.ts` files and the two test
 # scaffolding modules out of the image, and `packages/mcp` and `packages/e2e` are absent entirely.
+#
+# ⚠️ **`packages/sdk/node_modules` is not optional.** `whatsapp-api-sdk` is a directory symlink and
+# Node resolves realpaths, so a `zod` import inside the SDK restarts its resolution walk at
+# `/app/packages/sdk`, not at `/app/packages/api`. The only directory on that walk carrying `zod` is
+# `packages/sdk/node_modules` — `/app/node_modules` has no top-level `zod` under pnpm's isolated
+# layout. Dropping this line fails only once the SDK actually imports something, which is why it has
+# to be reasoned about rather than boot-tested against a placeholder.
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages/api/node_modules ./packages/api/node_modules
 COPY --from=build /app/packages/api/package.json ./packages/api/package.json
 COPY --from=build /app/packages/api/dist ./packages/api/dist
 COPY --from=build /app/packages/sdk/package.json ./packages/sdk/package.json
+COPY --from=build /app/packages/sdk/node_modules ./packages/sdk/node_modules
 COPY --from=build /app/packages/sdk/dist ./packages/sdk/dist
 COPY package.json ./
 RUN mkdir -p /data/whatsapp && chown -R node:node /data/whatsapp

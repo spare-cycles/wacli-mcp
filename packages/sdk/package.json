@@ -18,12 +18,13 @@
       "import": "./dist/index.js"
     }
   },
-  "//": "One entrypoint, `dist/`, in the workspace and when published: `npm publish` does not apply `publishConfig.exports`, and `pnpm deploy --prod` with `files: [\"dist\"]` would copy a package whose exports named a file it did not ship. The cost is that `dist/` must exist before anything typechecks against this package, which the root `check`/`test` scripts guarantee by building first.",
+  "//": "One entrypoint, `dist/`, in the workspace and when published: `npm publish` does not apply `publishConfig.exports`, and `pnpm deploy --prod` with `files: [\"dist\"]` would copy a package whose exports named a file it did not ship. The cost is that `dist/` must exist before anything typechecks against this package, which the root `check`/`test` scripts and `api`/`mcp`'s own `build:deps` both guarantee by building first.",
+  "//build": "The build script is `tsc -b`, not `-p`, because `api` and `mcp` each call it from their own `build:deps` and the root fans those out in parallel. Build mode compares input and output timestamps and writes nothing when `dist/` is already current, so the concurrent case is a no-op rather than two compilers emitting into the same directory. Build mode always writes a `.tsbuildinfo`; `tsconfig.json` redirects it into the root `node_modules/.cache/` so nothing untracked appears in the package and nothing extra ships.",
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -b tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",

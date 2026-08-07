@@ -10,14 +10,16 @@
   "bin": {
     "whatsapp-api": "dist/main.js"
   },
+  "//scripts": "Every script that reads `whatsapp-api-sdk` — at type level or at runtime — builds it first via `build:deps`, so a bare `pnpm --filter whatsapp-api <script>` cannot outrun the SDK build the way it would if only the root scripts sequenced it. `^...` is pnpm for \"this package's workspace dependencies, excluding itself\", so the list does not have to be maintained by hand. The SDK's own build is `tsc -b`, which is up-to-date-aware: when `dist/` is already current the nested call writes nothing, so the root's parallel `pnpm -r` fan-out cannot have two compilers emitting into `packages/sdk/dist` at once. `start` is deliberately not in the list: it runs the built artifact and presupposes a build.",
   "scripts": {
-    "dev": "tsx src/main.ts",
-    "build": "tsc -p tsconfig.build.json",
+    "build:deps": "pnpm --filter \"whatsapp-api^...\" run build",
+    "dev": "pnpm run build:deps && tsx src/main.ts",
+    "build": "pnpm run build:deps && tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint .",
-    "lint:fix": "eslint . --fix",
-    "test": "node --import tsx --test 'src/**/*.test.ts'"
+    "typecheck": "pnpm run build:deps && tsc -p tsconfig.json --noEmit",
+    "lint": "pnpm run build:deps && eslint .",
+    "lint:fix": "pnpm run build:deps && eslint . --fix",
+    "test": "pnpm run build:deps && node --import tsx --test 'src/**/*.test.ts'"
   },
   "dependencies": {
     "whatsapp-api-sdk": "workspace:*",

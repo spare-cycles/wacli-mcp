@@ -4,7 +4,12 @@
     "outDir": "dist",
     "rootDir": "src",
     // This package is published, so consumers need its declarations.
-    "declaration": true
+    "declaration": true,
+    // `build` runs `tsc -b`, and build mode always writes a `.tsbuildinfo`. Left at its default it
+    // lands at `packages/sdk/tsconfig.tsbuildinfo` — an untracked file in the package root that
+    // `files: ["dist"]` would not publish but every `git status` would show. Parked in the root
+    // `node_modules/` instead, which is already ignored by git, `.dockerignore` and prettier.
+    "tsBuildInfoFile": "../../node_modules/.cache/whatsapp-api-sdk.tsbuildinfo"
   },
   "include": ["src/**/*.ts"]
 }

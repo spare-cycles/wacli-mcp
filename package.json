@@ -8,15 +8,15 @@
   "engines": {
     "node": ">=24"
   },
-  "//": "`check` and `test` build first. `whatsapp-api-sdk` exports `./dist/`, the same paths npm publish and `pnpm deploy --prod` resolve, so a tree that has never been built has nothing for `api` and `mcp` to typecheck or import against. The recursive scripts stay unwrapped so a caller who knows dist/ is current can still run one stage on its own.",
+  "//": "Every entry point builds first. `whatsapp-api-sdk` exports `./dist/`, the same paths npm publish and `pnpm deploy --prod` resolve, so a tree that has never been built has nothing for `api` and `mcp` to typecheck, lint or import against. `api` and `mcp` also each build the SDK from their own `build:deps`, and `pnpm -r` runs those two concurrently: on an already-built tree the SDK's `tsc -b` makes both a no-op, but on a cold tree two compilers would emit into `packages/sdk/dist` at once and one could read the other's half-written `index.d.ts`. Building once up front is what keeps that from being reachable, which is why `check` calls `pnpm -r run lint`/`typecheck` directly rather than going through the wrapped `lint`/`typecheck` scripts and building three times.",
   "scripts": {
     "build": "pnpm -r run build",
-    "typecheck": "pnpm -r run typecheck",
-    "lint": "pnpm -r run lint",
+    "typecheck": "pnpm run build && pnpm -r run typecheck",
+    "lint": "pnpm run build && pnpm -r run lint",
     "test": "pnpm run build && pnpm -r run test",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "pnpm run build && pnpm run format:check && pnpm run lint && pnpm run typecheck"
+    "check": "pnpm run build && pnpm run format:check && pnpm -r run lint && pnpm -r run typecheck"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",

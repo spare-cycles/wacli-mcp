@@ -7,17 +7,29 @@ are non-obvious enough to get broken by an edit that looks correct.
   may contain `@lid`, `@s.whatsapp.net` or `@g.us`, or split a JID on `@` or `:`. WhatsApp hands the
   same human two identities — a phone JID and a LID — and folding them is the difference between one
   conversation and two half-empty ones. Every layer above calls `canonicalId(jid, contacts)` and
-  treats the result as an opaque key. The enforcing check, run from the repo root, which must print
-  nothing:
+  treats the result as an opaque key. Two enforcing checks, run from the repo root, each of which
+  must print nothing. **`packages/api` — exemptions for the three files that carry JID literals as
+  data:**
   ```bash
-  grep -rn '@lid\|@s\.whatsapp\.net\|@g\.us' packages/*/src/ --include='*.ts' \
+  grep -rn '@lid\|@s\.whatsapp\.net\|@g\.us' packages/api/src/ --include='*.ts' \
     | grep -v '\.test\.ts:' \
-    | grep -v 'packages/api/src/whatsapp/jid\.ts:' \
-    | grep -v 'packages/api/src/whatsapp/fixtures\.ts:'
+    | grep -v 'src/whatsapp/jid\.ts:' \
+    | grep -v 'src/whatsapp/fixtures\.ts:'
   ```
-  It sweeps every package, not just `api`, because the constraint binds any package that ever holds a
-  JID. Test files and `packages/api/src/whatsapp/fixtures.ts` are excluded because they carry JID
-  *literals as data* — a test for identity folding has to name a LID.
+  A test for identity folding has to name a LID, and `fixtures.ts` is message data, so both are
+  excluded. **`packages/mcp` — stricter, no exemptions at all, and `canonicalId` is banned outright:**
+  ```bash
+  grep -rn '@lid\|@s\.whatsapp\.net\|@g\.us\|canonicalId' packages/mcp/src/
+  ```
+  No `--include`, no `grep -v`: the MCP server treats every id as an opaque string it received from
+  the API, so there is nothing for it to say about JID syntax even in a test. A test that needs an id
+  uses whatever opaque string the API handed back.
+
+  The other two packages are deliberately outside both checks, and neither is an oversight.
+  `packages/sdk` is a wire contract — it carries ids as strings and never parses one — and
+  `packages/e2e` exists to fake the Baileys socket, whose `connection.update` payload has a real
+  `user.id` in it (`packages/api/src/whatsapp/connection.test.ts` shows the shape). Scanning `e2e`
+  would flag `fake-socket.ts` for doing exactly its job.
 
 - **`getMessage` makes the store load-bearing for the protocol, not just for reads.** Baileys calls
   it to re-encrypt a message a peer failed to decrypt, and to build a quote. It is wired in
