@@ -26,8 +26,9 @@ Every task's requirements implicitly include this section.
    depend on it or import it. `packages/mcp` and `packages/sdk` must not list it; an accidental
    import must fail module resolution rather than rely on convention.
 2. **The 14 MCP tools' input schemas and output JSON are unchanged**, with exactly three documented
-   exceptions (Task 15: document branch returns a link not a path; Task 12: `whatsapp_health` merges
-   API health with MCP reachability; `WHATSAPP_SEND_FILE_DIR` now names a directory on the API host).
+   exceptions (Task 14: the document branch returns a link not a path, in **both** its PDF and
+   non-PDF sub-cases; Task 12: `whatsapp_health` merges API health with MCP reachability;
+   `WHATSAPP_SEND_FILE_DIR` now names a directory on the API host).
    Every other byte of every tool result stays identical.
 3. **All raw JID interpretation lives in `packages/api/src/whatsapp/jid.ts`.** No other production
    module in `packages/api` may contain `@lid`, `@s.whatsapp.net` or `@g.us`, or split a JID on `@`
@@ -57,9 +58,12 @@ Every task's requirements implicitly include this section.
 11. **An ambiguous recipient is refused, never resolved by guessing.** Candidate ordering must be a
     total order over the data, because `pick` selects by number and an unstable order would send a
     private message to the wrong person. An out-of-range `pick` is an error, not a clamp.
-12. **`getMessage` is load-bearing for the Baileys protocol, not just for reads.** It stays wired to
-    `messages.getRaw` inside `packages/api` and never crosses the package boundary. The `raw` BLOB
-    column must keep being persisted.
+12. **The Baileys `getMessage` callback is load-bearing for the protocol, not just for reads.** It
+    stays wired to `messages.getRaw` inside `packages/api` and never crosses the package boundary.
+    The `raw` BLOB column must keep being persisted. ⚠️ Do not confuse this with the **REST
+    operation** also called `getMessage` (Task 8), which is public and cross-boundary by design.
+    Same name, opposite rules: the socket callback must never leave `packages/api`; the route exists
+    precisely to leave it.
 13. **`packageExtensions` is workspace-scoped config** and stays at the workspace root
     (`pnpm-workspace.yaml`), never in `packages/api/package.json`, even though `baileys` moves there.
 14. **`projectService: true` fatals on any file no tsconfig includes** — "was not found by the
@@ -106,7 +110,8 @@ packages/sdk/                       whatsapp-api-sdk — only runtime dep is zod
   src/errors.ts                     ApiErrorCode union, ApiError classes, fromWire/toWire
   src/schemas/common.ts             Cursor, Page(T), Timestamp, OpaqueId
   src/schemas/domain.ts             Chat, Message, SearchHit, Contact, Reaction, Health, Capabilities
-  src/schemas/media.ts              MediaRepresentation, KeyframeStrip, MediaMeta, MediaLink, PdfText
+  src/schemas/media.ts              MediaRepresentation, Keyframe, JpegDerivative, KeyframeStrip,
+                                    MediaMeta, MediaLink, PdfExtract
   src/schemas/requests.ts           every query/body schema
   src/routes.ts                     the route table (single source of truth)
   src/server.ts                     implement() — typed handler map, RouteTable types
@@ -150,10 +155,10 @@ carries it. `src/mcp/tools/reads.ts` becomes `packages/mcp/src/tools/reads.ts`.
 
 Tasks 1–3 build the contract with no behaviour change. Tasks 4–5 close the two capability gaps the
 scouts found (no `language` column; `convert.ts` returns the wrong shapes) — both must land before
-any route can be written against them. Tasks 6–10 implement the API. Task 10 mounts REST *alongside*
-the still-working in-process MCP, so the product never stops working. Tasks 11–14 build the MCP
-consumer. Task 15 is the e2e proof. Only Task 16, once that proof is green, removes the in-process
-MCP. Tasks 17–18 ship.
+any route can be written against them. Tasks 6–11 implement the API. **Task 11** mounts REST
+*alongside* the still-working in-process MCP, so the product never stops working. Tasks 12–14 build
+the MCP consumer. Task 15 is the e2e proof. Only Task 16, once that proof is green, removes the
+in-process MCP. Tasks 17–18 ship.
 
 ---
 
@@ -163,9 +168,20 @@ MCP. Tasks 17–18 ship.
 - Create: `pnpm-workspace.yaml`, `tsconfig.base.json`, `eslint.base.js`,
   `packages/{api,sdk,mcp}/package.json`, `packages/{api,sdk,mcp}/tsconfig.json`,
   `packages/{api,mcp}/tsconfig.build.json`, `packages/{api,sdk,mcp}/eslint.config.js`
-- Modify: `package.json` (root), `.dockerignore`
+- Create (**placeholders — do not skip these**): `packages/sdk/src/index.ts` and
+  `packages/mcp/src/index.ts`, each containing exactly `export {};`
+- Modify: `package.json` (root), `.dockerignore` — the existing patterns (`node_modules`, `dist`) are
+  unanchored and so already match at any depth; no functional change is required here yet, and
+  Task 17 supersedes the file. Noted so nobody invents an edit.
 - Move: all of `src/**` → `packages/api/src/**` (contents unchanged), `smoke.mjs` stays at root
 - Delete: root `tsconfig.json`, root `tsconfig.build.json`, root `eslint.config.js`
+
+**Why the placeholders.** `packages/sdk` gets its first real source in Task 2 and `packages/mcp` in
+Task 12, so at the end of *this* task both packages have a `package.json` and a `tsconfig.json`
+whose `include` is `src/**/*.ts` — and no `src/` at all. `tsc` treats that as a hard error,
+`TS18003: No inputs were found in config file`, not a graceful zero-file pass. Task 1's own
+"482 pass, 0 fail" gate and Global Constraint 15 would both fail on the very first task. A
+one-line `export {};` in each costs nothing and Task 2 / Task 12 overwrite it.
 
 **Interfaces:**
 - Produces: three workspace packages named `whatsapp-api`, `whatsapp-api-sdk`, `whatsapp-mcp`.
@@ -185,7 +201,11 @@ packageExtensions:
         optional: true
 ```
 
-Root `package.json`: drop `bin`, drop `dependencies` entirely, keep shared devDeps
+Root `package.json`: drop `bin` — and **redistribute it, do not just delete it**. The current root
+declares `"whatsapp-mcp": "dist/main.js"`, which stops resolving the moment there is no root
+`dist/`. `packages/mcp/package.json` takes `{"whatsapp-mcp": "dist/main.js"}` and
+`packages/api/package.json` takes `{"whatsapp-api": "dist/main.js"}`, each relative to its own
+package. Then drop `dependencies` entirely, keep shared devDeps
 (`eslint`, `typescript`, `typescript-eslint`, `prettier`, `eslint-config-prettier`, `@eslint/js`,
 `tsx`, `@types/node`), and orchestrate:
 
@@ -207,9 +227,13 @@ Dependency split — with one **transitional** entry that is easy to get wrong:
 
 | package | dependencies |
 | --- | --- |
-| `packages/api` | `baileys` (exact pin), `jimp`, `express`, `pino`, `zod`, **`@modelcontextprotocol/sdk`** *(transitional)*; dev: `@hapi/boom`, `@types/express` |
-| `packages/mcp` | `@modelcontextprotocol/sdk`, `express`, `pino`, `zod`; dev: **`@types/express`** |
+| `packages/api` | **`whatsapp-api-sdk: workspace:*`**, `baileys` (exact pin), `jimp`, `express`, `pino`, `zod`, **`@modelcontextprotocol/sdk`** *(transitional)*; dev: `@hapi/boom`, `@types/express` |
+| `packages/mcp` | **`whatsapp-api-sdk: workspace:*`**, `@modelcontextprotocol/sdk`, `express`, `pino`, `zod`; dev: `@types/express` |
 | `packages/sdk` | `zod`, and nothing else at runtime |
+
+The `workspace:*` entries are not decoration: they are what makes `pnpm -r run build` order the SDK
+before its two consumers, and what makes "an operation in the contract with no handler is a compile
+error" true rather than aspirational.
 
 **`packages/api` keeps `@modelcontextprotocol/sdk` until Task 16.** Task 1 moves *all* of `src/**`
 into it, including `src/mcp/**` and the Streamable-HTTP `src/http.ts`, and those files import the MCP
@@ -323,6 +347,12 @@ export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
 export const wireError = z.object({
   error: z.object({
     code: z.enum(API_ERROR_CODES),
+    /**
+     * The original error's `name`, so the client can reconstruct the exact string
+     * `describeError` renders. Required, not optional: several live throw sites are bare
+     * `new Error(...)` whose name is literally "Error", and losing that changes tool output.
+     */
+    name: z.string(),
     message: z.string(),
     details: z.record(z.unknown()).optional(),
   }),
@@ -372,6 +402,33 @@ Two specifics, both verified:
 
 Add `message_revoked`, `not_own_message` and `send_path_refused` to `API_ERROR_CODES`.
 
+**Third pass, and the one most likely to be skipped: bare `Error` throws and `CursorError`.** The
+two rounds above chased classes with an `override name`. But `describeError` renders *whatever*
+reaches it, and several live throw sites are plain `new Error(...)` whose `name` is the literal
+string `"Error"`. Route them through the generic path and today's `Error: …` silently becomes
+`ApiError: …` — a Global Constraint 2 break with no failing test, because no test asserts these
+renderings today.
+
+| site | today's rendered prefix |
+| --- | --- |
+| `whatsapp/recipient.ts:101` — `` `pick` only applies when the recipient is named by name…`` | `Error: ` |
+| `whatsapp/send.ts:261` — ``cannot @mention "${mention}"…`` | `Error: ` |
+| `whatsapp/send.ts:337` — `file exceeds the maximum upload size…` | `Error: ` |
+| `whatsapp/send.ts:400` — ``WhatsApp accepted the send to ${chatId} but returned no message id`` | `Error: ` |
+| `mcp/cursor.ts:13` — `CursorError`, thrown by `decodeCursor` for every paginated read | `CursorError: ` |
+| `mcp/tools/reads.ts:172` — the `kind`/`has_media` contradiction | `Error: ` |
+
+The wire carries a code; the SDK must reconstruct the **name** as well as the message. So
+`errorFromWire` needs an explicit `name` on the wire envelope, or a code-to-name table covering
+these. Concretely: add `invalid_cursor` mapped to a class whose `name` is `"CursorError"`, and give
+`bad_request` a class that sets `this.name = "Error"` when the API reports the failure originated
+from a bare throw. That last one is ugly, and it is the price of "every other byte stays identical" —
+the alternative is to declare these a fourth documented exception, which is a decision, not an
+oversight. **This plan takes the byte-identical route.**
+
+The API side must therefore send the original `name`: extend the wire envelope to
+`{ error: { code, name, message, details? } }`. Without `name` on the wire this is unimplementable.
+
 Domain schemas (denormalised per spec §4.1 — resolved names and counts, because a client cannot
 issue one round trip per row):
 
@@ -394,6 +451,10 @@ export const SearchHit = Message.extend({ snippet: z.string(), matchedTranscript
  * silently drop that array and change the tool's output. Keep both fields: `reactionCount` so the
  * shape stays a superset of `Message`, `reactions` for the detail path.
  */
+export const Reaction = z.object({ emoji: z.string(), from: z.object({ id: z.string(), name: z.string() }) });
+// Declared after `Reaction` on purpose: `const` bindings are in the temporal dead zone until
+// initialised, so referencing `Reaction` above its declaration is a runtime ReferenceError, not a
+// hoisting nicety. Order matters in this file.
 export const MessageDetail = Message.extend({ reactions: z.array(Reaction) });
 export const Chat = z.object({
   id: z.string(), name: z.string().nullable(), isGroup: z.boolean(),
@@ -405,7 +466,6 @@ export const Contact = z.object({
   id: z.string(), name: z.string().nullable(), notify: z.string().nullable(),
   phoneNumber: z.string().nullable(), lid: z.string().nullable(),
 });
-export const Reaction = z.object({ emoji: z.string(), from: z.object({ id: z.string(), name: z.string() }) });
 export const Page = <T extends z.ZodTypeAny>(item: T) =>
   z.object({ nextCursor: z.string().nullable(), items: z.array(item) });
 ```
@@ -413,8 +473,13 @@ export const Page = <T extends z.ZodTypeAny>(item: T) =>
 `Chat.name` uses the same fallback logic as today's `chatName()` — a DM with no chat name falls back
 to the contact's display name, and reports `null` rather than echoing the JID.
 
-`Health` mirrors `HealthReport` exactly (snake_case → camelCase at this boundary; the MCP renames
-back in Task 13). `Capabilities` is `{ readOnly: boolean, apiVersion: string, features: { transcription: boolean, autoTranscribe: boolean, mediaLinks: boolean } }`.
+**`/health` is the one payload that does NOT get camelCased.** It returns today's `HealthReport`
+verbatim, snake_case keys and all (`ok`, `needs_pairing`, `last_event_age_sec`, `auto_transcribe`,
+`read_only`, …), because `whatsapp_health` hands it to the model unchanged and Global Constraint 2
+requires those exact keys. So there is no `Health` schema mirroring it in camelCase and no
+rename-back step in Task 13 — an earlier draft claimed both; that was wrong. The SDK simply types
+the existing shape.
+`Capabilities` is `{ readOnly: boolean, apiVersion: string, features: { transcription: boolean, autoTranscribe: boolean, mediaLinks: boolean } }`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -464,6 +529,13 @@ export type Route = {
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   response: RouteResponse;
+  /**
+   * Which gate this route sits behind. It is **not** decoration: `implement()` returns it on every
+   * binding and Task 7 partitions the mount order by it — public and signed bindings are mounted
+   * *before* the bearer gate, bearer bindings *after*. That is what lets `/health` and the signed
+   * download live in this table (and therefore on the generated client) while still being
+   * reachable without a token.
+   */
   auth: "bearer" | "public" | "signed";
 };
 export const routes = { /* … */ } as const satisfies Record<string, Route>;
@@ -504,12 +576,20 @@ export type RawResponse = {
 };
 export function implement(handlers: Handlers): RouteBinding[];
 
-/** One typed client method per route; the argument object omits the parts the route does not declare. */
-export type ClientMethod<R extends Route> = (input: {
-  params?: R["params"] extends z.ZodTypeAny ? z.infer<R["params"]> : never;
-  query?:  R["query"]  extends z.ZodTypeAny ? z.infer<R["query"]>  : never;
-  body?:   R["body"]   extends z.ZodTypeAny ? z.infer<R["body"]>   : never;
-}) => Promise<HandlerResult<R>>;
+/**
+ * One typed client method per route. Each part is **required exactly when the route declares it**
+ * — making them all optional would let `client.sendText({})` compile and fail only at runtime,
+ * which defeats the point of generating the client from the table. Routes declaring nothing take
+ * no argument at all.
+ */
+type Declared<R extends Route> =
+  (R["params"] extends z.ZodTypeAny ? { params: z.infer<R["params"]> } : object) &
+  (R["query"]  extends z.ZodTypeAny ? { query:  z.infer<R["query"]>  } : object) &
+  (R["body"]   extends z.ZodTypeAny ? { body:   z.infer<R["body"]>   } : object);
+
+export type ClientMethod<R extends Route> = keyof Declared<R> extends never
+  ? () => Promise<HandlerResult<R>>
+  : (input: Declared<R>) => Promise<HandlerResult<R>>;
 
 export type WhatsAppApiClient = { [K in keyof Routes]: ClientMethod<Routes[K]> };
 export function createClient(opts: {
@@ -531,7 +611,21 @@ whose `response` is `JsonResponse | BinaryResponse` makes `HandlerResult<R>` eva
 neither conditional branch. The alternatives were a distributive helper returning a union the caller
 must narrow at runtime (which defeats a typed SDK) or separate entries. Separate entries also keep
 the `method + path` uniqueness invariant, which query-param routing cannot: Express does not route
-on `?as=`. That makes **23 operations**; every one must appear in `routes.ts`.
+on `?as=`.
+
+**The table holds exactly 24 operations**, and the arithmetic is worth stating because implementers
+use it as a checklist: 6 reads (`listChats`, `listGroups`, `listContacts`, `listMessages`,
+`searchMessages`, `getMessage`) + 7 media (`raw`, `jpeg`, `link`, `keyframes`, `text`, `transcript`,
+`meta`) + 8 writes (`sendText`, `sendFile`, `editMessage`, `deleteMessage`, `react`, `markRead`,
+`transcribe`, `resolveRecipient`) + `capabilities` + `getHealth` + `fetchSignedMedia` = 24.
+
+**`getHealth` and `fetchSignedMedia` belong in the table even though they are unauthenticated.** An
+earlier draft pulled them out and collapsed `auth` to a single literal; that was wrong, and the way
+it was wrong is instructive. The generated client is `{ [K in keyof Routes]: ClientMethod<Routes[K]> }`
+— so a route absent from the table has no client method, and Task 14's `whatsapp_health` calls
+`client.getHealth()`. Removing it from the table makes `packages/mcp` fail to compile. Routes carry
+`auth` and the mounting code partitions on it (Task 7); that keeps one source of truth instead of a
+table plus a set of hand-written exceptions.
 
 **Client behaviour:**
 - Request bodies and queries are validated before send.
@@ -735,7 +829,9 @@ resolve.
    So: log a redacted access record — the sha256's first 8 hex characters, the representation, the
    outcome, and the timestamp — never the token, never the URL, never the chat. And rate-limit the
    route per token (a small fixed ceiling per TTL window is enough; the link is meant for one or two
-   fetches, not a hundred). This is the only unauthenticated route in the system.
+   fetches, not a hundred). It is the only unauthenticated route that serves **conversation
+   content** — `GET /health` is also unauthenticated, but returns a closed record with no secrets
+   and no message data.
 6. **`X-Content-Type-Options: nosniff` on every media response**, and `Content-Disposition:
    attachment` for anything that is not an image, audio or video type. WhatsApp attachments include
    browser-renderable types such as SVG and HTML; serving one unauthenticated, with a
@@ -822,24 +918,30 @@ takes an already-batched reaction count. `reactionCounts` issues **one** grouped
 `reactions.countsFor(keys)` — never one per row. Carry over the existing `(chatId, messageId)`
 composite key joined by `\u0000`, because a message id is only unique within its chat.
 
-**Middleware order is load-bearing** and mirrors today's `http.ts`:
-1. `GET /health` — before the bearer gate, so a container healthcheck needs no secret.
-2. `GET /media/dl/:token` — **deliberately outside `/v1`**. It must be public, and mounting it under
-   `/v1` would make that a property of registration order rather than of structure. Worse, a route
-   `GET /v1/media/:chat/:id` matches `/v1/media/dl/<token>` with `chat = "dl"`, so the generic media
-   route would shadow or be shadowed by the download depending on which registered first. A separate
-   prefix removes both hazards: no `:chat` pattern can ever match it, and the `/v1` gate cannot
-   apply to it. It is also honest — a signed blob endpoint is not a versioned API resource.
-3. Bearer gate on `/v1` (constant-time compare, `WWW-Authenticate: Bearer` on 401).
-4. `express.json` mounted **on `/v1` behind the gate**, so an anonymous `POST /anything` cannot make
+**Middleware order is load-bearing** and mirrors today's `http.ts`. Every route comes from
+`implement()`; the order is produced by **partitioning the bindings on `binding.auth`**, not by
+hand-mounting exceptions:
+
+1. Bindings where `auth !== "bearer"` — today that is `getHealth` (`GET /health`) and
+   `fetchSignedMedia` (`GET /media/dl/:token`). Mounted first, so no gate applies.
+2. Bearer gate on `/v1` (constant-time compare, `WWW-Authenticate: Bearer` on 401).
+3. `express.json` mounted **on `/v1` behind the gate**, so an anonymous `POST /anything` cannot make
    the server buffer and parse ~90 MB. Limit is `maxUploadBytes` + base64 overhead + 1 MiB.
-5. Route bindings from `implement()`.
-6. Four-argument error middleware last — arity is how Express identifies it. Map `ApiError` → its
+4. Bindings where `auth === "bearer"` — the other 22.
+5. Four-argument error middleware last — arity is how Express identifies it. Map `ApiError` → its
    status + `errorToWire`; anything else → 500 `internal`. Log `errorDetail(err)`, never the raw
    error object (Global Constraint 6).
 
-A test must fetch an actual minted URL end to end (Task 9), not merely assert the route exists —
-that is the only thing that catches a shadowing regression.
+**`GET /media/dl/:token` sits outside `/v1` by path, and that is separate from its `auth` value.**
+A route `GET /v1/media/:chat/:id` also matches `/v1/media/dl/<token>` with `chat = "dl"`, so had the
+download stayed under `/v1` the two would shadow each other depending on registration order. The
+distinct prefix removes the hazard structurally rather than by ordering — no `:chat` pattern can
+match it. Partitioning by `auth` then handles the gate, and the two mechanisms are independent:
+one prevents shadowing, the other prevents a 401.
+
+Two tests, because each catches a different regression: one fetching an actual minted URL end to end
+(Task 9) to catch shadowing, and one asserting `GET /health` answers 200 with no `Authorization`
+header while `GET /v1/chats` answers 401.
 
 `GET /health` returns the existing `HealthReport` shape unchanged. `GET /v1/capabilities` returns
 `{ readOnly, apiVersion, features }`.
@@ -952,7 +1054,7 @@ Task 3; the representations themselves are unchanged.
 | `GET /v1/media/:chat/:id/keyframes` | JSON `{ durationSec, width, height, frames: [{ index, atSec, mimeType, data }], source }` | `keyframes`, base64 |
 | `GET /v1/media/:chat/:id/text` | JSON `{ text, truncated }` | `pdfExtract` |
 | `GET /v1/media/:chat/:id/transcript` | JSON `{ text, model, language } \| null` | `MessageRow` (Task 4) |
-| `GET /v1/media/:chat/:id/meta` | JSON | row + `probeDimensions`/`probeDuration` |
+| `GET /v1/media/:chat/:id/meta` | JSON `{ mimetype, bytes, width, height, durationSec, hasTranscript, sha256 }` | row + `probeDimensions`/`probeDuration` |
 | `GET /media/dl/:token` | binary, public | Task 6 signer — note: **not** under `/v1`, see Task 7 |
 
 `source` is `{ bytes: number, mimetype: string }` — the size and type of the **original** attachment,
@@ -1286,11 +1388,23 @@ Tool → SDK call mapping:
 | the six writes | the matching write routes |
 
 `whatsapp_download_media` branches by media kind, exactly as today, each branch calling the one
-media route that serves it: image → `fetchMediaJpeg` → one image block; video → `fetchMediaKeyframes`
-(already base64) plus `fetchMediaTranscript`; audio → `fetchMediaTranscript`, else `fetchMediaMeta`;
-PDF → `fetchMediaText`; any other document → `fetchMediaLink`. One SDK call per branch — never fetch
-bytes in order to inspect them. The summary's `reactions` array comes from `getMessage`'s
-`MessageDetail.reactions` (Task 8), not from `reactionCount`.
+media route that serves it. Every branch must be able to reproduce `summaryOf`'s **unconditional**
+`mimetype` and `bytes` fields, which is what dictates the calls below — several branches need
+`fetchMediaMeta` purely for those two, and leaving it out makes them unreachable:
+
+| branch | calls | why |
+| --- | --- | --- |
+| image / sticker | `fetchMediaJpeg` | carries `source.bytes`/`source.mimetype` + `width`/`height` |
+| video | `fetchMediaKeyframes` | same, plus `durationSec`; transcript comes from `MessageDetail.transcript` — **not** a second `fetchMediaTranscript` call, which would be a redundant round trip and a second source of truth for the same value |
+| audio, transcript cached | `fetchMediaTranscript` **+ `fetchMediaMeta`** | `/transcript` carries no `bytes`; without `/meta` the summary loses it |
+| audio, no transcript | `fetchMediaMeta` | `duration_sec`, `bytes`, `mimetype` |
+| PDF | `fetchMediaText` **+ `fetchMediaLink`** | `/text` carries only `{ text, truncated }`; `/link` supplies `url`, `mimeType` and `bytes` — and point 1 below requires the PDF branch to carry `url` too |
+| any other document | `fetchMediaLink` | `url`, `mimeType`, `bytes` |
+
+"One call per branch" was the earlier framing and it was too strong — three branches genuinely need
+two calls to reproduce today's fields. What still holds is the rule behind it: **never fetch raw
+bytes in order to inspect them.** Two small metadata calls are fine; pulling a 20 MB video to read
+its dimensions is not.
 
 Three details that are easy to get wrong, each of which would silently change output:
 
