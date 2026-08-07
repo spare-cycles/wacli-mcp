@@ -288,6 +288,22 @@ package's `ignores` must cover its own `dist/`. Root `eslint.config.js` is delet
 the workspace root is no longer reachable by any package's `eslint .`, so its ignore entry moves
 nowhere — but confirm with `pnpm -r run lint` that nothing fatals.
 
+**`packages/mcp/eslint.config.js` additionally gives Global Constraint 1 teeth.** Today the rule
+that `mcp/` must not import `baileys` is prose plus a grep in `CLAUDE.md` — a convention a reviewer
+has to remember. Absence from `package.json` is the primary enforcement, but pnpm's layout is not a
+guarantee against every hoisting arrangement, and `node:sqlite` is a builtin no manifest can
+withhold at all. So the MCP package's config adds:
+
+```js
+"no-restricted-imports": ["error", { paths: [
+  { name: "baileys",     message: "packages/mcp must never import Baileys — see Global Constraint 1." },
+  { name: "node:sqlite", message: "packages/mcp holds no store — reads go through the SDK client." },
+]}],
+```
+
+That turns both into a build failure rather than a review catch, which is what Global Constraint 1
+claims and could not previously deliver.
+
 - [ ] **Step 1: Create the workspace files and move the tree**
 
 `git mv src packages/api/src`. Write every file listed above. Run `pnpm install` to regenerate
@@ -553,7 +569,22 @@ verbatim, snake_case keys and all (`ok`, `needs_pairing`, `last_event_age_sec`, 
 requires those exact keys. So there is no `Health` schema mirroring it in camelCase and no
 rename-back step in Task 13 — an earlier draft claimed both; that was wrong. The SDK simply types
 the existing shape.
-`Capabilities` is `{ readOnly: boolean, apiVersion: string, features: { transcription: boolean, autoTranscribe: boolean, mediaLinks: boolean } }`.
+`Capabilities` is
+`{ apiVersion, contractVersion, readOnly, maxUploadBytes, features: { transcription, autoTranscribe, mediaLinks } }`.
+
+Two of those fields are not reporting, they are enforcement, and both were added after hardening
+found the failure they prevent:
+
+- **`contractVersion` is compared, not displayed.** An MCP built against a newer SDK talking to an
+  older API fails as a pile of Zod parse errors at the boundary, which reach the model as noise
+  about fields it never asked for. The client compares at session build and refuses with an explicit
+  version-skew message instead. A monorepo makes skew *unlikely*, not impossible — the two images
+  are deployed separately and nothing stops a partial rollout.
+- **`maxUploadBytes` is published so the MCP can refuse early.** Today one `bodyLimitBytes`
+  (`src/http.ts:204`) governs one server. Split, the same number must be configured identically in
+  two places or the MCP accepts a body the API answers with a bare 413 — a confusing failure at the
+  wrong layer, with no useful message. Publishing it makes the MCP's limit derived rather than
+  duplicated.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1410,6 +1441,19 @@ export type McpConfig = {
   /** From WHATSAPP_MCP_REQUEST_TIMEOUT_MS, default 30000, clamped [1000, 300000]. Feeds
    *  createClient({ timeoutMs }). Not in spec §9's table — recorded as a deviation. */
   requestTimeoutMs: number;
+  /**
+   * From WHATSAPP_MCP_TRANSCRIBE_TIMEOUT_MS, default 960_000, clamped [60_000, 3_900_000].
+   *
+   * A separate knob, not a larger `requestTimeoutMs`, and the numbers force it: the API's own
+   * `transcribeTimeoutMs` defaults to 900_000 (`config.ts:213`) and clamps to an hour, while
+   * `requestTimeoutMs` clamps at 300_000. One shared timeout either gives up on a transcription
+   * five minutes into a fifteen-minute job, or gives every ordinary read a fifteen-minute rope.
+   * The default sits just above the API's so the SDK is never the component that quits first, and
+   * the ceiling sits just above the API's own ceiling for the same reason.
+   *
+   * `createClient` takes it as a per-route override for `transcribe` only.
+   */
+  transcribeTimeoutMs: number;
 };
 ```
 
@@ -1933,7 +1977,31 @@ Named here so they are visible omissions rather than oversights:
 1. **The SDK release workflow.** `packages/sdk` is made *publishable* in Task 1 (manifest fields), but
    no CI publish job and no versioning policy are in scope. Spec §2 leans on registry publication to
    justify the monorepo, so this needs a follow-up before an external consumer exists.
-2. **Deployment migration for existing installs.** The volume is the account, and this split changes
-   the process topology. No task covers upgrading a live deployment from one container to two.
+2. **Deployment migration for existing installs** is covered in Task 18's README upgrade section and
+   Task 17's compose file, but no automated migration exists — an operator follows prose.
 3. **Published image architecture.** Stays amd64-only; only the stale whisper.cpp comment is fixed.
 4. **An event stream (SSE/webhooks).** Spec §1 already lists it as a non-goal; a web UI will want it.
+5. **The `pick` race — a pre-existing correctness bug, deliberately not fixed here.** The refusal and
+   the `pick` retry are two independent requests, and the store ingests continuously between them. A
+   contact arriving in that window shifts every later position, so `pick: 2` can select a different
+   human than the one the refusal numbered — arrived at by following the instructions exactly.
+   `recipient.ts:16` reasons about the *ordering* being stable but not about the candidate *set*
+   changing. **This is identical in-process today; the split neither creates nor worsens it**, and
+   the honest fix (pinning the shown list behind a resolution token) would change the refusal
+   payload, violating Global Constraint 2. It therefore belongs in its own change, on its own
+   evidence. Worth filing immediately — the failure mode is "sends a private message to the wrong
+   person".
+6. **Asynchronous transcription.** `transcribeTimeoutMs` defaults to 900 000 ms (`config.ts:213`) and
+   the RunPod backend polls for that whole window. In one process only the caller's patience bounded
+   it; split, there are three independent timeouts (SDK `fetch`, any reverse proxy, the client), and
+   a proxy 504 abandons a job that keeps running and keeps being billed. The full fix is a job
+   contract (`202 Accepted` + `GET /v1/jobs/:id`) with persisted RunPod job ids — real machinery, and
+   a behaviour change to a paid path. **Interim mitigation, in scope:** a dedicated
+   `WHATSAPP_MCP_TRANSCRIBE_TIMEOUT_MS` (Task 12), defaulting just above the API's own 900 000 ms so
+   the SDK never quits first, and Task 18's docs state that any reverse proxy in front of the API
+   needs a matching read timeout — the one component this plan cannot configure.
+7. **MCP-side alerting.** `alerts.ts` is API-side, so an MCP that cannot reach the API notifies
+   nobody — and `last_message_at` exists precisely because a 44-hour outage once went unnoticed.
+   A minimal ntfy alerter in the MCP for the single condition "API unreachable beyond a threshold"
+   would close it. Out of scope here; the `api.reachable` field in the merged health report makes the
+   condition observable to any external watchdog in the meantime.
