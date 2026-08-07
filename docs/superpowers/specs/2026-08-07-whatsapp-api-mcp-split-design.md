@@ -407,6 +407,6 @@ answer a tool call.
 | Chatty reads (per-row name resolution) | §4.1 denormalization, decided up front rather than discovered under load |
 | Stub drift between the fake client and the real API | The end-to-end test in §10 is the only defence, and is not optional |
 | A network partition turning read tools into failures | `api_unreachable` as a distinct, legible code; named as an accepted cost in §8 |
-| Signed links leaking conversation content | HMAC over the exact tuple, short TTL, constant-time compare, never logged (§5.2) |
+| Signed links leaking conversation content | AES-256-GCM: the payload is unreadable, so the sha256, mimetype and **filename** do not leak to whoever holds the URL; the GCM tag replaces a separate HMAC; short TTL; never logged (§5.2) |
 | Baileys' pinned `7.0.0-rc14` behaviour changing under a workspace hoist | Pin stays exact; the API package owns it and no other package may import `baileys` |
 | Two images drifting in Node major | Both pinned to `node:24-slim`; `engines.node` `">=24"` in all three packages |

@@ -159,12 +159,17 @@ are non-obvious enough to get broken by an edit that looks correct.
   `*.test.ts` file, so that glob catches neither and anything left out compiles into `dist/` and
   ships in the image as dead code. Any new non-`*.test.ts` scaffolding needs a line there too.
 
-- **`whatsapp-api-sdk` resolves through `dist/`, so the root `check` and `test` build first.** Its
-  `exports`/`types` name `./dist/index.js` and `./dist/index.d.ts` — the same paths `npm publish` and
-  `pnpm deploy --prod` will use, which is why they may not point at `src/index.ts` however well Node's
-  type stripping happens to cope. Nothing else builds implicitly, so from the moment `api` or `mcp`
-  actually imports the SDK a bare `pnpm -r run typecheck` against a tree with no `packages/sdk/dist`
-  stops resolving it. Run `pnpm check` and `pnpm test`, not the recursive scripts directly.
+- **`whatsapp-api-sdk` resolves through `dist/`, so something must build it before anything reads it.**
+  Its `exports`/`types` name `./dist/index.js` and `./dist/index.d.ts` — the same paths `npm publish`
+  and `pnpm deploy --prod` will use, which is why they may not point at `src/index.ts` however well
+  Node's type stripping happens to cope. Two mechanisms cover it: `api` and `mcp` each build their
+  workspace deps first via `build:deps` (`pnpm --filter "<pkg>^..." run build`), so a bare
+  `pnpm --filter whatsapp-api typecheck` is self-sufficient; and the root `check`/`test` build once
+  up front. **Prefer the root scripts anyway** — not because the recursive ones fail to resolve, since
+  `build:deps` means they now do, but because `pnpm -r run typecheck` fans out `api`'s and `mcp`'s
+  `build:deps` concurrently, and on a cold tree that is two `tsc` invocations emitting into
+  `packages/sdk/dist` at once. Building once up front keeps that unreachable, and the SDK's build is
+  `tsc -b` so the warm case is a no-op rather than a second writer.
 
 - **`WHATSAPP_SEND_FILE_DIR` is unset by default and that is a security decision.** `whatsapp_send_file`'s `path`
   argument is an arbitrary-file-read primitive that would hand `/proc/self/environ` to a WhatsApp

@@ -172,9 +172,13 @@ tools keep working while disconnected and a reconnect must not flap the containe
 
 ```bash
 pnpm install
-pnpm --filter whatsapp-api dev                      # tsx, no build step
+pnpm --filter whatsapp-api dev                      # builds the SDK, then tsx for the API itself
 pnpm build && pnpm --filter whatsapp-api start      # compiled
 ```
+
+`dev` runs the API through `tsx` but still compiles `whatsapp-api-sdk` first, because the SDK is
+consumed through its `dist/`. The consequence worth knowing: an edit under `packages/sdk/src` is
+invisible to a running `dev` process until the SDK is rebuilt.
 
 Two endpoints:
 
