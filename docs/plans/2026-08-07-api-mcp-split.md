@@ -128,6 +128,7 @@ packages/api/                       whatsapp-api — ffmpeg + poppler
   src/config.ts                     API vars only
   src/version.ts                    moved
   src/rest/cursor.ts                moved from src/mcp/cursor.ts, unchanged encoding
+  src/rest/errors.ts                toApiError(): domain throw -> ApiError. See Task 2's table.
   src/rest/present.ts               denormalised row → SDK domain object
   src/rest/medialink.ts             HMAC signed-token mint/verify
   src/rest/handlers/*.ts            one file per route group
@@ -951,8 +952,12 @@ void test("the payload carries no chat id or phone number", () => {
 **Files:**
 - Move: `packages/api/src/mcp/cursor.ts` → `packages/api/src/rest/cursor.ts` (encoding unchanged)
 - Create: `packages/api/src/rest/present.ts`, `packages/api/src/rest/server.ts`,
+  **`packages/api/src/rest/errors.ts`** (`toApiError`, implementing Task 2's domain-throw → code →
+  status table in full),
   `packages/api/src/rest/handlers/meta.ts`
-- Test: `packages/api/src/rest/present.test.ts`, `packages/api/src/rest/server.test.ts`
+- Test: `packages/api/src/rest/present.test.ts`, `packages/api/src/rest/server.test.ts`,
+  `packages/api/src/rest/errors.test.ts` (one case per row of Task 2's mapping table, asserting
+  code, status, `name` and `message` together)
 
 **Interfaces — Produces:**
 
@@ -1000,9 +1005,12 @@ hand-mounting exceptions:
 3. `express.json` mounted **on `/v1` behind the gate**, so an anonymous `POST /anything` cannot make
    the server buffer and parse ~90 MB. Limit is `maxUploadBytes` + base64 overhead + 1 MiB.
 4. Bindings where `auth === "bearer"` — the other 22.
-5. Four-argument error middleware last — arity is how Express identifies it. Map `ApiError` → its
-   status + `errorToWire`; anything else → 500 `internal`. Log `errorDetail(err)`, never the raw
-   error object (Global Constraint 6).
+5. Four-argument error middleware last — arity is how Express identifies it. **Its first action is
+   `const apiErr = toApiError(err)`** (`rest/errors.ts`, Task 2's table) — *not* an
+   `instanceof ApiError` check. Every domain error in this codebase extends plain `Error`, so a bare
+   `instanceof` test sends all of them as 500 and breaks Tasks 8, 9 and 10's own acceptance tests.
+   Then respond with `apiErr.status` and `errorToWire(apiErr)`, carrying the original `name` and
+   `message`. Log `errorDetail(err)`, never the raw error object (Global Constraint 6).
 
 **`GET /media/dl/:token` sits outside `/v1` by path, and that is separate from its `auth` value.**
 A route `GET /v1/media/:chat/:id` also matches `/v1/media/dl/<token>` with `chat = "dl"`, so had the
@@ -1290,7 +1298,9 @@ void test("path sending is refused when no directory is configured, without echo
 ### Task 11: API bootstrap and config split, REST alongside MCP
 
 **Files:**
-- Modify: `packages/api/src/main.ts`, `packages/api/src/config.ts`
+- Modify: `packages/api/src/main.ts`, `packages/api/src/config.ts`,
+  **`packages/api/src/http.ts`** — see the restructure below; sharing one listener is not possible
+  without it, and an earlier draft asserted the sharing while assigning no file
 - Test: `packages/api/src/main.test.ts`
 
 **The product must keep working.** This task mounts the REST server **in addition to** the existing
@@ -1303,11 +1313,38 @@ listener of its own, and the legacy MCP `startHttp` is still running through Tas
 them naively is an `EADDRINUSE` crash the moment this task lands, in the very task whose purpose is
 "the product must keep working".
 
-Mount **both on one `http.Server`**: build the Express app for REST, mount the legacy MCP router on
-`config.httpPath` (default `/mcp`) within the same app, and listen once on `config.port`. This is
-preferable to a second port because it keeps the deployed surface, the healthcheck and the compose
-file unchanged for the whole side-by-side phase — nothing outside the process can tell the
-difference. The paths cannot collide: REST owns `/v1` and `/health`, MCP owns `/mcp`.
+Mount **both on one `http.Server`** — but that is not a wiring change, it is a restructure of
+`http.ts`, and it must be assigned or an implementer cannot do it. `startHttp` today owns things a
+guest router may not own (line references against the current file):
+
+| `startHttp` today | why it blocks sharing |
+| --- | --- |
+| `app.listen(config.port, …)` (`:335`) | a second listener on the same port is the `EADDRINUSE` |
+| its own `GET /health` (`:180`) | collides with REST's `/health` |
+| its own four-argument error middleware (`:299`) | a terminal handler must be last, and REST's is |
+| creates its own `express()` app (`:175`) | there can only be one app |
+
+So split it in two, keeping every behaviour intact:
+
+```ts
+/** Registers the MCP routes on a caller-supplied app. No listen, no /health, no error middleware. */
+export function mountMcp(app: Express, deps: McpMountDeps): McpMountHandle;
+```
+
+`startRest` then creates the app, mounts REST, calls `mountMcp(app, …)`, installs the single error
+middleware, and listens once. The session map, the unref'd sweeper, the bearer gate on
+`config.httpPath` and `closeAllConnections` on shutdown all move into `mountMcp` unchanged — only
+ownership of the app, the listener, `/health` and the terminal error handler changes hands.
+
+This keeps the deployed surface, the healthcheck and the compose file identical for the whole
+side-by-side phase; nothing outside the process can tell the difference. The paths cannot collide:
+REST owns `/v1` and `/health`, MCP owns `/mcp`.
+
+⚠️ **Task 12 ports the *original* `startHttp`, not this restructured one.** `packages/mcp` is its
+own process and needs its own listener, its own `/health` and its own error middleware back — i.e.
+the shape this task just dismantled. Take that port from the pre-restructure file (git history, or
+`packages/api/src/http.ts` before this task's commit). Reading Task 12 as "port whatever `http.ts`
+looks like now" would produce an MCP server that never listens.
 
 Config keeps every existing API variable and adds `WHATSAPP_API_TOKEN` and
 `WHATSAPP_MEDIA_LINK_TTL` (default 900, clamped `[60, 86400]`). Invalid numbers fall back to the
@@ -1379,7 +1416,11 @@ export type McpConfig = {
 `ToolContext` collapses from thirteen fields to three. Nothing else may be added to it — a tool that
 needs data grows an SDK call, not a context field.
 
-**`http.ts` is ported near-verbatim** from `packages/api/src/http.ts` with one change:
+**`http.ts` is ported near-verbatim** from `packages/api/src/http.ts` **as it stood before Task 11**
+— the self-listening version that owns its own `express()` app, its own `GET /health` and its own
+terminal error middleware. Task 11 split that file into `mountMcp(app, deps)` so the API could share
+one listener; `packages/mcp` is a separate process and needs the original shape back. Take it from
+git history if Task 11 has already landed. One change:
 `HttpDeps.buildServer` becomes `() => Promise<McpServer>`.
 
 **Be precise about what the risk is, because an earlier draft of this plan overstated it.** There is
@@ -1531,7 +1572,15 @@ Tool → SDK call mapping:
 | `whatsapp_messages_list` / `messages_search` | `listMessages` / `searchMessages` |
 | `whatsapp_download_media` | `getMessage` + one `fetchMedia` by kind |
 | `whatsapp_transcribe` | `transcribe` |
-| the six writes | the matching write routes |
+| the six writes | the matching write routes — **but see the `status` note below** |
+
+**Four of the six write tools emit a `status: "ok"` field the wire shape does not carry.** Today
+`writes.ts` has two shapers: `sendResult` → `{ chat, message_id }` for `whatsapp_send_text` and
+`whatsapp_send_file`, and `okResult` → `{ status: "ok", chat, message_id }` for `whatsapp_react`,
+`whatsapp_mark_read`, `whatsapp_edit_message` and `whatsapp_delete_message`. The REST responses are
+uniformly `{ chat, messageId }`, so the MCP must re-add `status: "ok"` for exactly those four and
+not for the two sends. Keep both shapers in `packages/mcp`; do not unify them into one "tidier"
+helper, because the asymmetry *is* the contract.
 
 `whatsapp_download_media` branches by media kind, exactly as today, each branch calling the one
 media route that serves it. Every branch must be able to reproduce `summaryOf`'s **unconditional**
@@ -1611,7 +1660,9 @@ were considered and two are wrong:
    `whatsapp-api` gives `mcp` a resolvable path to `baileys` and makes
    `import { makeConnection } from "whatsapp-api"` compile in MCP source. The enforcement stops
    being mechanical, which is the whole point of it.
-3. **`packages/e2e` — a private package that ships nowhere.** `"private": true`, no `build` script,
+3. **`packages/e2e` — a private package that ships nowhere.** `"private": true`, no `build` script
+   (verified: `pnpm -r run build` **skips** a package lacking the script and exits 0 —
+   `Scope: 2 of 3 workspace projects` — so no no-op stub is needed, and adding one is not a fix),
    not in either Dockerfile. It devDepends on `whatsapp-api`, `whatsapp-mcp` and the SDK, so it can
    drive the real pair, while both product packages keep clean dependency graphs. Its tests run
    under its own `src/**/*.test.ts` glob via `pnpm -r run test`. No cycle exists: `api → sdk`,
