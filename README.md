@@ -83,8 +83,8 @@ recording — and left with the `WHATSAPP_WHISPER_BIN` / `_MODEL` / `_THREADS` v
 ## First run: pairing
 
 The server pairs **by code, not by QR**. It never renders a QR — a QR in a container log is a live credential anyone
-reading the log can use, so the code path is the only one implemented (`src/whatsapp/connection.ts`, `handleQr` and
-`requestPairingCode`).
+reading the log can use, so the code path is the only one implemented
+(`packages/api/src/whatsapp/connection.ts`, `handleQr` and `requestPairingCode`).
 
 1. Set `WHATSAPP_PHONE_NUMBER` to the account's number in E.164 **digits only, no leading `+`** — e.g. `33612345678`.
    Validated at boot: 8–15 digits, no leading zero, or the process exits with a `ConfigError`.
@@ -112,7 +112,8 @@ and a human has to re-pair it.
 ## Configuration
 
 Every variable is optional except where noted. Invalid numbers fall back to the default rather than failing the boot;
-`WHATSAPP_PHONE_NUMBER` is the one exception and throws. All of this is one function — `loadConfig` in `src/config.ts`.
+`WHATSAPP_PHONE_NUMBER` is the one exception and throws. All of this is one function — `loadConfig` in
+`packages/api/src/config.ts`.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
@@ -148,15 +149,15 @@ Every variable is optional except where noted. Invalid numbers fall back to the 
 | `NTFY_TOPIC` | — | The **incident** topic: disconnection, waiting-to-be-paired, logged-out, and the recovery that closes one of those. Recovery is deliberately not routed elsewhere — an operator who sees the alarm on this topic has to see the all-clear on it too. |
 | `NTFY_TOPIC_INFO` | `NTFY_TOPIC` | The **routine** topic, for traffic that is not a problem: today, the startup self-test. Optional; unset, routine notices join the incident topic, which is the single-topic behaviour that predates the split. Setting it can only ever move traffic off the incident topic, never silence it. |
 | `NTFY_TOKEN` | — | Bearer token for ntfy, if the server needs one. Travels in a header and appears in no log line. **A token the server does not recognise fails silently:** every publish is a `warn` and nothing more, by design — an alerting failure must never take the WhatsApp socket down — so a wrong token means no alert will ever arrive and nothing will say so except `alerts: ntfy publish rejected` in the log. The startup self-test exists to put that line where it can be found on boot rather than during the first real incident. |
-| `LOG_LEVEL` | `info` | pino level for every log line the process writes: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. Read in `src/logger.ts`, not through `loadConfig`, so it is the one variable here that is not part of `Config`. **`trace` and `debug` are not safe to leave on.** The same logger is handed to Baileys, which logs raw stanzas at those levels — including the pairing `ref`, which is a live credential. Turn them on to debug, then turn them back off. |
+| `LOG_LEVEL` | `info` | pino level for every log line the process writes: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`. Read in `packages/api/src/logger.ts`, not through `loadConfig`, so it is the one variable here that is not part of `Config`. **`trace` and `debug` are not safe to leave on.** The same logger is handed to Baileys, which logs raw stanzas at those levels — including the pairing `ref`, which is a live credential. Turn them on to debug, then turn them back off. |
 
 Alerting debounces on purpose: a dropped socket must stay down for a grace period before anyone is paged, re-alerts on
 a cadence while still down, and announces recovery only if a down alert actually went out. `logged_out` skips the grace
 and goes out immediately — no backoff recovers it.
 
 `WHATSAPP_MCP_TOKEN` and `NTFY_TOKEN` never appear in a log line, an error message, or the `/health` response. `/health`
-returns a closed record built in `src/mcp/health.ts` rather than a spread of the config, so a new config field can
-never widen it by accident.
+returns a closed record built in `packages/api/src/mcp/health.ts` rather than a spread of the config, so a new config
+field can never widen it by accident.
 
 **`last_event_age_sec` and `last_message_at` measure different things, and only the second one detects a frozen
 store.** `last_event_age_sec` is the age of the last `connection.update` — the socket's opinion of itself — so it stays
@@ -171,8 +172,8 @@ tools keep working while disconnected and a reconnect must not flap the containe
 
 ```bash
 pnpm install
-pnpm dev                      # tsx, no build step
-pnpm build && pnpm start      # compiled
+pnpm --filter whatsapp-api dev                      # tsx, no build step
+pnpm build && pnpm --filter whatsapp-api start      # compiled
 ```
 
 Two endpoints:
@@ -213,12 +214,13 @@ deliberately, rather than discovering it under a user's request.
 ## Quality gate
 
 ```bash
-pnpm check     # prettier --check, eslint, tsc --noEmit
-pnpm test      # node:test via tsx
-pnpm build     # tsc -> dist/
+pnpm check     # build, then prettier --check, eslint, tsc --noEmit
+pnpm test      # build, then node:test via tsx
+pnpm build     # tsc -> packages/*/dist
 ```
 
-`pnpm check` is `format:check && lint && typecheck`, and all three must be silent. The TypeScript config is the full
+`pnpm check` is `build && format:check && lint && typecheck`, and the last three must be silent. It builds first
+because `whatsapp-api-sdk` resolves through its `dist/`. The TypeScript config is the full
 strict set — `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, `noPropertyAccessFromIndexSignature`,
 `verbatimModuleSyntax` and the rest — and ESLint runs `strictTypeChecked` + `stylisticTypeChecked` with zero tolerance
 for warnings. Do not weaken a compiler option to make code compile.
@@ -229,13 +231,13 @@ and `test`. `.github/workflows/docker.yml` re-runs it as a `check` job and gates
 
 ## Testing
 
-Tests are `node:test`, run through `tsx`, and live beside their subject as `src/**/*.test.ts`. No test framework is
-installed. Media tests are not mocked at the boundary that matters: they build real PNG, WebP and MP4 fixtures with
-ffmpeg and convert them back, because a stubbed converter only ever asserts the stub.
+Tests are `node:test`, run through `tsx`, and live beside their subject as `packages/*/src/**/*.test.ts`. No test
+framework is installed. Media tests are not mocked at the boundary that matters: they build real PNG, WebP and MP4
+fixtures with ffmpeg and convert them back, because a stubbed converter only ever asserts the stub.
 
 ```bash
 pnpm test                                              # everything
-node --import tsx --test src/whatsapp/ingest.test.ts         # one file
+node --import tsx --test packages/api/src/whatsapp/ingest.test.ts   # one file
 ```
 
 What the suite structurally cannot cover is the wiring end to end, and a real GPU job. That is `smoke.mjs`:

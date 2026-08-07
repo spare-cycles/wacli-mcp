@@ -10,21 +10,17 @@
   "files": [
     "dist"
   ],
-  "types": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
-  },
-  "//": "In the workspace the entrypoint is the TypeScript source, so `api` and `mcp` typecheck without a prior build; `publishConfig` swaps in the compiled `dist/` paths at publish time.",
-  "publishConfig": {
-    "access": "public",
-    "main": "./dist/index.js",
-    "types": "./dist/index.d.ts",
-    "exports": {
-      ".": {
-        "types": "./dist/index.d.ts",
-        "import": "./dist/index.js"
-      }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
+  },
+  "//": "One entrypoint, `dist/`, in the workspace and when published: `npm publish` does not apply `publishConfig.exports`, and `pnpm deploy --prod` with `files: [\"dist\"]` would copy a package whose exports named a file it did not ship. The cost is that `dist/` must exist before anything typechecks against this package, which the root `check`/`test` scripts guarantee by building first.",
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -1,6 +1,6 @@
 {
   "extends": "./tsconfig.json",
   "include": ["src/**/*.ts"],
-  "//": "Test scaffolding that is not a *.test.ts file gets named here explicitly, because the glob below cannot catch it. Left in, it compiles into dist/ and ships in the image as dead code that nothing imports.",
+  "//": "Only the *.test.ts glob today — this package has no non-test scaffolding yet. Task 12 adds src/tools/harness.ts here: scaffolding that is not a *.test.ts file has to be named explicitly, or it compiles into dist/ and ships as dead code that nothing imports.",
   "exclude": ["src/**/*.test.ts"]
 }

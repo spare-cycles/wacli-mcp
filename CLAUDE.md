@@ -3,27 +3,31 @@
 `README.md` is the reference (tools, env vars, pairing, Docker). This file is the list of things that
 are non-obvious enough to get broken by an edit that looks correct.
 
-- **All raw JID interpretation lives in `src/whatsapp/jid.ts`.** No other production module may contain
-  `@lid`, `@s.whatsapp.net` or `@g.us`, or split a JID on `@` or `:`. WhatsApp hands the same human
-  two identities — a phone JID and a LID — and folding them is the difference between one
+- **All raw JID interpretation lives in `packages/api/src/whatsapp/jid.ts`.** No other production module
+  may contain `@lid`, `@s.whatsapp.net` or `@g.us`, or split a JID on `@` or `:`. WhatsApp hands the
+  same human two identities — a phone JID and a LID — and folding them is the difference between one
   conversation and two half-empty ones. Every layer above calls `canonicalId(jid, contacts)` and
-  treats the result as an opaque key. The enforcing check, which must print nothing:
+  treats the result as an opaque key. The enforcing check, run from the repo root, which must print
+  nothing:
   ```bash
-  grep -rn '@lid\|@s\.whatsapp\.net\|@g\.us' src/ --include='*.ts' \
-    | grep -v '\.test\.ts:' | grep -v 'src/whatsapp/jid\.ts:' | grep -v 'src/whatsapp/fixtures\.ts:'
+  grep -rn '@lid\|@s\.whatsapp\.net\|@g\.us' packages/*/src/ --include='*.ts' \
+    | grep -v '\.test\.ts:' \
+    | grep -v 'packages/api/src/whatsapp/jid\.ts:' \
+    | grep -v 'packages/api/src/whatsapp/fixtures\.ts:'
   ```
-  Test files and `src/whatsapp/fixtures.ts` are excluded because they carry JID *literals as data* — a
-  test for identity folding has to name a LID.
+  It sweeps every package, not just `api`, because the constraint binds any package that ever holds a
+  JID. Test files and `packages/api/src/whatsapp/fixtures.ts` are excluded because they carry JID
+  *literals as data* — a test for identity folding has to name a LID.
 
 - **`getMessage` makes the store load-bearing for the protocol, not just for reads.** Baileys calls
   it to re-encrypt a message a peer failed to decrypt, and to build a quote. It is wired in
-  `src/main.ts` to `messages.getRaw(...)`, which returns the stored protobuf envelope — so the `raw`
+  `packages/api/src/main.ts` to `messages.getRaw(...)`, which returns the stored protobuf envelope — so the `raw`
   BLOB column is not a debugging convenience, and a change that stops persisting it silently breaks
   retries and replies rather than failing a test. It is typed to return the **inner** `proto.IMessage`,
   not the `WebMessageInfo` envelope.
 
 - **FTS5 is an external-content table** (`content='messages'`, `content_rowid='rowid'`), kept in sync
-  by three triggers in `src/db/schema.ts` — insert, delete, and an update that deletes-then-inserts.
+  by three triggers in `packages/api/src/db/schema.ts` — insert, delete, and an update that deletes-then-inserts.
   An external-content FTS index stores no copy of the text, so a write that bypasses those triggers
   leaves the index wrong forever with no error. In particular `setTranscript` writes through the
   repository *because* the UPDATE trigger is what puts transcribed speech into the search index.
@@ -31,12 +35,12 @@ are non-obvious enough to get broken by an edit that looks correct.
 - **Which FTS column matched is read from the `snippet()` markers, never from a snippet being empty.**
   `snippet()` returns unmarked leading text for a column that took no part in the match, so "empty
   means no match" mislabels the common case — a captioned video whose caption does not contain the
-  query but whose transcript does — as a text hit. `src/db/messages.ts` asks for `char(1)`/`char(2)`
+  query but whose transcript does — as a text hit. `packages/api/src/db/messages.ts` asks for `char(1)`/`char(2)`
   delimiters and tests for those markers.
 
 - **Baileys is pinned exactly: `"baileys": "7.0.0-rc14"`.** No caret, no tilde. It is a prerelease
   and rc→rc has broken APIs before. Bumping it is a task with a test run, not a dependency refresh.
-  Related: `src/mcp/tools/*` must not import from `baileys` — Baileys types stop at the `whatsapp/` and
+  Related: `packages/api/src/mcp/tools/*` must not import from `baileys` — Baileys types stop at the `whatsapp/` and
   `media/` boundary.
 
 - **The socket's `browser[1]` is a protocol value, not a cosmetic label, and only six strings work.**
@@ -47,7 +51,7 @@ are non-obvious enough to get broken by an edit that looks correct.
   awaits that reply: it returns the locally generated code either way. So the whole failure
   surfaces as eight plausible characters the phone refuses, with a healthy-looking pod and no
   error in the log. Only Baileys' `BROWSER_TO_COMPANION_WEB_CLIENT` keys — Chrome, Edge, Firefox,
-  IE, Opera, Safari — are safe; `src/whatsapp/connection.ts` uses `Browsers.macOS("Chrome")`. Upstream
+  IE, Opera, Safari — are safe; `packages/api/src/whatsapp/connection.ts` uses `Browsers.macOS("Chrome")`. Upstream
   issue #2560, whose fix (PR #2559) is unmerged as of rc14 — recheck on any Baileys bump.
 
 - **`creds.me` is written when a pairing code is *requested*, not when pairing succeeds**, and
@@ -96,7 +100,7 @@ are non-obvious enough to get broken by an edit that looks correct.
   suite is the check — run it on the new major before changing anything.
 
 - **HTTP transport only, with bearer auth.** No stdio transport and no `StdioServerTransport` import.
-  Middleware order in `src/http.ts` is load-bearing: `/health` is registered **before** the bearer
+  Middleware order in `packages/api/src/http.ts` is load-bearing: `/health` is registered **before** the bearer
   gate (a container healthcheck that needs the secret is a secret in the compose file), and
   `express.json` is mounted **on the MCP path behind the gate**, so an anonymous `POST /anything`
   cannot make the server buffer and parse ~90 MB. No log line in that file is ever handed a raw error
@@ -108,7 +112,7 @@ are non-obvious enough to get broken by an edit that looks correct.
   `.shape`; `normalizeObjectSchema` falls back to `EMPTY_OBJECT_JSON_SCHEMA`, so `listTools`
   advertises `{"type":"object","properties":{}}` and no client learns that any argument exists. The
   call still *validates*, so a server-side test that only checks a bad call is refused sees nothing
-  wrong. Cross-field rules go in the handler (`fileSource` in `src/mcp/tools/writes.ts`) and in the
+  wrong. Cross-field rules go in the handler (`fileSource` in `packages/api/src/mcp/tools/writes.ts`) and in the
   description. Same class of trap: a discriminated union renders as a top-level `anyOf`, which
   several clients present badly.
 
@@ -132,14 +136,23 @@ are non-obvious enough to get broken by an edit that looks correct.
   Anything from `Date.now()` divides by 1000 and floors; the only milliseconds in the codebase carry
   `Ms` in the name.
 
-- **The gate is `pnpm check` (prettier + eslint + tsc) and `pnpm test`, both green before a commit.**
+- **The gate is `pnpm check` (build + prettier + eslint + tsc) and `pnpm test`, both green before a
+  commit.** Both build first, because the SDK's `exports` name `dist/`: see the workspace bullet below.
   Full TS strict set, ESLint `strictTypeChecked` + `stylisticTypeChecked` at zero warnings; do not
-  weaken a compiler option to make code compile. `smoke.mjs` is listed in `eslint.config.js`'s
+  weaken a compiler option to make code compile. `eslint.base.js` names `eslint.config.js` in its
   `ignores` — being outside `src/` is *not* enough, because `projectService` fatals on any file no
-  tsconfig includes. Symmetrically, `src/mcp/tools/harness.ts` and `src/whatsapp/fixtures.ts` are named
-  one by one in `tsconfig.build.json`'s `exclude`: both are test scaffolding, neither is a
+  tsconfig includes; root-level `smoke.mjs` is safe only because `pnpm -r run lint` never leaves a
+  package directory. Symmetrically, `src/mcp/tools/harness.ts` and `src/whatsapp/fixtures.ts` are named
+  one by one in `packages/api/tsconfig.build.json`'s `exclude`: both are test scaffolding, neither is a
   `*.test.ts` file, so that glob catches neither and anything left out compiles into `dist/` and
   ships in the image as dead code. Any new non-`*.test.ts` scaffolding needs a line there too.
+
+- **`whatsapp-api-sdk` resolves through `dist/`, so the root `check` and `test` build first.** Its
+  `exports`/`types` name `./dist/index.js` and `./dist/index.d.ts` — the same paths `npm publish` and
+  `pnpm deploy --prod` will use, which is why they may not point at `src/index.ts` however well Node's
+  type stripping happens to cope. Nothing else builds implicitly, so from the moment `api` or `mcp`
+  actually imports the SDK a bare `pnpm -r run typecheck` against a tree with no `packages/sdk/dist`
+  stops resolving it. Run `pnpm check` and `pnpm test`, not the recursive scripts directly.
 
 - **`WHATSAPP_SEND_FILE_DIR` is unset by default and that is a security decision.** `whatsapp_send_file`'s `path`
   argument is an arbitrary-file-read primitive that would hand `/proc/self/environ` to a WhatsApp

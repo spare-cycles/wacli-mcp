@@ -27,9 +27,13 @@ WORKDIR /app
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json ./
 COPY packages ./packages
 RUN pnpm install --frozen-lockfile && pnpm -r run build
-# NOTE: no `pnpm prune --prod` here. It is not workspace-recursive, so at a workspace root it does
-# not do what the single-package build used it for. This temporary image is allowed to carry
-# devDependencies; Task 17 slims both real images with `pnpm deploy --filter <pkg> --prod`.
+# Prune to production. `pnpm prune --prod` is not workspace-recursive, so it is the wrong tool at a
+# workspace root; a second `install --prod` is, and it drops typescript/tsx/eslint and every other
+# devDependency out of `/app/node_modules` before the runtime stage copies it. It rebuilds the
+# modules directory from the store rather than editing it, hence `confirmModulesPurge=false` — with
+# no TTY pnpm otherwise refuses the removal instead of assuming consent. Task 17 replaces the whole
+# arrangement with `pnpm deploy --filter <pkg> --prod`.
+RUN pnpm --config.confirmModulesPurge=false install --frozen-lockfile --prod --ignore-scripts
 
 # ── 2) Runtime ───────────────────────────────────────────────────────────────
 FROM node:24-slim
@@ -40,10 +44,17 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # The workspace layout is preserved verbatim, not flattened: `packages/api`'s dependencies are
-# symlinks inside `packages/api/node_modules` pointing at `../../node_modules/.pnpm/…`, so moving
-# `dist/` up to `/app/dist` would leave `baileys` unresolvable at runtime.
+# symlinks inside `packages/api/node_modules` pointing at `../../node_modules/.pnpm/…`, and its
+# `whatsapp-api-sdk` link points at `../../sdk`, so moving `dist/` up to `/app/dist` would leave both
+# unresolvable at runtime. The copy is narrowed to exactly what `packages/api/dist/main.js` can
+# reach: no package's `src/` ships, which is what keeps the 27 `*.test.ts` files and the two test
+# scaffolding modules out of the image, and `packages/mcp` and `packages/e2e` are absent entirely.
 COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/packages ./packages
+COPY --from=build /app/packages/api/node_modules ./packages/api/node_modules
+COPY --from=build /app/packages/api/package.json ./packages/api/package.json
+COPY --from=build /app/packages/api/dist ./packages/api/dist
+COPY --from=build /app/packages/sdk/package.json ./packages/sdk/package.json
+COPY --from=build /app/packages/sdk/dist ./packages/sdk/dist
 COPY package.json ./
 RUN mkdir -p /data/whatsapp && chown -R node:node /data/whatsapp
 ENV NODE_ENV=production \
