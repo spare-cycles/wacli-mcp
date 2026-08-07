@@ -684,7 +684,12 @@ void test("whatsapp_transcribe caches: a second call does not re-run whisper", a
     assert.equal(resultText(first), "transcrit");
     assert.equal(h.transcribeCalls.n, 1);
     // Written through, so whatsapp_messages_search finds it: setTranscript re-indexes into FTS.
-    assert.equal(h.ctx.messages.get(CHAT, MSG)?.transcript, "transcrit");
+    const stored = h.ctx.messages.get(CHAT, MSG);
+    assert.equal(stored?.transcript, "transcrit");
+    // The whole result goes into the row, not just the words — this is the interactive writer, the
+    // other of the two that hands `setTranscript` a `Transcript` it never unpacks.
+    assert.equal(stored.transcriptModel, "test-model");
+    assert.equal(stored.transcriptLanguage, "fr");
 
     const second = await h.client.callTool({ name: "whatsapp_transcribe", arguments: { chat: CHAT, message_id: MSG } });
     assert.equal(resultText(second), "transcrit");

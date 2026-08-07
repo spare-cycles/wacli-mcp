@@ -32,6 +32,7 @@ import { mkdir, readFile, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import type { Config, TranscribeBackend } from "../config.js";
+import type { TranscriptInput } from "../db/messages.js";
 import { makeMistralBackend } from "./backends/mistral.js";
 import { MAX_PAYLOAD_BYTES, makeRunpodBackend } from "./backends/runpod.js";
 import { BackendError, type Backend } from "./backends/types.js";
@@ -52,8 +53,15 @@ export type TranscribeOptions = {
   lane?: Lane | undefined;
 };
 
-/** A transcript and the provenance that goes into `messages.transcript_model`. */
-export type Transcript = { text: string; model: string; language: string | null };
+/**
+ * A transcript and the provenance that goes with it: the model that produced it
+ * (`messages.transcript_model`) and the language it reported (`messages.transcript_language`).
+ *
+ * Declared in `db/messages.ts` and aliased here rather than the other way round — `db` sits below
+ * `media`, and the shape has to exist in one place or a field added here goes on being accepted by
+ * the persist path and dropped by its SQL. See `TranscriptInput` for why that import points down.
+ */
+export type Transcript = TranscriptInput;
 
 export type Transcriber = {
   /**

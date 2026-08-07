@@ -4,21 +4,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { makeChatsRepo } from "./chats.js";
-import { openDb } from "./client.js";
+import { openDb, type Db } from "./client.js";
 import { makeContactsRepo } from "./contacts.js";
-import { makeMessagesRepo, type MessageInput } from "./messages.js";
+import { makeMessagesRepo, TRANSCRIPT_COLUMNS, type MessageInput, type TranscriptInput } from "./messages.js";
 
 const dir = mkdtempSync(join(tmpdir(), "whatsapp-msg-"));
 after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 let n = 0;
-function repo() {
+function store() {
   const db = openDb(join(dir, `m${n++}.db`));
   const chats = makeChatsRepo(db);
   chats.ensure("c", false);
   chats.ensure("c2", false);
-  return makeMessagesRepo(db);
+  return { db, messages: makeMessagesRepo(db) };
+}
+function repo() {
+  return store().messages;
 }
 const msg = (over: Partial<MessageInput> = {}): MessageInput => ({
   chatId: "c",
@@ -30,6 +33,21 @@ const msg = (over: Partial<MessageInput> = {}): MessageInput => ({
   text: "hello",
   ...over,
 });
+
+/**
+ * The fields of a transcript, read off the map the repository generates its SQL from.
+ *
+ * Everything below that walks this list covers a field nobody has invented yet: adding one to
+ * `TranscriptInput` will not compile until it has a column here, and from that moment these tests
+ * demand that it reach the database and that a revoked row lose it.
+ */
+const transcriptFields = Object.keys(TRANSCRIPT_COLUMNS) as (keyof TranscriptInput)[];
+
+/** The transcript columns of one row, straight from SQLite — no repository mapping in between. */
+function transcriptColumns(db: Db, id: string): Record<string, unknown> {
+  const cols = transcriptFields.map((f) => TRANSCRIPT_COLUMNS[f]).join(", ");
+  return db.prepare(`SELECT ${cols} FROM messages WHERE chat_id = 'c' AND id = ?`).get(id) as Record<string, unknown>;
+}
 
 void test("upsert then get round-trips", () => {
   const r = repo();
@@ -217,6 +235,44 @@ void test("a transcript's language survives a round trip", () => {
   assert.equal(row?.transcript, "bonjour");
   assert.equal(row.transcriptModel, "voxtral");
   assert.equal(row.transcriptLanguage, "fr");
+});
+
+void test("every field a transcript carries reaches a column of its own", () => {
+  // The three assertions above name today's fields; this one names none of them. It walks
+  // `TRANSCRIPT_COLUMNS`, which is the map `setTranscript`'s UPDATE is generated from and which the
+  // compiler will not let anyone leave a `TranscriptInput` field out of — so the field added next
+  // year is covered here the day it appears, without anyone remembering to come back. That is the
+  // whole point: `language` existed on `Transcript` for as long as it did precisely because no
+  // test and no compiler error stood between "the transcriber returns it" and "the SQL drops it".
+  const s = store();
+  s.messages.upsert(msg({ id: "V1", kind: "audio", text: undefined }));
+  // A value derived from the field name, so a statement that bound the right number of parameters
+  // in the wrong order fails instead of passing on interchangeable strings.
+  const sent = Object.fromEntries(transcriptFields.map((f) => [f, `spoken-${f}`])) as TranscriptInput;
+  s.messages.setTranscript("c", "V1", sent);
+
+  // Read raw: `toMessageRow` is the other half of the plumbing, and a test that went through it
+  // could not tell a column that was never written from one that was never mapped back out.
+  const row = transcriptColumns(s.db, "V1");
+  for (const field of transcriptFields) {
+    assert.equal(row[TRANSCRIPT_COLUMNS[field]], sent[field], `${field} must land in ${TRANSCRIPT_COLUMNS[field]}`);
+  }
+});
+
+void test("revoking a message clears every transcript column, provenance included", () => {
+  // A tombstoned row that still answers `{ text: null, model: "voxtral", language: "fr" }` is
+  // describing a transcript that no longer exists. `markDeleted` clears the whole set — generated
+  // from the same map, so a future field is tombstoned as automatically as it is written.
+  const s = store();
+  s.messages.upsert(msg({ id: "V1", kind: "audio", text: "la legende" }));
+  s.messages.setTranscript("c", "V1", { text: "bonjour", model: "voxtral", language: "fr" });
+  s.messages.markDeleted("c", "V1", 5000);
+
+  const row = transcriptColumns(s.db, "V1");
+  for (const field of transcriptFields) {
+    assert.equal(row[TRANSCRIPT_COLUMNS[field]], null, `${TRANSCRIPT_COLUMNS[field]} must not outlive the transcript`);
+  }
+  assert.equal(s.messages.get("c", "V1")?.deletedTs, 5000, "and the row itself stays, tombstoned");
 });
 
 void test("a backend that could not name a language stores NULL rather than a guess", () => {

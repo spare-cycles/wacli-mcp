@@ -267,9 +267,9 @@ export function makeSender(deps: SendDeps): Sender {
   /**
    * The stored row a caller named — and the one place the revoke tombstone is enforced for sends.
    *
-   * `markDeleted` (`db/messages.ts`) clears `text` and `transcript` but deliberately *keeps* `raw`,
-   * because the socket's `getMessage` contract is served from those bytes and Baileys needs them for
-   * its retry and decrypt path. That makes every read site here responsible for the tombstone: the
+   * `markDeleted` (`db/messages.ts`) clears the text and every transcript column but deliberately
+   * *keeps* `raw`, because the socket's `getMessage` contract is served from those bytes and Baileys needs
+   * them for its retry and decrypt path. That makes every read site here responsible for the tombstone: the
    * bytes are still there to be handed to WhatsApp by anything that does not check.
    *
    * `quotedFor` is the sharp edge — Baileys embeds the decoded envelope as

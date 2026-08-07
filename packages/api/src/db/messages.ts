@@ -110,13 +110,38 @@ export type MessageListFilter = MessageFilter & {
 export type SearchHit = MessageRow & { matchedTranscript: boolean; snippet: string };
 
 /**
- * What `setTranscript` persists.
+ * What `setTranscript` persists — and, aliased as `Transcript` in `media/transcribe.ts`, what the
+ * transcribers produce. One declaration, so the two cannot drift apart.
  *
- * Structurally the transcribers' `Transcript` (`media/transcribe.ts`), restated here rather than
- * imported: `db` sits below `media`, and importing upwards — even a type — would make the
- * dependency circular. A caller hands over what its backend returned, unchanged.
+ * It lives *here*, in the layer that stores it, rather than in the layer that produces it, because
+ * `db` sits below `media` and nothing in `db` may depend on a transcriber. To be exact about the
+ * cost of the alternative: an import the other way would not actually close a module cycle today
+ * (`media/transcribe.ts` reaches `db/meta.ts` → `db/client.ts` → `db/schema.ts` through
+ * `media/budget.ts`, none of which import this file), and no lint rule forbids one. It is the
+ * layering that rules it out, not the module graph.
  */
 export type TranscriptInput = { text: string; model: string; language: string | null };
+
+/**
+ * Every field of a transcript, and the column that holds it.
+ *
+ * This is a mechanism, not a note: both statements below are generated from it, so a field added
+ * to `TranscriptInput` is a compile error here until it is given a column, and the moment it has
+ * one it is written and tombstoned like the rest. Nothing else enforces that. The object form of
+ * `setTranscript` reads as though it would, but both production callers pass a `Transcript`
+ * *variable* — excess-property checking never applies — so a new field would compile, be accepted,
+ * and be dropped at the SQL layer without a word. Which is the exact bug schema V3 exists to fix.
+ */
+export const TRANSCRIPT_COLUMNS = {
+  text: "transcript",
+  model: "transcript_model",
+  language: "transcript_language",
+} as const satisfies Record<keyof TranscriptInput, string>;
+
+const TRANSCRIPT_FIELDS = Object.keys(TRANSCRIPT_COLUMNS) as (keyof TranscriptInput)[];
+/** `transcript = :text, transcript_model = :model, …` — the parameter is named for the field. */
+const TRANSCRIPT_SET_CLAUSE = TRANSCRIPT_FIELDS.map((f) => `${TRANSCRIPT_COLUMNS[f]} = :${f}`).join(", ");
+const TRANSCRIPT_CLEAR_CLAUSE = TRANSCRIPT_FIELDS.map((f) => `${TRANSCRIPT_COLUMNS[f]} = NULL`).join(", ");
 
 export type MessagesRepo = {
   /** Returns true when the row was newly inserted, false when it updated an existing one.
@@ -128,15 +153,24 @@ export type MessagesRepo = {
   list: (filter: MessageListFilter, limit: number, offset: number) => MessageRow[];
   search: (query: string, filter: MessageFilter, limit: number, offset: number) => SearchHit[];
   markEdited: (chatId: string, id: string, text: string, ts: number) => void;
+  /**
+   * Tombstone a revoked message: its text and its transcript go, the row and its `raw` stay.
+   *
+   * "Its transcript" means every transcript column, provenance included — a row answering
+   * `{ text: null, model: "voxtral", language: "fr" }` describes a transcript that no longer
+   * exists, and the `as=transcript` view being built on these columns would report it that way.
+   * `transcript_model` had been left behind since V2; V3 would have added a second such residue.
+   */
   markDeleted: (chatId: string, id: string, ts: number) => void;
   setStatus: (chatId: string, id: string, status: string) => void;
   /**
    * Store a transcript together with the provenance that came with it.
    *
-   * Taken as one object rather than as loose arguments because that is the shape the transcribers
-   * already return (`Transcript` in `media/transcribe.ts`): a caller passes what it was given
-   * instead of unpacking it, and a field added to a transcript later cannot be silently dropped by
-   * a call site that simply never passed it.
+   * Taken as one object rather than as loose arguments because that is exactly what a transcriber
+   * returns (`Transcript` in `media/transcribe.ts` is this very type): a caller passes what it was
+   * given instead of unpacking it. What stops a field of that object from being quietly left out
+   * of the write is not the object form — it is `TRANSCRIPT_COLUMNS`, from which this statement is
+   * generated.
    *
    * `model` is not optional. Making it so would let a caller store a transcript with no provenance,
    * which is the exact state schema V2 exists to end — and the one caller that could plausibly want
@@ -381,12 +415,14 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
     "UPDATE messages SET text = :text, edited_ts = :editedTs WHERE chat_id = :chatId AND id = :id",
   );
   const markDeletedStmt = db.prepare(
-    "UPDATE messages SET text = NULL, transcript = NULL, deleted_ts = :deletedTs WHERE chat_id = :chatId AND id = :id",
+    `UPDATE messages
+        SET text = NULL, ${TRANSCRIPT_CLEAR_CLAUSE}, deleted_ts = :deletedTs
+      WHERE chat_id = :chatId AND id = :id`,
   );
   const setStatusStmt = db.prepare("UPDATE messages SET status = :status WHERE chat_id = :chatId AND id = :id");
   const setTranscriptStmt = db.prepare(
     `UPDATE messages
-        SET transcript = :transcript, transcript_model = :model, transcript_language = :language
+        SET ${TRANSCRIPT_SET_CLAUSE}
       WHERE chat_id = :chatId AND id = :id`,
   );
   const pendingTranscriptsStmt = db.prepare(`
@@ -492,7 +528,12 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
   }
 
   function setTranscript(chatId: string, id: string, t: TranscriptInput): void {
-    setTranscriptStmt.run({ chatId, id, transcript: t.text, model: t.model, language: t.language });
+    // Bound field by field off the same list the SET clause came from, so the two cannot disagree
+    // about how many parameters there are. Passing `t` itself would work today and throw
+    // "Unknown named parameter" the day a caller hands over a structurally wider object.
+    const params: Record<string, string | null> = { chatId, id };
+    for (const field of TRANSCRIPT_FIELDS) params[field] = t[field];
+    setTranscriptStmt.run(params);
   }
 
   function pendingTranscripts(sinceTs: number, limit: number): PendingTranscript[] {

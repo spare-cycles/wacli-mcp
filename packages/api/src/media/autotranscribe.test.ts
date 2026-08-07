@@ -144,6 +144,9 @@ void test("a voice note that passes every gate is transcribed and stored with it
   // Provenance goes in with the text: without it a Voxtral transcript and a whisper.cpp-era one are
   // indistinguishable, and nothing can decide what is worth re-transcribing.
   assert.equal(row.transcriptModel, "voxtral");
+  // And the language, through this writer rather than through the repository test: the background
+  // sweep is the path that produced a language and stored nothing for every voice note until V3.
+  assert.equal(row.transcriptLanguage, "fr");
 });
 
 void test("🔴 a history replay enqueues nothing while an offline drain of recent notes does", async (t) => {
