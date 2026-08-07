@@ -559,6 +559,18 @@ new refusal behaviour under cover of a refactor.
 Test it directly: one case per row, asserting code, status, `name` and `message` together. A table
 this size with no test is a table that rots.
 
+**And guard the table against silent drift, because nothing else does.** Every row above was found
+by hand, and the list has already been wrong three times — the four `send.ts` classes, then the bare
+`Error` sites and `CursorError`, then two more in `mcp/tools/writes.ts`. An eighth throw site added
+to `packages/api` tomorrow compiles, passes every test, and reaches the client as `internal`/500
+instead of a 400 — a wrong status for an argument-validation refusal, invisible to the suite.
+
+So Task 7 also adds a **drift test**: enumerate the throw sites in `packages/api/src` mechanically
+(a grep for `throw new ` across the reachable modules), and assert the set equals the set the
+mapping table covers. A new throw site then fails a test with a message naming the file and line,
+instead of silently degrading a status code. Keep the enumeration dumb and greppable; a clever
+AST-walking version will itself drift.
+
 Domain schemas (denormalised per spec §4.1 — resolved names and counts, because a client cannot
 issue one round trip per row):
 
