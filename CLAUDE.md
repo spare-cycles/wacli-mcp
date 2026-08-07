@@ -3,6 +3,18 @@
 `README.md` is the reference (tools, env vars, pairing, Docker). This file is the list of things that
 are non-obvious enough to get broken by an edit that looks correct.
 
+- 🔴 **`media/autotranscribe.ts` contains literal NUL bytes, and some grep tooling skips such a file
+  *silently*.** The NULs are the `keyOf` separator. The consequence is not cosmetic: a call-site
+  audit over `packages/api/src/media/` for `setTranscript` returns the two test files and **omits the
+  production caller at `autotranscribe.ts:218`**, with no warning that a file was skipped. That is a
+  confidently wrong answer to exactly the question you ask before changing a signature — and it has
+  already bitten once, during the schema V3 change. Shell `grep -rn` finds it; so does
+  `LC_ALL=C grep -rnUa`. Some editor/agent grep implementations do not. **Verify any "I found every
+  caller" claim in this repo with `LC_ALL=C grep -rnUa`, and treat a clean result from anything else
+  as unproven.** The related trap: a caller that hand-builds a `MessageRow` literal (e.g.
+  `whatsapp/send.test.ts`) contains the method name nowhere at all, so no grep finds it — only
+  `tsc` does.
+
 - **All raw JID interpretation lives in `packages/api/src/whatsapp/jid.ts`.** No other production module
   may contain `@lid`, `@s.whatsapp.net` or `@g.us`, or split a JID on `@` or `:`. WhatsApp hands the
   same human two identities — a phone JID and a LID — and folding them is the difference between one
