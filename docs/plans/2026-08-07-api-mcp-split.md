@@ -108,10 +108,12 @@ tsconfig.base.json                  compilerOptions only, no include/rootDir/out
 
 packages/sdk/                       whatsapp-api-sdk — only runtime dep is zod
   src/errors.ts                     ApiErrorCode union, ApiError classes, fromWire/toWire
-  src/schemas/common.ts             Cursor, Page(T), Timestamp, OpaqueId
-  src/schemas/domain.ts             Chat, Message, SearchHit, Contact, Reaction, Health, Capabilities
-  src/schemas/media.ts              MediaRepresentation, Keyframe, JpegDerivative, KeyframeStrip,
-                                    MediaMeta, MediaLink, PdfExtract
+  src/schemas/common.ts             Page(T); a cursor is a plain opaque `z.string()`, not a branded
+                                    type — nothing may parse it but the API
+  src/schemas/domain.ts             Chat, Message, MessageDetail, SearchHit, Contact, Reaction,
+                                    HealthReport, Capabilities
+  src/schemas/media.ts              MediaRepresentation, JpegDerivative, KeyframeStrip, MediaMeta,
+                                    MediaLink, PdfExtract
   src/schemas/requests.ts           every query/body schema
   src/routes.ts                     the route table (single source of truth)
   src/server.ts                     implement() — typed handler map, RouteTable types
@@ -143,7 +145,7 @@ packages/mcp/                       whatsapp-mcp — zero native deps
   src/http.ts                       Streamable HTTP, async buildServer
   src/main.ts                       bootstrap
 
-packages/api/tests/e2e/             fake socket + real API + real SDK + real MCP tools
+packages/mcp/src/e2e/                fake socket + real API + real SDK + real MCP tools
 ```
 
 **Naming note:** the `mcp/` directory prefix is dropped inside `packages/mcp` — the package name
@@ -182,6 +184,17 @@ whose `include` is `src/**/*.ts` — and no `src/` at all. `tsc` treats that as 
 `TS18003: No inputs were found in config file`, not a graceful zero-file pass. Task 1's own
 "482 pass, 0 fail" gate and Global Constraint 15 would both fail on the very first task. A
 one-line `export {};` in each costs nothing and Task 2 / Task 12 overwrite it.
+
+Both halves of this were verified empirically on `node:24-slim`, the image's exact runtime, rather
+than assumed:
+
+| check | result |
+| --- | --- |
+| `tsc -p tsconfig.json` with `include: ["src/**/*.ts"]` and an empty `src/` | **exit 2**, `error TS18003: No inputs were found in config file` |
+| the same with a single `export {};` file present | exit 0 |
+| `node --test 'src/**/*.test.ts'` with a zero-match glob | **exit 0** — the placeholder does not break the test script |
+
+So the placeholder is genuinely load-bearing for `typecheck`, and harmless for `test`.
 
 **Interfaces:**
 - Produces: three workspace packages named `whatsapp-api`, `whatsapp-api-sdk`, `whatsapp-mcp`.
@@ -428,6 +441,64 @@ oversight. **This plan takes the byte-identical route.**
 
 The API side must therefore send the original `name`: extend the wire envelope to
 `{ error: { code, name, message, details? } }`. Without `name` on the wire this is unimplementable.
+
+#### The translation layer, and why nothing works without it
+
+Every domain error in this codebase extends plain `Error`: `NotFoundError`, `MessageRevokedError`,
+`NotOwnMessageError`, `SendPathError` (`whatsapp/send.ts:102,115,120,125`),
+`AmbiguousRecipientError`, `RecipientNotFoundError` (`whatsapp/recipient.ts:31,36`),
+`ConnectionUnavailableError` (`whatsapp/connection.ts:46`), `CursorError` (`rest/cursor.ts:13`),
+`MediaUnavailableError`, `MessageNotFoundError` (`media/store.ts:53,67`), `ConversionError`
+(`media/convert.ts:26`), `TranscriptionError` (`media/transcribe.ts:91`). **None of them extends
+`ApiError`.**
+
+So an error middleware that reads "map `ApiError` → its status, anything else → 500 `internal`"
+sends **every one of them as a 500**. That silently breaks Task 8's 400-cursor test, Task 9's
+503-media-unavailable test, and Task 10's 409 and 403 tests — and `describeError` would render
+`ApiError: …` instead of `CursorError: …`, violating Global Constraint 2.
+
+`packages/api/src/rest/errors.ts` owns the bridge, applied **before** the middleware's `ApiError`
+check:
+
+```ts
+/** Domain throw -> wire. The single place a domain error becomes an HTTP concern. */
+export function toApiError(err: unknown): ApiError;
+```
+
+It is a total function: anything unrecognised becomes `internal` with `name: "Error"`, so an
+unmapped throw degrades rather than leaking a stack. The mapping is exhaustive and testable:
+
+| domain throw | code | status |
+| --- | --- | --- |
+| `CursorError` | `bad_request` | 400 |
+| the `kind`/`has_media` contradiction (bare `Error`) | `bad_request` | 400 |
+| `ZodError` from `implement()`'s own parse | `bad_request` | 400 |
+| body-parser `PayloadTooLargeError` | `payload_too_large` | 413 |
+| `SendPathError` | `send_path_refused` | 400 |
+| bare `Error` from `recipient.ts:101`, `send.ts:261`, `send.ts:337`, `send.ts:400` | `bad_request` | 400 |
+| `RecipientNotFoundError` | `recipient_not_found` | 404 |
+| `NotFoundError`, `MessageNotFoundError` | `message_not_found` | 404 |
+| `AmbiguousRecipientError` | `ambiguous_recipient` | 409 |
+| `MessageRevokedError`, `NotOwnMessageError` | `message_revoked` / `not_own_message` | 409 |
+| read-only refusal | `read_only` | 403 |
+| `ConnectionUnavailableError` | `not_connected` | 503 |
+| `MediaUnavailableError` | `media_unavailable` | 503 |
+| `ConversionError` | `conversion_failed` | 502 |
+| `TranscriptionError` | `transcription_unavailable` | 503 |
+| budget exhausted | `budget_exhausted` | 429 |
+| anything else | `internal` | 500 |
+
+`toApiError` always carries the **original** `err.name` and `err.message` onto the wire — that is
+what the `name` field exists for, and it is why a bare `Error` must arrive at the client rendering
+as `Error: …` and not `ApiError: …`.
+
+Two codes have no throw site today and must not be invented into one: `budget_exhausted` is
+currently only *read* for the health report (`media/budget.ts` → `mcp/health.ts`), and nothing
+throws on an exhausted budget. Keep the code reserved, mapped, and untriggered rather than adding
+new refusal behaviour under cover of a refactor.
+
+Test it directly: one case per row, asserting code, status, `name` and `message` together. A table
+this size with no test is a table that rots.
 
 Domain schemas (denormalised per spec §4.1 — resolved names and counts, because a client cannot
 issue one round trip per row):
@@ -748,9 +819,15 @@ export type JpegBytes = { bytes: Buffer; mimeType: "image/jpeg"; width: number; 
 export async function imageJpeg(path: string, opts: { maxBytes: number; maxEdge?: number }): Promise<JpegBytes>;
 
 export type Keyframe = { index: number; atSec: number; bytes: Buffer; mimeType: "image/jpeg" };
-export async function keyframes(path: string, opts: { count: number; maxBytes: number }): Promise<{ durationSec: number; frames: Keyframe[] }>;
-
-export type PdfExtract = { text: string; truncated: boolean };
+export async function keyframes(path: string, opts: { count: number; maxBytes: number }): Promise<{
+  durationSec: number;
+  /** Dimensions of the extracted frames, which `/keyframes` reports at the top level. Returned
+   *  here rather than left to a separate `probeDimensions` call in the handler, so the strip and
+   *  its reported size cannot disagree. */
+  width: number;
+  height: number;
+  frames: Keyframe[];
+}>;
 export async function pdfExtract(path: string, maxChars: number): Promise<PdfExtract>;
 ```
 
@@ -823,20 +900,13 @@ resolve.
    not survive a restart. Log that fact once at boot.
 4. `verify` throws the *same* `not_found` error for a bad MAC, a bad version, malformed base64 and an
    expired token — never a distinguishing message.
-5. **The token is never logged — but the request must still be observable.** "Never logged" plus no
-   rate limit means a validly-minted, still-live link can be fetched without bound and an operator
-   has no way to notice. Forgery is thoroughly handled above; *volume abuse of a real link* is not.
-   So: log a redacted access record — the sha256's first 8 hex characters, the representation, the
-   outcome, and the timestamp — never the token, never the URL, never the chat. And rate-limit the
-   route per token (a small fixed ceiling per TTL window is enough; the link is meant for one or two
-   fetches, not a hundred). It is the only unauthenticated route that serves **conversation
-   content** — `GET /health` is also unauthenticated, but returns a closed record with no secrets
-   and no message data.
-6. **`X-Content-Type-Options: nosniff` on every media response**, and `Content-Disposition:
-   attachment` for anything that is not an image, audio or video type. WhatsApp attachments include
-   browser-renderable types such as SVG and HTML; serving one unauthenticated, with a
-   browser-trusted `Content-Type` and no sniffing guard, turns the media cache into a hosting
-   provider for stored XSS against whoever opens the link.
+5. The token is never logged.
+
+**Two further requirements belong to Task 9, not here, and are specified there:** rate limiting and
+redacted access logging for `/media/dl/:token`, and the response headers that stop a served
+attachment becoming stored XSS. Both are properties of the *HTTP response*, which this module never
+sees — `MediaLinkSigner` is `{ mint, verify }` and has no request or response in scope. An earlier
+draft listed them here, where nothing could implement or test them.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1087,6 +1157,27 @@ the call site.
 `maxBytes` / `maxEdge` / `frames` are optional query parameters on the routes that use them; the
 API's configured values are both the defaults and the ceilings, so a client cannot request a 4K strip.
 
+**Response-layer security, owned here because this is where the response exists.**
+
+1. **`X-Content-Type-Options: nosniff` on every media response**, signed or bearer-gated.
+2. **An explicit inline allowlist.** Only these may be served with `Content-Disposition: inline`:
+   `image/jpeg`, `image/png`, `image/gif`, `image/webp`, `audio/*`, `video/*`, `application/pdf`.
+   **Everything else is forced to `attachment`.** Note what this deliberately excludes:
+   `image/svg+xml`. The obvious predicate `mimetype.startsWith("image/")` lets SVG through, and an
+   SVG is a script-bearing document — served inline from an unauthenticated URL, it is stored XSS
+   against whoever opens the link. Write the allowlist as a literal set, never a prefix test.
+   This overrides `?disposition=inline` on the raw route; a caller cannot opt back in.
+3. **Rate-limit `/media/dl/:token`** per token: a fixed ceiling of 20 fetches per token per TTL
+   window, counted in an in-memory `Map` swept on the same interval as the TTL. In-memory is
+   sufficient and deliberate — the counter resets on restart, which is acceptable for a link that
+   expires in 15 minutes anyway, and a persistent store would be a new failure mode for a
+   defence-in-depth measure.
+4. **Log a redacted access record** on every `/media/dl` hit: the sha256's first 8 hex characters,
+   the representation, the outcome, the timestamp. Never the token, never the URL, never the chat id.
+
+Tests: an SVG attachment is served `attachment` even when `?disposition=inline` is asked for; the
+21st fetch of one token is refused; a fetch emits a log line containing neither the token nor a JID.
+
 - [ ] **Step 1: Write the failing test**
 
 ```ts
@@ -1132,8 +1223,27 @@ void test("the raw route can be forced to download rather than render", async ()
 - Create: `packages/api/src/rest/handlers/writes.ts`
 - Test: `packages/api/src/rest/handlers/writes.test.ts`
 
+
 **Produces:** `sendText`, `sendFile`, `editMessage`, `deleteMessage`, `react`, `markRead`,
-`transcribe`, `resolveRecipient`.
+`transcribe`, `resolveRecipient` — with their methods, paths and success shapes pinned here, because
+four of them appeared nowhere in an earlier draft and two engineers would have invented four
+different REST spellings:
+
+| operation | method + path | success |
+| --- | --- | --- |
+| `sendText` | `POST /v1/messages` | 201 `{ chat, messageId }` |
+| `sendFile` | `POST /v1/messages/file` | 201 `{ chat, messageId }` |
+| `editMessage` | `PATCH /v1/messages/:chat/:id` | 200 `{ chat, messageId }` |
+| `deleteMessage` | `DELETE /v1/messages/:chat/:id` | 200 `{ chat, messageId }` |
+| `react` | `POST /v1/messages/:chat/:id/reaction` | 200 `{ chat, messageId }` |
+| `markRead` | `POST /v1/chats/:chat/read` | 200 `{ chat, messageId }` |
+| `transcribe` | `POST /v1/messages/:chat/:id/transcribe` | 200 `{ text, model, language }` |
+| `resolveRecipient` | `POST /v1/recipients/resolve` | 200 `{ candidates: [...] }` |
+
+**`react`'s `emoji` takes no `.min(1)` on the wire schema either.** Global Constraint 8 pins this for
+the MCP tool schema; it is restated here because an independently written wire schema would add
+`.min(1)` as an obvious improvement and silently break reaction *removal*, which is what an empty
+string means.
 
 `readOnly` is enforced **here**, returning `403 read_only`, regardless of what any client believes —
 a separate process cannot be trusted to police itself. The MCP additionally *discovers* it (Task 14)
@@ -1185,9 +1295,27 @@ void test("path sending is refused when no directory is configured, without echo
 in-process MCP surface. Both answer from the same domain objects, which is what makes Task 15's
 comparison possible. The in-process MCP is removed in Task 16 and not before.
 
+**The two surfaces must not both bind `config.port`.** Today `Config` has exactly one port
+(`src/config.ts:54,199`, `PORT`, default 8080) and one listener. Task 7's `startRest` owns a
+listener of its own, and the legacy MCP `startHttp` is still running through Task 16 — so mounting
+them naively is an `EADDRINUSE` crash the moment this task lands, in the very task whose purpose is
+"the product must keep working".
+
+Mount **both on one `http.Server`**: build the Express app for REST, mount the legacy MCP router on
+`config.httpPath` (default `/mcp`) within the same app, and listen once on `config.port`. This is
+preferable to a second port because it keeps the deployed surface, the healthcheck and the compose
+file unchanged for the whole side-by-side phase — nothing outside the process can tell the
+difference. The paths cannot collide: REST owns `/v1` and `/health`, MCP owns `/mcp`.
+
 Config keeps every existing API variable and adds `WHATSAPP_API_TOKEN` and
 `WHATSAPP_MEDIA_LINK_TTL` (default 900, clamped `[60, 86400]`). Invalid numbers fall back to the
 default rather than failing the boot; `WHATSAPP_PHONE_NUMBER` stays the one exception that throws.
+
+**`WHATSAPP_API_TOKEN` unset fails closed for writes.** Task 6 already says an unset token means
+media links get a random per-boot key; the bearer gate needs its own answer and it is not the same
+one. Unset ⇒ log once at boot, serve `/health`, and refuse every `/v1` route with 401. An
+API that silently accepts unauthenticated writes to a WhatsApp account because a variable was
+missing is not a defensible default.
 
 Shutdown order gains the REST handle and keeps the existing dependency order: stop accepting
 requests, stop the socket, stop alerting, close the store.
@@ -1207,10 +1335,17 @@ void test("a REST write is visible to the in-process MCP surface immediately", a
   await app.close();
 });
 
-void test("both surfaces are listening and neither shadows the other", async () => {
+// This one MUST go over a real socket. Asserting the MCP side through the in-process linked-client
+// harness would pass even if the HTTP listener never started — which is precisely the bug
+// (EADDRINUSE, or a router mounted on a path nothing serves) that this test exists to catch.
+void test("both surfaces answer on one real listener, and neither shadows the other", async () => {
   const app = await bootBoth({});
   assert.equal((await fetch(`${app.url}/health`)).status, 200);
-  assert.equal((await app.mcp.listTools()).tools.length, 14);
+  assert.equal((await fetch(`${app.url}/v1/chats`, { headers: auth() })).status, 200);
+
+  // A real Streamable-HTTP initialize against the same port.
+  const res = await fetch(`${app.url}/mcp`, { method: "POST", headers: initHeaders(), body: initializeBody() });
+  assert.equal(res.status, 200);
   await app.close();
 });
 ```
@@ -1343,15 +1478,24 @@ export function presentMessage(m: SdkMessage): Record<string, unknown> {
     kind: m.kind, text: m.text, transcript: m.transcript, quoted_id: m.quotedId,
     status: m.status, edited: m.edited, deleted: m.deleted,
     media: m.media === null ? null : { type: m.media.type, cached: m.media.cached },
+    // Required, and easy to lose: today every list and search row carries it
+    // (`reads.ts:120-121,126-128` attach it after the batched count). The SDK already
+    // denormalises it onto `Message`, so it is a rename here, not a lookup.
+    reaction_count: m.reactionCount,
   };
 }
 ```
 
-Key order matters for nothing functionally, but the **`{ next_cursor, items }` envelope must keep
-serialising `next_cursor` first** — it is deliberately ahead of `items` so a truncated page still
-shows the cursor. `jsonResult`, `textResult`, `errorResult`, `failedResult` and `describeError` move
-verbatim; `describeError` is what renders SDK errors into model-visible text, which is why Task 2
-pinned their `name` values.
+**The `{ next_cursor, items }` envelope must keep serialising `next_cursor` first** — deliberately
+ahead of `items`, so a truncated page still shows the cursor. Note that a `deepEqual` golden-object
+test cannot prove this: structural equality is key-order-insensitive. The property is enforced by
+the truncation test that greps the serialised string (`reads.test.ts:858-882`), which lives in
+Task 15's ported suite. Task 13 states the invariant; Task 15 owns the check. Do not "simplify" the
+truncation test into a `deepEqual` — it would still pass and stop testing anything.
+
+`jsonResult`, `textResult`, `errorResult`, `failedResult` and `describeError` move verbatim;
+`describeError` is what renders SDK errors into model-visible text, which is why Task 2 pinned their
+`name` values.
 
 - [ ] **Step 1: Write the failing test** — assert `presentMessage` output deep-equals a golden object
   captured from the current implementation, field for field.
@@ -1421,6 +1565,11 @@ Three details that are easy to get wrong, each of which would silently change ou
    into the summary changes the shape.
 3. **The untranscribed-audio pointer text is a fixed string** and must be reproduced byte for byte,
    along with `duration_sec` from `fetchMediaMeta`.
+4. **The two `/link` branches discard `expiresAt` and `filename`.** `/link` returns
+   `{ url, expiresAt, mimeType, bytes, filename }`, but today's document summary is exactly
+   `{ chat, message_id, kind, mimetype, bytes, url, reactions }`. Passing the response through
+   whole adds two fields the model never saw before. Same discipline as the audio branch above —
+   take `url`, `mimeType` and `bytes`, drop the rest.
 
 `buildMcpServer` registers reads and media always, writes only when `!caps.readOnly`. Capabilities
 come from the API per session, so flipping the API to read-only takes effect on the next client
@@ -1440,9 +1589,26 @@ from `ConnectionUnavailableError`'s "WhatsApp connection unavailable".
 
 **Files:**
 - Create: `packages/mcp/src/tools/harness.ts`, `packages/mcp/src/tools/reads.test.ts`,
-  `packages/mcp/src/server.test.ts`, `packages/api/tests/e2e/fake-socket.ts`,
-  `packages/api/tests/e2e/mcp-over-api.test.ts`
+  `packages/mcp/src/server.test.ts`
+- Create (**e2e — note the location and the dependency, both load-bearing**):
+  `packages/mcp/src/e2e/fake-socket.ts`, `packages/mcp/src/e2e/mcp-over-api.test.ts`
+- Modify: `packages/mcp/package.json` — add `"whatsapp-api": "workspace:*"` as a **devDependency**
 - Delete: `packages/api/src/mcp/tools/{harness,reads.test,...}` as they are superseded
+
+**Why the e2e test lives under `packages/mcp/src/e2e/` and not `packages/api/tests/e2e/`.** Two
+reasons, either of which alone would sink it where an earlier draft put it:
+
+1. **It would never run.** Each package's test script is the verbatim
+   `node --import tsx --test 'src/**/*.test.ts'`. A file under `tests/e2e/` matches no package's
+   glob, so the plan's "only defence against stub drift" would sit in the repo never executing —
+   the most expensive kind of dead test, because it reads as coverage.
+2. **It would not compile.** The test drives the real MCP server against the real API, so it needs
+   both packages. `packages/api` must not depend on `packages/mcp` — that would invert the
+   dependency direction the whole split exists to establish. The dependency belongs the other way,
+   as a devDependency of `packages/mcp`, which already depends on the SDK.
+
+`packages/mcp/tsconfig.build.json` must exclude `src/e2e/` alongside `src/tools/harness.ts`, or this
+scaffolding compiles into the shipped image.
 
 **The harness is the crux.** Today's `harness()` builds real SQLite repos, a real `McpServer`, and a
 linked in-memory MCP `Client`, then stubs `conn`/`sender`/`media`/`transcriber`. Tests touch it only
@@ -1538,7 +1704,11 @@ config field (`mcpToken`, `httpPath` if unused by REST, `maxResultChars`).
 - [ ] **Step 1: Delete and unwire.**
 - [ ] **Step 2: Verify nothing references the removed modules** —
   `grep -rn "modelcontextprotocol" packages/api/src` prints nothing.
-- [ ] **Step 3: Full container run, green.**
+- [ ] **Step 3: Full container run.** State the number, not "green": expected pass count is Task 15's
+  total, minus the tests deleted with `packages/api/src/mcp/**`, minus the 8 `imageBlock`/
+  `videoKeyframes` tests removed from `convert.test.ts`. Compute it before running and compare. This
+  is the largest deletion in the plan, and "green" cannot distinguish "everything still runs" from
+  "a suite silently stopped being collected" — the exact failure Task 15 warns about.
 - [ ] **Step 4: Commit** — `refactor(api): remove the in-process MCP surface`
 
 ---
