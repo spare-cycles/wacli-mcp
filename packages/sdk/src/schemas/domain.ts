@@ -149,6 +149,47 @@ export const Contact = z.object({
 export type Contact = z.infer<typeof Contact>;
 
 /**
+ * What every write that touches one message answers with: where it landed, and what it is called.
+ *
+ * One shape for six routes — the two sends, the edit, the revoke, the reaction and the mark-read —
+ * because all six identify a message and none of them has anything else to report. `chat` is the id
+ * the API *resolved* the call against, never the string the caller passed: a recipient may have been
+ * a name or a LID, and echoing the input would make one field name mean the canonical chat on some
+ * routes and "whatever you typed" on others.
+ *
+ * The four non-send tools additionally print `status: "ok"`; that field is added MCP-side, because
+ * it is presentation and not something the wire has ever carried.
+ */
+export const SendResult = z.object({ chat: z.string(), messageId: z.string() });
+
+export type SendResult = z.infer<typeof SendResult>;
+
+/**
+ * One chat or contact a recipient name matched.
+ *
+ * `index` is 1-based and exists only on the wire: in-process the position in the array *is* the
+ * number, but across HTTP a client that re-sorted or filtered the list would renumber it, and `pick`
+ * selects by number. Sending the number the refusal used removes the possibility that a retry means
+ * a different person than the refusal offered (Global Constraint 11).
+ */
+export const RecipientCandidate = z.object({
+  index: z.number().int().positive(),
+  id: z.string(),
+  label: z.string(),
+  exact: z.boolean(),
+});
+
+export type RecipientCandidate = z.infer<typeof RecipientCandidate>;
+
+/**
+ * `POST /v1/recipients/resolve`'s answer: the same candidate list an ambiguity refusal carries in
+ * `details.candidates`, in the resolver's existing total order, without sending anything.
+ */
+export const RecipientResolution = z.object({ candidates: z.array(RecipientCandidate) });
+
+export type RecipientResolution = z.infer<typeof RecipientResolution>;
+
+/**
  * `/health` is the one payload that is **not** camelCased.
  *
  * It is today's `HealthReport` verbatim, snake_case keys and all, because `whatsapp_health` hands it

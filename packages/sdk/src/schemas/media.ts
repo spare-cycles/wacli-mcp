@@ -91,14 +91,23 @@ export const PdfExtract = z.object({ text: z.string(), truncated: z.boolean() })
 export type PdfExtract = z.infer<typeof PdfExtract>;
 
 /**
+ * A transcript that exists.
+ *
+ * Factored out of `MediaTranscript` because `POST /v1/messages/:chat/:id/transcribe` answers the
+ * same three fields and cannot answer `null` — it either produced speech or it threw. Declaring the
+ * object once means the read path and the write path cannot disagree about what a transcript is.
+ */
+export const Transcript = z.object({ text: z.string(), model: z.string(), language: z.string().nullable() });
+
+export type Transcript = z.infer<typeof Transcript>;
+
+/**
  * `GET /v1/media/:chat/:id/transcript` — the cached transcript, or `null` when there is none.
  *
  * Reads the cache and never spends money: triggering transcription is a separate write route. That
  * is what preserves the two-lane rule, since the lane is a property of the call site.
  */
-export const MediaTranscript = z
-  .object({ text: z.string(), model: z.string(), language: z.string().nullable() })
-  .nullable();
+export const MediaTranscript = Transcript.nullable();
 
 export type MediaTranscript = z.infer<typeof MediaTranscript>;
 
