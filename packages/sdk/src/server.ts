@@ -11,7 +11,7 @@
  * to `Partial`; `server.test.ts` pins the exhaustiveness with a compile-time negative.
  */
 
-import { z } from "zod";
+import type { z } from "zod";
 
 import { BadRequestError } from "./errors.js";
 import type { BinaryPayload, HandlerResult, Route } from "./routes.js";

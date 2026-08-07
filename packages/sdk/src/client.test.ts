@@ -209,6 +209,23 @@ void test("an unreachable API is never reported as a downed WhatsApp socket", as
   );
 });
 
+void test("the unreachable message names the API without naming a credential in its URL", async () => {
+  const client = createClient({
+    baseUrl: "http://someone:hunter2@api.internal:8080/",
+    fetch: () => Promise.reject(new Error("getaddrinfo ENOTFOUND api.internal")),
+  });
+  await assert.rejects(
+    () => client.getHealth(),
+    (err: unknown) => {
+      assert.ok(err instanceof ApiUnreachableError);
+      assert.doesNotMatch(err.message, /hunter2/);
+      assert.doesNotMatch(err.message, /someone/);
+      assert.match(err.message, /api\.internal:8080/);
+      return true;
+    },
+  );
+});
+
 void test("a timeout is a transport failure, because AbortSignal.timeout rejects the fetch", async () => {
   const client = createClient({
     baseUrl: "http://x",

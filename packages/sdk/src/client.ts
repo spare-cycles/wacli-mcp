@@ -116,14 +116,33 @@ async function errorFromResponse(res: Response): Promise<ApiError> {
 }
 
 /**
+ * The base URL with any credentials stripped.
+ *
+ * It goes into the one message this client writes itself, and a `http://user:pass@host` base would
+ * otherwise put a password in front of a language model and into two log streams (Global Constraint
+ * 5). A base that is not a parseable URL is returned unchanged: it cannot carry a userinfo section,
+ * and a `fetch` against it will fail with something more useful than this function guessing.
+ */
+function withoutCredentials(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl);
+    url.username = "";
+    url.password = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return baseUrl;
+  }
+}
+
+/**
  * A typed client for the route table.
  *
  * Requests are validated on the way out and JSON responses are `.parse`d on the way in, so a field
  * the API stops sending becomes a thrown parse error at the boundary rather than an `undefined`
- * discovered three layers away. The two validation directions throw different things on purpose:
- * an outbound failure is a `ZodError` because the caller's own process built the bad value and its
- * stack points at the bug, while an inbound failure is the same — a contract violation by the peer,
- * which no `ApiError` code honestly describes.
+ * discovered three layers away. Both directions throw a `ZodError` rather than an `ApiError`, and
+ * that is deliberate: outbound, the caller's own process built the bad value and the stack points
+ * at the bug; inbound, the peer broke the contract, and no error *code* honestly describes that —
+ * `bad_request` would claim an HTTP refusal that never happened.
  *
  * Every request carries an `x-request-id`. The split turned one greppable log stream into two, and
  * without a shared id an MCP-side tool failure caused by an API-side 500 cannot be tied to its
@@ -132,6 +151,7 @@ async function errorFromResponse(res: Response): Promise<ApiError> {
 export function createClient(opts: ClientOptions): WhatsAppApiClient {
   const doFetch = opts.fetch ?? globalThis.fetch;
   const base = opts.baseUrl.replace(/\/+$/, "");
+  const shown = withoutCredentials(base);
 
   const call = async (route: Route, input: CallInput): Promise<unknown> => {
     // Annotated `unknown` rather than left inferred: `ZodTypeAny["parse"]` answers `any`, and an
@@ -166,8 +186,8 @@ export function createClient(opts: ClientOptions): WhatsAppApiClient {
       // backend is down, the other says WhatsApp is, and the MCP surfaces them differently.
       throw new ApiUnreachableError(
         err instanceof Error
-          ? `could not reach the API at ${base}: ${err.message}`
-          : `could not reach the API at ${base}`,
+          ? `could not reach the API at ${shown}: ${err.message}`
+          : `could not reach the API at ${shown}`,
       );
     }
 
