@@ -50,9 +50,14 @@ void test("a denormalised row parses with its resolved sender and reaction count
 });
 
 void test("a timestamp is integer Unix seconds, so a milliseconds value is refused", () => {
-  // The one bug this catches is real: 1_700_000_000_000 parses fine as a number, and a message
-  // dated 55 000 AD is only visible once a model reads it back.
-  assert.ok(!Message.safeParse({ ...MESSAGE, ts: 1_700_000_000.5 }).success);
+  // 1_700_000_000_000 is a perfectly good integer, so `.int()` alone accepted it and this test
+  // asserted nothing it claimed. The refusal comes from `epochSeconds`' 1e11 bound instead. The bug
+  // is real: a message dated 55 000 AD is only visible once a model reads it back.
+  assert.ok(!Message.safeParse({ ...MESSAGE, ts: 1_700_000_000_000 }).success, "milliseconds");
+  assert.ok(!Message.safeParse({ ...MESSAGE, ts: 1_700_000_000.5 }).success, "fractional");
+  // Exclusive bound: 1e11 seconds is the year 5138, so the threshold itself is already milliseconds.
+  assert.ok(!Message.safeParse({ ...MESSAGE, ts: 1e11 }).success, "the threshold itself");
+  assert.ok(Message.safeParse({ ...MESSAGE, ts: 1e11 - 1 }).success, "just under the threshold");
   assert.ok(Message.safeParse({ ...MESSAGE, ts: 0 }).success);
 });
 
@@ -106,19 +111,31 @@ void test("MessageDetail validates its reactions with Reaction, not as loose obj
 
 // --- Chat and Contact -------------------------------------------------------------------------------
 
+const CHAT = {
+  id: "1@s.whatsapp.net",
+  name: null,
+  isGroup: false,
+  lastMessageTs: null,
+  unreadCount: 0,
+  archived: false,
+  mutedUntil: null,
+  participantCount: null,
+};
+
 void test("a chat with no resolvable name reports null rather than echoing the JID", () => {
-  const chat = Chat.parse({
-    id: "1@s.whatsapp.net",
-    name: null,
-    isGroup: false,
-    lastMessageTs: null,
-    unreadCount: 0,
-    archived: false,
-    mutedUntil: null,
-    participantCount: null,
-  });
+  const chat = Chat.parse(CHAT);
   assert.equal(chat.name, null);
   assert.notEqual(chat.name, chat.id);
+});
+
+void test("mutedUntil is the one timestamp the milliseconds bound is not applied to", () => {
+  // `lastMessageTs` is an observation and takes the bound like every other stamp.
+  assert.ok(!Chat.safeParse({ ...CHAT, lastMessageTs: 1_700_000_000_000 }).success);
+  // `mutedUntil` does not, on purpose: WhatsApp's muted-forever is a Long that `toEpochSeconds`
+  // divides by 1000 and still leaves far above 1e11 (`whatsapp/ingest.ts:212-215`, called at
+  // `:600`). Bounding it would make one muted chat unparse a whole page. Pin the exemption so it is
+  // a decision, not an oversight someone later "fixes" into an outage.
+  assert.ok(Chat.safeParse({ ...CHAT, mutedUntil: 9_223_372_036_854 }).success);
 });
 
 void test("Contact keeps every identifier nullable, because most contacts have only some", () => {

@@ -8,7 +8,6 @@ import {
   ApiUnreachableError,
   BadRequestError,
   ConversionError,
-  CursorError,
   MediaUnavailableError,
   MessageNotFoundError,
   MessageRevokedError,
@@ -126,6 +125,16 @@ const LIVE_THROWS = [
     ctor: MessageNotFoundError,
   },
   {
+    // Same class and same message template as `media/store.ts:146`, thrown a layer earlier so that
+    // `whatsapp_transcribe` — which answers from `row.transcript` and fetches nothing — still
+    // refuses an unknown id. Listed separately because Task 7 maps throw sites, not templates.
+    site: "mcp/tools/media.ts:209",
+    code: "message_not_found",
+    name: "MessageNotFoundError",
+    message: "no message ABC in chat 1@s.whatsapp.net",
+    ctor: MessageNotFoundError,
+  },
+  {
     site: "media/convert.ts:155",
     code: "conversion_failed",
     name: "ConversionError",
@@ -140,15 +149,18 @@ const LIVE_THROWS = [
     ctor: TranscriptionError,
   },
   {
+    // `bad_request`, not a code of its own: the envelope carries `name`, so the code does not have
+    // to encode it. The assertion that matters is the rendered string below, which is identical
+    // either way — and `ctor` is `BadRequestError` because that is genuinely what comes back.
     site: "mcp/cursor.ts:29",
-    code: "invalid_cursor",
+    code: "bad_request",
     name: "CursorError",
     message:
       "invalid pagination cursor: pass back the `next_cursor` from a previous page verbatim, or omit it to start over",
-    ctor: CursorError,
+    ctor: BadRequestError,
   },
   {
-    // The four bare `new Error(...)` throws. Their name is the literal string "Error", and routing
+    // The seven bare `new Error(...)` throws. Their name is the literal string "Error", and routing
     // them through a generic ApiError would silently turn `Error: …` into `ApiError: …`.
     site: "whatsapp/recipient.ts:101",
     code: "bad_request",
@@ -184,6 +196,23 @@ const LIVE_THROWS = [
     message: 'has_media=true contradicts kind="text", which never carries an attachment — drop one of the two',
     ctor: BadRequestError,
   },
+  {
+    // Reached through `guarded("whatsapp_send_file", …)` (`writes.ts:126-132`, called at `:212`),
+    // which routes to `failedResult` → `errorResult` → `describeError`: it renders as `Error: …` on
+    // the model-visible path today, so it is a `bad_request`/400, not an `internal`/500.
+    site: "mcp/tools/writes.ts:163",
+    code: "bad_request",
+    name: "Error",
+    message: "give either `data` (base64 bytes) or `path` (a server-side file), not both",
+    ctor: BadRequestError,
+  },
+  {
+    site: "mcp/tools/writes.ts:167",
+    code: "bad_request",
+    name: "Error",
+    message: "provide exactly one of `data` (base64 bytes) or `path` (a server-side file under WHATSAPP_SEND_FILE_DIR)",
+    ctor: BadRequestError,
+  },
 ] as const;
 
 void test("every live throw site renders identically after a full round trip through the wire", () => {
@@ -202,10 +231,45 @@ void test("every live throw site renders identically after a full round trip thr
   }
 });
 
+/**
+ * Two 404s that render the same words, kept as two codes on purpose.
+ *
+ * `NotFoundError` (`whatsapp/send.ts:287`) and `MessageNotFoundError` (`media/store.ts:146`,
+ * `mcp/tools/media.ts:209`) share a message template *and* a status, so folding them onto one wire
+ * code looks free. It is not. `errorFromWire` rebuilds the class from the code alone, so a merged
+ * row would leave every byte a model reads unchanged while `instanceof NotFoundError` quietly
+ * stopped matching in every client that narrows on it — a break with no symptom until something
+ * downstream takes the wrong branch. This test is the alarm: merge the rows and it fails here,
+ * where the reason is written down, instead of in whatever consumes the narrowing later.
+ */
+void test("not_found and message_not_found stay two codes, because two classes narrow on them", () => {
+  const shared = "no message ABC in chat 1@s.whatsapp.net";
+  const roundTrip = (err: ApiError): ApiError => {
+    const { status, body } = errorToWire(err);
+    return errorFromWire(status, JSON.parse(JSON.stringify(body)) as unknown);
+  };
+  const plain = roundTrip(new NotFoundError(shared));
+  const media = roundTrip(new MessageNotFoundError(shared));
+
+  assert.equal(plain.code, "not_found");
+  assert.equal(media.code, "message_not_found");
+  assert.notEqual(plain.code, media.code);
+  // What makes the merge tempting: same status, same message.
+  assert.equal(plain.status, media.status);
+  assert.equal(plain.message, media.message);
+  // What it would cost: neither narrowing can stand in for the other.
+  assert.ok(plain instanceof NotFoundError);
+  assert.ok(!(plain instanceof MessageNotFoundError));
+  assert.ok(media instanceof MessageNotFoundError);
+  assert.ok(!(media instanceof NotFoundError));
+  // And the one thing that does differ on the wire is the name the model reads.
+  assert.equal(describeError(plain), `NotFoundError: ${shared}`);
+  assert.equal(describeError(media), `MessageNotFoundError: ${shared}`);
+});
+
 void test("each class carries its code's canonical status and legacy name with no help from the wire", () => {
   const expected: [ApiError, string, number][] = [
     [new BadRequestError("m"), "Error", 400],
-    [new CursorError("m"), "CursorError", 400],
     [new SendPathError("m"), "SendPathError", 400],
     [new NotFoundError("m"), "NotFoundError", 404],
     [new MessageNotFoundError("m"), "MessageNotFoundError", 404],
@@ -224,6 +288,46 @@ void test("each class carries its code's canonical status and legacy name with n
     assert.ok(err instanceof ApiError);
     assert.ok(err instanceof Error, "must stay an Error, or describeError's instanceof check skips it");
   }
+});
+
+/**
+ * One code, many names — the reason there is no `invalid_cursor` code and no `CursorError` class.
+ *
+ * A cursor refusal is a `bad_request` that happens to be called `CursorError`, and the *only* thing
+ * that has to survive is the string the model reads. This test is what makes dropping the code
+ * safe: the byte-for-byte rendering below is asserted independently of how the code is spelled, so
+ * `bad_request` carrying two different names cannot blur them together.
+ */
+void test("bad_request carries whatever name the throw had, so a cursor refusal still reads as CursorError", () => {
+  const cursor =
+    "invalid pagination cursor: pass back the `next_cursor` from a previous page verbatim, or omit it to start over";
+  const contradiction =
+    'has_media=true contradicts kind="text", which never carries an attachment — drop one of the two';
+  const roundTrip = (err: ApiError): ApiError => {
+    const { status, body } = errorToWire(err);
+    return errorFromWire(status, JSON.parse(JSON.stringify(body)) as unknown);
+  };
+  const named = roundTrip(new BadRequestError(cursor, { name: "CursorError" }));
+  const bare = roundTrip(new BadRequestError(contradiction));
+
+  // Same code and status: a client branching on `code` treats both as the argument error they are.
+  assert.equal(named.code, "bad_request");
+  assert.equal(bare.code, "bad_request");
+  assert.equal(named.status, 400);
+  assert.equal(bare.status, 400);
+  // Different names, and the rendering is what the model reads. Neither degrades to `ApiError: …`.
+  assert.equal(describeError(named), `CursorError: ${cursor}`);
+  assert.equal(describeError(bare), `Error: ${contradiction}`);
+  // The code carries no name of its own to leak: `bad_request`'s fallback only applies when the
+  // wire sent none, which is the case `bare` covers.
+  assert.notEqual(named.name, bare.name);
+});
+
+void test("invalid_cursor is not a wire code, so nothing can send one the client would not understand", () => {
+  assert.ok(!(API_ERROR_CODES as readonly string[]).includes("invalid_cursor"));
+  assert.throws(() => wireError.parse({ error: { code: "invalid_cursor", name: "CursorError", message: "m" } }));
+  // And an API that sent it anyway degrades to internal rather than throwing at the client.
+  assert.equal(errorFromWire(400, { error: { code: "invalid_cursor", message: "m" } }).code, "internal");
 });
 
 // --- errorFromWire ------------------------------------------------------------------------------

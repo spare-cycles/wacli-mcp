@@ -5,11 +5,13 @@
  * server-side because in-process they cost a function call and across HTTP a naive port costs fifty
  * round trips per page. A client cannot issue one request per row, so the row carries what it needs.
  *
- * Every timestamp here is integer **Unix seconds**. Only a `*Ms` name carries milliseconds, and
- * nothing in this file has one.
+ * Every timestamp here is integer **Unix seconds**, and `epochSeconds` enforces it rather than
+ * asserting it in prose. Only a `*Ms` name carries milliseconds, and nothing in this file has one.
  */
 
 import { z } from "zod";
+
+import { epochSeconds } from "./common.js";
 
 /**
  * Every kind a stored message can have. Mirrors `packages/api`'s `MESSAGE_KINDS`, as a value rather
@@ -46,7 +48,7 @@ export type ConnectionState = (typeof CONNECTION_STATES)[number];
 export const Message = z.object({
   id: z.string(),
   chat: z.string(),
-  ts: z.number().int(),
+  ts: epochSeconds,
   fromMe: z.boolean(),
   sender: z.object({ id: z.string(), name: z.string() }),
   kind: z.enum(MESSAGE_KINDS),
@@ -105,9 +107,18 @@ export const Chat = z.object({
   id: z.string(),
   name: z.string().nullable(),
   isGroup: z.boolean(),
-  lastMessageTs: z.number().int().nullable(),
+  lastMessageTs: epochSeconds.nullable(),
   unreadCount: z.number().int(),
   archived: z.boolean(),
+  /**
+   * The one timestamp here that is **not** `epochSeconds`.
+   *
+   * It is a deadline, not an observation, and WhatsApp's "muted forever" is expressed as a Long so
+   * large that `toEpochSeconds` (`whatsapp/ingest.ts:212-215`, called at `:600`) divides it by 1000
+   * and still lands far above the threshold. Bounding this field would refuse a row the API really
+   * stores, and a client that cannot parse a chat list because one chat is muted forever is a worse
+   * outcome than an unbounded number.
+   */
   mutedUntil: z.number().int().nullable(),
   participantCount: z.number().int().nullable(),
 });
@@ -136,8 +147,8 @@ export const HealthReport = z.object({
   connection: z.enum(CONNECTION_STATES),
   needs_pairing: z.boolean(),
   last_event_age_sec: z.number().int(),
-  last_connected_at: z.number().int().nullable(),
-  last_message_at: z.number().int().nullable(),
+  last_connected_at: epochSeconds.nullable(),
+  last_message_at: epochSeconds.nullable(),
   self_id: z.string().nullable(),
   counts: z.object({ chats: z.number().int(), messages: z.number().int(), contacts: z.number().int() }),
   schema_version: z.number().int(),

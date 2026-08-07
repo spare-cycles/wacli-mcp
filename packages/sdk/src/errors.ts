@@ -39,7 +39,6 @@ export const API_ERROR_CODES = [
   "message_revoked",
   "not_own_message",
   "send_path_refused",
-  "invalid_cursor",
 ] as const;
 
 /** A code valid on the wire. */
@@ -81,11 +80,15 @@ export type WireError = z.infer<typeof wireError>;
  * introduces.
  */
 const CODE_SPEC: Record<ApiErrorCode, { status: number; name: string }> = {
-  // `whatsapp/recipient.ts:101`, `whatsapp/send.ts:261`, `:337`, `:400` and
-  // `mcp/tools/reads.ts:173` all throw a bare `Error`, and `implement()`'s own `ZodError` parse
-  // failure lands here too. "Error" is the name every one of those renders with today.
+  // `whatsapp/recipient.ts:101`, `whatsapp/send.ts:261`, `:337`, `:400`, `mcp/tools/reads.ts:173`
+  // and `mcp/tools/writes.ts:163`, `:167` all throw a bare `Error`, and `implement()`'s own
+  // `ZodError` parse failure lands here too. "Error" is the name every one of those renders with
+  // today. `mcp/cursor.ts:29`'s `CursorError` is here as well, keeping only its `name`; see the
+  // note where its class used to be. The list is load-bearing, not documentation: Task 7's
+  // `toApiError` maps off it, and a bare `Error` missing from it falls through to `internal`/500 —
+  // a server-fault status for an argument-validation refusal. `LIVE_THROWS` in `errors.test.ts`
+  // pins each one's message.
   bad_request: { status: 400, name: "Error" },
-  invalid_cursor: { status: 400, name: "CursorError" },
   send_path_refused: { status: 400, name: "SendPathError" },
   unauthorized: { status: 401, name: "Error" },
   read_only: { status: 403, name: "Error" },
@@ -147,12 +150,18 @@ export class BadRequestError extends ApiError {
   }
 }
 
-/** `mcp/cursor.ts`'s refusal. Its `name` is what tells a model the cursor, not the query, is wrong. */
-export class CursorError extends ApiError {
-  constructor(message: string, options: ApiErrorOptions = {}) {
-    super("invalid_cursor", message, options);
-  }
-}
+// There is no `CursorError` class, and its absence is the design.
+//
+// A malformed cursor answers `bad_request`/400 with `name: "CursorError"`, so `describeError` still
+// renders `CursorError: invalid pagination cursor: …` byte for byte — the name travels on the wire,
+// which is what the field is for. One code, many names: the code is what a client branches on, the
+// name is what the model reads.
+//
+// A class here would be worse than nothing. `errorFromWire` reconstructs from the code alone, so
+// `bad_request` always comes back a `BadRequestError`; a `CursorError` would be a narrowing that
+// compiles, reads correctly, and never matches anything that crossed the wire. That is the exact
+// failure the `not_found`/`message_not_found` test guards against, and it is not worth inviting for
+// a refusal whose only distinguishing feature is a string the envelope already carries.
 
 export class SendPathError extends ApiError {
   constructor(message: string, options: ApiErrorOptions = {}) {
@@ -241,7 +250,6 @@ export class ApiUnreachableError extends ApiError {
 /** Code → the class that carries it. Total over `ApiErrorCode`, so `errorFromWire` never branches. */
 const CONSTRUCT: Record<ApiErrorCode, (message: string, options: ApiErrorOptions) => ApiError> = {
   bad_request: (m, o) => new BadRequestError(m, o),
-  invalid_cursor: (m, o) => new CursorError(m, o),
   send_path_refused: (m, o) => new SendPathError(m, o),
   unauthorized: (m, o) => new ApiError("unauthorized", m, o),
   read_only: (m, o) => new ApiError("read_only", m, o),

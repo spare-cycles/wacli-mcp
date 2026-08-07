@@ -8,6 +8,8 @@
 
 import { z } from "zod";
 
+import { epochSeconds } from "./common.js";
+
 /**
  * Which representation of an attachment is meant.
  *
@@ -69,11 +71,13 @@ export type KeyframeStrip = z.infer<typeof KeyframeStrip>;
 /**
  * `GET /v1/media/:chat/:id/link` — a URL to the unauthenticated signed download.
  *
- * `expiresAt` is integer Unix seconds, like every other timestamp in the contract.
+ * `expiresAt` is integer Unix seconds, like every other timestamp in the contract, and uses the
+ * shared `epochSeconds` so a milliseconds deadline is refused rather than granting a link a
+ * thousand-fold longer life than it was signed for.
  */
 export const MediaLink = z.object({
   url: z.string(),
-  expiresAt: z.number().int(),
+  expiresAt: epochSeconds,
   mimeType: z.string(),
   bytes: z.number().int(),
   filename: z.string(),
