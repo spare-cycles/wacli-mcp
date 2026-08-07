@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/**/*.ts"],
+  "//": "This package is published, and `files: [\"dist\"]` ships whatever `dist/` holds. Without this split the `build` script's own config would compile `*.test.ts` into `dist/` and publish it. `tsconfig.json` stays the typecheck/lint project so tests are still fully checked; only emit is narrowed. Only the `*.test.ts` glob so far — this package has no non-test scaffolding.",
+  "exclude": ["src/**/*.test.ts"]
+}
