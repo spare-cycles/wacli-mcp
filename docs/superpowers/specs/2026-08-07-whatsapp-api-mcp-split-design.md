@@ -183,7 +183,7 @@ many or structured → JSON.**
 | `as` | Response | Applies to | Notes |
 | --- | --- | --- | --- |
 | `raw` *(default)* | binary | any | `disposition=attachment\|inline`; original mimetype |
-| `link` | JSON | any | `{ url, expiresAt, mimeType, bytes, filename }` |
+| `link` | JSON | any | `{ url, expiresAt, mimeType, bytes, filename }`; `for=raw\|jpeg` |
 | `jpeg` | binary | image | Downscaled to fit `maxBytes` / `maxEdge` |
 | `keyframes` | JSON | video | `{ durationSec, frames: [{ index, atSec, mimeType, data }] }` |
 | `text` | JSON | pdf | `{ text, truncated }` |
@@ -211,36 +211,56 @@ token into the DOM.
 It is a real security surface: an unauthenticated route serving conversation attachments. It gets
 the same posture as `WHATSAPP_SEND_FILE_DIR`.
 
-**Token format.** A MAC verifies data, it does not carry it, so the token must be self-describing
-or the download route has nothing to resolve. It is three dot-separated base64url parts:
+**Which representations get a link.** `for=raw` (the default) or `for=jpeg`, and nothing else. Those
+are the two binary representations, and a URL is only worth minting for something a browser can
+render or download directly. `text`, `transcript`, `meta` and `keyframes` are JSON: a caller that
+can parse JSON can send an `Authorization` header, so an unauthenticated URL buys them nothing.
+
+`for=jpeg` is regenerated from the raw cached file on each fetch rather than materialised into a
+second cache. The conversion is deterministic and cheap, and a derivative cache would need its own
+key, its own eviction and its own invalidation for a media cache that is documented as never
+evicted. If thumbnail traffic ever justifies one, it is a pure optimisation behind an unchanged
+contract.
+
+**Token format.** A MAC verifies data, it does not carry it — a bare HMAC of the parameters leaves
+the download route with nothing to resolve. So the token carries its own payload. It is
+**encrypted**, not merely encoded:
 
 ```
-v1.<payload>.<mac>
+v1.<base64url( iv ‖ ciphertext ‖ tag )>
 ```
 
-`payload` is a compact JSON record `{ s, r, m, f, e }` — the cached file's **sha256**, the
-representation, the mimetype, the download filename, and the expiry in Unix seconds. `mac` is
-HMAC-SHA256 over the literal bytes `"v1." + payload`, keyed by a secret derived via HKDF from
-`WHATSAPP_API_TOKEN`.
+AES-256-GCM, key derived via HKDF from `WHATSAPP_API_TOKEN`, 96-bit random IV per token. GCM is
+authenticated encryption, so it replaces the separate HMAC rather than adding to it: a tampered
+token fails the tag check and never decrypts. The plaintext is a compact record
+`{ s, r, m, f, e }` — the raw file's sha256, the representation, the mimetype, the download
+filename and the expiry in Unix seconds.
 
-Verification order is fixed: parse the version, recompute the MAC and compare in constant time,
-*then* check `e` against the clock. Checking expiry first would answer a forged token with a
-different error than a stale one, which is a distinguishing oracle for free.
+Verification order is fixed: decrypt and check the GCM tag first, *then* check `e` against the
+clock. Checking expiry first would answer a forged token differently from a stale one, which is a
+distinguishing oracle for free.
 
-**The payload names a sha256, never a JID.** The obvious encoding — chat id plus message id — puts
-a phone number in a URL whose entire purpose is being shared with someone who may not be entitled
-to it. Keying on the content hash carries no identity at all. The cost is that `as=link` must
-resolve and cache the attachment at mint time rather than at fetch time, which is the better
-failure mode anyway: a link that cannot be produced fails immediately, in front of the caller,
-instead of 404-ing for whoever it was sent to.
+**Why encrypted rather than signed-and-readable.** base64url is encoding, not secrecy: a signed
+payload is world-readable to anyone holding the link, and this payload carries a filename.
+`contrat_divorce.pdf` or `bilan_medical.pdf` in a URL is a disclosure on its own, independent of
+any identifier. Encryption removes the whole class rather than the one field anybody thought of.
+
+**No account identifier appears in the token at all.** The obvious payload is chat id plus message
+id, and a chat id *is* a phone number. Substituting the LID would be an improvement and not a fix:
+a LID is pseudonymous, not anonymous — it is stable per account, so two links correlate to the same
+person — it is precisely what `canonicalId` folds *away* (reversing that fold reintroduces the
+split-identity bug `CLAUDE.md` calls out), and groups have no LID. Keying on the raw file's sha256
+sidesteps the question: a content hash identifies bytes, not people.
 
 - Rotating `WHATSAPP_API_TOKEN` invalidates every outstanding link, which is the correct behaviour.
   When no API token is configured — the API is then presumably behind a private network — the key is
   32 random bytes generated at boot, so links do not survive a restart. Stated rather than silent,
   because a link that dies on deploy is surprising exactly once.
 - Short TTL, `WHATSAPP_MEDIA_LINK_TTL` (default 900 s).
-- The token resolves to a content hash inside the media cache, not to a path, so traversal is not
-  expressible: a sha256 that names no cached file is a 404, not a filesystem read.
+- `as=link` resolves and caches the attachment at **mint** time, so a link that cannot be produced
+  fails in front of the caller instead of 404-ing for whoever it was sent to.
+- The token names a content hash, not a path, so traversal is not expressible: a sha256 matching no
+  cached file is a 404, never a filesystem read.
 - The URL is never logged, on either side. It is a credential.
 
 ### 5.3 Why not S3

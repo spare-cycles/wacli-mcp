@@ -145,7 +145,9 @@ packages/mcp/                       whatsapp-mcp — zero native deps
   src/http.ts                       Streamable HTTP, async buildServer
   src/main.ts                       bootstrap
 
-packages/mcp/src/e2e/                fake socket + real API + real SDK + real MCP tools
+packages/e2e/                       private, ships nowhere; depends on api + mcp + sdk
+  src/fake-socket.ts                the union of the three existing partial fakes, plus updateMediaMessage
+  src/mcp-over-api.test.ts          real MCP tools -> real SDK client -> real API over HTTP
 ```
 
 **Naming note:** the `mcp/` directory prefix is dropped inside `packages/mcp` — the package name
@@ -168,10 +170,10 @@ in-process MCP. Tasks 17–18 ship.
 
 **Files:**
 - Create: `pnpm-workspace.yaml`, `tsconfig.base.json`, `eslint.base.js`,
-  `packages/{api,sdk,mcp}/package.json`, `packages/{api,sdk,mcp}/tsconfig.json`,
-  `packages/{api,mcp}/tsconfig.build.json`, `packages/{api,sdk,mcp}/eslint.config.js`
-- Create (**placeholders — do not skip these**): `packages/sdk/src/index.ts` and
-  `packages/mcp/src/index.ts`, each containing exactly `export {};`
+  `packages/{api,sdk,mcp,e2e}/package.json`, `packages/{api,sdk,mcp,e2e}/tsconfig.json`,
+  `packages/{api,mcp}/tsconfig.build.json`, `packages/{api,sdk,mcp,e2e}/eslint.config.js`
+- Create (**placeholders — do not skip these**): `packages/sdk/src/index.ts`,
+  `packages/mcp/src/index.ts` and `packages/e2e/src/index.ts`, each containing exactly `export {};`
 - Modify: `package.json` (root), `.dockerignore` — the existing patterns (`node_modules`, `dist`) are
   unanchored and so already match at any depth; no functional change is required here yet, and
   Task 17 supersedes the file. Noted so nobody invents an edit.
@@ -1590,25 +1592,33 @@ from `ConnectionUnavailableError`'s "WhatsApp connection unavailable".
 **Files:**
 - Create: `packages/mcp/src/tools/harness.ts`, `packages/mcp/src/tools/reads.test.ts`,
   `packages/mcp/src/server.test.ts`
-- Create (**e2e — note the location and the dependency, both load-bearing**):
-  `packages/mcp/src/e2e/fake-socket.ts`, `packages/mcp/src/e2e/mcp-over-api.test.ts`
-- Modify: `packages/mcp/package.json` — add `"whatsapp-api": "workspace:*"` as a **devDependency**
+- Create (**e2e — in its own package; see below, the location is load-bearing**):
+  `packages/e2e/package.json`, `packages/e2e/tsconfig.json`, `packages/e2e/eslint.config.js`,
+  `packages/e2e/src/fake-socket.ts`, `packages/e2e/src/mcp-over-api.test.ts`
 - Delete: `packages/api/src/mcp/tools/{harness,reads.test,...}` as they are superseded
 
-**Why the e2e test lives under `packages/mcp/src/e2e/` and not `packages/api/tests/e2e/`.** Two
-reasons, either of which alone would sink it where an earlier draft put it:
+**The e2e test needs a fourth package, and the reason is Global Constraint 1.** Three placements
+were considered and two are wrong:
 
-1. **It would never run.** Each package's test script is the verbatim
-   `node --import tsx --test 'src/**/*.test.ts'`. A file under `tests/e2e/` matches no package's
-   glob, so the plan's "only defence against stub drift" would sit in the repo never executing —
-   the most expensive kind of dead test, because it reads as coverage.
-2. **It would not compile.** The test drives the real MCP server against the real API, so it needs
-   both packages. `packages/api` must not depend on `packages/mcp` — that would invert the
-   dependency direction the whole split exists to establish. The dependency belongs the other way,
-   as a devDependency of `packages/mcp`, which already depends on the SDK.
+1. `packages/api/tests/e2e/` — **would never run.** Each package's test script is the verbatim
+   `node --import tsx --test 'src/**/*.test.ts'`; a file under `tests/` matches no glob. The plan's
+   "only defence against stub drift" would sit in the repo never executing, which is worse than
+   absent because it reads as coverage.
+2. `packages/mcp/src/e2e/` with `whatsapp-api` as a devDependency of `mcp` — **would break the
+   mechanical baileys guarantee.** Task 1 Step 3 asserts `pnpm --filter whatsapp-mcp why baileys`
+   reports nothing, and Global Constraint 1 requires that an accidental `baileys` import in
+   `packages/mcp` *fail module resolution* rather than rely on convention. Depending on
+   `whatsapp-api` gives `mcp` a resolvable path to `baileys` and makes
+   `import { makeConnection } from "whatsapp-api"` compile in MCP source. The enforcement stops
+   being mechanical, which is the whole point of it.
+3. **`packages/e2e` — a private package that ships nowhere.** `"private": true`, no `build` script,
+   not in either Dockerfile. It devDepends on `whatsapp-api`, `whatsapp-mcp` and the SDK, so it can
+   drive the real pair, while both product packages keep clean dependency graphs. Its tests run
+   under its own `src/**/*.test.ts` glob via `pnpm -r run test`. No cycle exists: `api → sdk`,
+   `mcp → sdk`, `e2e → {api, mcp, sdk}`, and nothing depends on `e2e`.
 
-`packages/mcp/tsconfig.build.json` must exclude `src/e2e/` alongside `src/tools/harness.ts`, or this
-scaffolding compiles into the shipped image.
+Task 1 creates this package alongside the other three (with the same `export {};` placeholder), and
+its `eslint.config.js` and `tsconfig.json` follow the same per-package pattern.
 
 **The harness is the crux.** Today's `harness()` builds real SQLite repos, a real `McpServer`, and a
 linked in-memory MCP `Client`, then stubs `conn`/`sender`/`media`/`transcriber`. Tests touch it only
