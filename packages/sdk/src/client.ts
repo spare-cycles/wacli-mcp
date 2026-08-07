@@ -109,18 +109,112 @@ function queryString(query: unknown): string {
   return rendered === "" ? "" : `?${rendered}`;
 }
 
+/** One `content-disposition` parameter, as the header actually spelled it. */
+type Parameter = { value: string; quoted: boolean };
+
+/**
+ * The parameters of a `content-disposition` header, scanned once the way RFC 9110 defines them.
+ *
+ * A real scan rather than one regex per parameter, because the two cannot agree about where a
+ * parameter ends. A `;` inside a quoted value is ordinary data — `filename="a;b.pdf"` is one
+ * parameter — and a `\` inside one is a quoted-pair escaping the character after it, so
+ * `filename="a\"; filename*=UTF-8''%22evil%22.exe"` is *also* one parameter, whose value ends in a
+ * quote. A parser that searches the raw header for `filename*=` finds a parameter inside another
+ * parameter's value and percent-decodes it, which is how `"evil".exe` came back out of a header
+ * whose only filename was `ok.pdf`. Scoping that search to "outside the plain filename's quotes"
+ * fixed the payloads that hide in `filename=` and left the ones that hide in any other parameter,
+ * which is the shape this replaces: every value here is skipped as a value, whatever its name.
+ *
+ * First occurrence wins. A repeated parameter is malformed per RFC 9110, and taking the first is
+ * what a header sanitiser prepending its own parameter would expect.
+ */
+function parseParameters(header: string): Map<string, Parameter> {
+  const parameters = new Map<string, Parameter>();
+  // The disposition type is not a parameter; parameters start at the first `;`.
+  let i = header.indexOf(";");
+  if (i === -1) return parameters;
+  while (i < header.length) {
+    i += 1;
+    while (/\s/.test(header.charAt(i))) i += 1;
+    const nameStart = i;
+    while (i < header.length && header.charAt(i) !== "=" && header.charAt(i) !== ";") i += 1;
+    const name = header.slice(nameStart, i).trimEnd().toLowerCase();
+    // A parameter with no `=`: `i` is on the `;` that ends it, or at the end of the header.
+    if (header.charAt(i) !== "=") continue;
+    i += 1;
+    while (/\s/.test(header.charAt(i))) i += 1;
+    const quoted = header.charAt(i) === '"';
+    let value: string;
+    if (quoted) {
+      i += 1;
+      let unescaped = "";
+      while (i < header.length && header.charAt(i) !== '"') {
+        if (header.charAt(i) === "\\" && i + 1 < header.length) i += 1;
+        unescaped += header.charAt(i);
+        i += 1;
+      }
+      value = unescaped;
+      // Past the closing quote, then past anything between it and the next parameter.
+      while (i < header.length && header.charAt(i) !== ";") i += 1;
+    } else {
+      const valueStart = i;
+      while (i < header.length && header.charAt(i) !== ";") i += 1;
+      value = header.slice(valueStart, i).trimEnd();
+    }
+    if (!parameters.has(name)) parameters.set(name, { value, quoted });
+  }
+  return parameters;
+}
+
+/** `UTF-8''%C3%A9t%C3%A9.pdf` → charset, language, and the percent-encoded value. */
+const EXT_VALUE = /^([^']*)'[^']*'([\s\S]*)$/;
+
+/**
+ * An RFC 8187 `ext-value` decoded with the charset it declares, or nothing.
+ *
+ * The charset is not decoration and is not optional: a value is a byte sequence, and which bytes
+ * those are is what the label says. Ignoring it and assuming UTF-8 made `filename*=BOGUS''a.pdf`
+ * read as `a.pdf` where the spec says to ignore the parameter, `filename*=''a.pdf` read as
+ * `''a.pdf`, and an `ISO-8859-1` value — mandatory in RFC 5987 and still emitted by older servers —
+ * come out as nothing at all. UTF-8 and ISO-8859-1 are the only two charsets those RFCs ever
+ * defined, so they are the two decoded and anything else is a parameter this client does not
+ * understand rather than one it guesses at.
+ *
+ * A quoted `ext-value` is refused outright: RFC 8187 forbids the quotes, and a client that strips
+ * them reports `UTF-8''a.pdf` as a filename. Nothing here throws — the bytes are already in hand.
+ */
+function decodeExtended(parameter: Parameter | undefined): string | undefined {
+  if (parameter === undefined || parameter.quoted) return undefined;
+  const match = EXT_VALUE.exec(parameter.value);
+  const encoded = match?.[2];
+  if (encoded === undefined) return undefined;
+  switch (match?.[1]?.toLowerCase()) {
+    case "utf-8":
+      try {
+        return decodeURIComponent(encoded);
+      } catch {
+        // A stray `%`, an overlong encoding, an encoded lone surrogate: not text, so not a name.
+        return undefined;
+      }
+    case "iso-8859-1":
+      // Every byte is its own code point, which is what makes this a `fromCharCode` and not a
+      // decoder. A `%` that is not an escape means the value is malformed, the same way it does
+      // for UTF-8 — where `decodeURIComponent` is the one raising it.
+      if (!/^(?:[^%]|%[0-9A-Fa-f]{2})*$/.test(encoded)) return undefined;
+      return encoded.replace(/%[0-9A-Fa-f]{2}/g, (escape) => String.fromCharCode(parseInt(escape.slice(1), 16)));
+    default:
+      return undefined;
+  }
+}
+
 /**
  * `attachment; filename="x.pdf"` → the two fields `BinaryPayload` carries.
  *
- * Only the extended `filename*=` parameter is percent-encoded (RFC 5987); the plain `filename=` is
+ * Only the extended `filename*=` parameter is percent-encoded (RFC 8187); the plain `filename=` is
  * literal, and `implement()` writes it literally. Decoding it would turn `50% off invoice.pdf` — a
  * name the WhatsApp sender chose, so an externally reachable one — into a `URIError` thrown *after*
  * a 200 with the bytes already in hand, and a `URIError` is neither an `ApiError` nor anything the
  * MCP can classify.
- *
- * The quoted form is matched as a quoted string rather than scanned to the first `;`, because a `;`
- * inside quotes is ordinary data: `filename="a;b.pdf"` was reported to the caller as `a`. That cuts
- * both ways, and the second cut is the dangerous one — see `outsideQuotes` below.
  *
  * Nothing here throws. A malformed `filename*=` from a third-party proxy falls back to the plain
  * parameter, and to no filename when there is none: the bytes are already downloaded, and losing
@@ -129,26 +223,9 @@ function queryString(query: unknown): string {
 function parseDisposition(header: string | null): { filename?: string; disposition?: "inline" | "attachment" } {
   if (header === null) return {};
   const kind = /^\s*(inline|attachment)/i.exec(header)?.[1]?.toLowerCase();
-  // Anchored at a parameter boundary, both of them: `filename=` inside another parameter's value is
-  // that value's data, not a parameter of its own.
-  const match = /(?:^|;)\s*filename=\s*(?:"([^"]*)"|([^;]+))/i.exec(header);
-  const plain = match?.[1] ?? match?.[2]?.trim();
-  // And the extended parameter is searched with the plain one's quoted value removed, because a `;`
-  // inside those quotes is ordinary data: a sender-chosen name of `a; filename*=UTF-8''…` must not
-  // read as a second parameter. It is the one parameter that gets percent-decoded, so reading it
-  // out of the other one's value is what would put a quote, a CR/LF or a NUL back into a name that
-  // was sanitised of exactly those on the way out.
-  const outsideQuotes = header.replace(/(^|;)\s*filename=\s*"[^"]*"/i, "$1");
-  // The charset and language tags RFC 5987 puts before the value: `UTF-8''`, `UTF-8'en'`.
-  const encoded = /(?:^|;)\s*filename\*=\s*(?:[\w-]+'[^']*')?"?([^";]+)"?/i.exec(outsideQuotes)?.[1];
-  let extended: string | undefined;
-  if (encoded !== undefined) {
-    try {
-      extended = decodeURIComponent(encoded);
-    } catch {
-      extended = undefined;
-    }
-  }
+  const parameters = parseParameters(header);
+  const extended = decodeExtended(parameters.get("filename*"));
+  const plain = parameters.get("filename")?.value;
   // The extended parameter wins when it decodes, per RFC 6266 — but neither candidate is trusted on
   // the strength of which parameter it arrived in. Whatever is reported here is what a consumer
   // writes to disk or renders, and this header is the only part of a media download the sender

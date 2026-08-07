@@ -414,9 +414,51 @@ void test("a decoded name that is a path or carries control characters is not re
   assert.equal(await readBack(`attachment; filename*=UTF-8''line%0Ainjected`), undefined);
   assert.equal(await readBack(`attachment; filename*=UTF-8''%2E%2E`), undefined);
   assert.equal(await readBack('attachment; filename="../../etc/passwd"'), undefined);
-  assert.equal(await readBack('attachment; filename="back\\slash.pdf"'), undefined);
+  // A backslash inside a quoted string is a quoted-pair, so `"back\slash.pdf"` *is* `backslash.pdf`
+  // to a spec-correct parser and to a browser — the separator has to be escaped to survive as one.
+  assert.equal(await readBack('attachment; filename="back\\\\slash.pdf"'), undefined);
+  assert.equal(await readBack('attachment; filename="back\\slash.pdf"'), "backslash.pdf");
   // And an unusable extended value falls back to a usable plain one rather than losing the name.
   assert.equal(await readBack(`attachment; filename="safe.pdf"; filename*=UTF-8''%2E%2E%2Fetc%2Fpasswd`), "safe.pdf");
+});
+
+void test("a filename* hidden in another parameter's value is that value's data, not a parameter", async () => {
+  // Scoping the extended search past the *plain filename's* quoted value left every other
+  // parameter's, so a `;` inside one still separated a `filename*=` a browser never sees. This
+  // client is asserted elsewhere as a defence in its own right, against a third-party server or a
+  // proxy — which only holds if it parses parameters the way RFC 9110 defines them.
+  const evil = `filename*=UTF-8''%22evil%22.exe`;
+  // A sibling parameter carrying the payload, with and without a real filename to be preferred to.
+  assert.equal(await readBack(`attachment; foo="x; ${evil}"; filename="ok.pdf"`), "ok.pdf");
+  assert.equal(await readBack(`attachment; foo="x; ${evil}"`), undefined);
+  assert.equal(await readBack(`attachment; creation-date="Mon; ${evil}"; filename="ok.pdf"`), "ok.pdf");
+  // A repeated plain parameter: the first is the answer, and the second is not re-scanned.
+  assert.equal(await readBack(`attachment; filename="a.pdf"; filename="b; ${evil}"`), "a.pdf");
+  // A quoted-pair, which is one quoted string to a spec-correct parser: the value ends in a quote.
+  assert.equal(await readBack(`attachment; filename="a\\"; ${evil}"`), `a"; ${evil}`);
+  // And a genuine second parameter still decodes: parsing properly is not disabling the parameter.
+  assert.equal(await readBack(`attachment; foo="x"; filename="a"; filename*=UTF-8''%C3%A9t%C3%A9.pdf`), "été.pdf");
+});
+
+void test("an ext-value is decoded with the charset it declares, or not at all", async () => {
+  // The charset was matched and discarded, so every value was decoded as UTF-8: an unsupported
+  // charset was read rather than ignored as RFC 8187 requires, an empty one leaked its own
+  // delimiters into the name, quotes RFC 8187 forbids leaked `UTF-8''`, and an ISO-8859-1 value —
+  // mandatory in RFC 5987, still emitted by older servers — was lost. Divergence from what a
+  // browser reports for the same header is the whole class this round is about.
+  assert.equal(await readBack(`attachment; filename*=BOGUS''a.pdf`), undefined);
+  assert.equal(await readBack(`attachment; filename*=''a.pdf`), undefined);
+  assert.equal(await readBack(`attachment; filename*="UTF-8''a.pdf"`), undefined);
+  assert.equal(await readBack(`attachment; filename*=ISO-8859-1''%E9t%E9.pdf`), "été.pdf");
+  assert.equal(await readBack(`attachment; filename*=iso-8859-1'en'caf%E9.pdf`), "café.pdf");
+  assert.equal(await readBack(`attachment; filename*=ISO-8859-1''bad%zz.pdf`), undefined);
+  // Each of those falls back to the plain parameter rather than to nothing, when there is one.
+  assert.equal(await readBack(`attachment; filename="ok.pdf"; filename*=BOGUS''a.pdf`), "ok.pdf");
+});
+
+void test("a name longer than any filesystem takes is not reported, whichever parameter carried it", async () => {
+  assert.equal(await readBack(`attachment; filename="${"a".repeat(300)}.pdf"`), undefined);
+  assert.equal(await readBack(`attachment; filename*=UTF-8''${"%C3%A9".repeat(200)}.pdf`), undefined);
 });
 
 // --- a deadline that fires after the headers ------------------------------------------------------------

@@ -14,7 +14,7 @@
 import type { z } from "zod";
 
 import { BadRequestError } from "./errors.js";
-import { isUsableFilename } from "./filename.js";
+import { extendedFilenameValue, isUsableFilename } from "./filename.js";
 import type { BinaryPayload, HandlerResult, Route } from "./routes.js";
 import { routes, type RouteKey, type Routes } from "./routes.js";
 
@@ -110,34 +110,37 @@ function isBinary(result: unknown): result is BinaryPayload {
  * character — or the closing quote, for a name ending in one — and a CR or LF would split the
  * header. So does `;`, and that one is not header injection but *parameter* injection: a name of
  * `a; filename*=UTF-8''%2E%2E%2F%2E%2E%2Fetc%2Fpasswd` is one filename to a spec-correct parser and
- * two parameters to a lenient one, and the second decodes back to `../../etc/passwd`. A `/` goes
- * too, because a name with one in it is a path. Every non-printable and non-ASCII byte becomes `_`
+ * two parameters to a lenient one, and the second decodes back to `../../etc/passwd`. `/` and `:`
+ * go too, because a name with either in it is a path rather than a name — a drive-relative one or
+ * an alternate data stream, for the colon. Every non-printable and non-ASCII byte becomes `_`
  * rather than being escaped: this parameter is the fallback a client uses when it has nothing
  * better, and Node refuses to send a header value carrying them at all.
  *
  * That sanitising is lossy, so it is not the only thing written. When the real name differs and is
- * still a name a consumer can use, `filename*=` carries it percent-encoded (RFC 5987) — the
+ * still a name a consumer can use, `filename*=` carries it percent-encoded (RFC 8187) — the
  * parameter that survives a `;`, a quote or an accent intact and inert, because a client decodes it
  * as a value and never re-parses it as parameters. A name that is not usable — a path, or one
  * carrying control characters — is not preserved anywhere: there is nothing there worth keeping,
- * and `createClient()` refuses it on arrival for the same reason.
+ * and `createClient()` refuses it on arrival for the same reason. `extendedFilenameValue` applies
+ * that rule itself rather than trusting this call site to have applied it, which is what keeps the
+ * guard and the encoder from disagreeing about which names are safe to encode.
  *
  * Plain first, extended second, per RFC 6266 Appendix D: a parser that understands only the
  * fallback reads the fallback, and one that understands both prefers the extended.
  */
-function contentDisposition(disposition: "inline" | "attachment", filename: string | undefined): string {
-  if (filename === undefined) return disposition;
-  const plain = filename.replace(/[^ -~]/g, "_").replace(/["\\;/]/g, "");
-  if (!isUsableFilename(plain)) return disposition;
-  if (plain === filename || !isUsableFilename(filename)) return `${disposition}; filename="${plain}"`;
-  // `encodeURIComponent` leaves `!'()*` alone — legal in a URI component, not in RFC 5987's
-  // `attr-char`, and `'` in particular is the delimiter the charset and language tags are written
-  // with, so an apostrophe in a name would look like the end of one.
-  const encoded = encodeURIComponent(filename).replace(
-    /['()!*]/g,
-    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
-  );
-  return `${disposition}; filename="${plain}"; filename*=UTF-8''${encoded}`;
+function contentDisposition(disposition: string, filename: string | undefined): string {
+  // Typed `string` rather than the payload's own `"inline" | "attachment"`, because the only thing
+  // that can put anything else here is a handler that bypassed the types — a cast, or a value read
+  // from a row — and that is exactly what this line is for. It is the last unchecked path into this
+  // header now that the filename beside it is guarded, and `attachment\r\nX-Evil: 1` splits it.
+  // `attachment` is the safe half of the pair: it cannot turn a download into a rendered document.
+  const kind = disposition === "inline" ? "inline" : "attachment";
+  if (filename === undefined) return kind;
+  const plain = filename.replace(/[^ -~]/g, "_").replace(/["\\;/:]/g, "");
+  if (!isUsableFilename(plain)) return kind;
+  const extended = plain === filename ? undefined : extendedFilenameValue(filename);
+  if (extended === undefined) return `${kind}; filename="${plain}"`;
+  return `${kind}; filename="${plain}"; filename*=UTF-8''${extended}`;
 }
 
 /** The one thing about `implement()` that is a policy rather than a contract. */

@@ -415,6 +415,62 @@ void test("a filename that smuggles a second parameter round-trips as data, not 
   }
 });
 
+void test("a lone surrogate in a filename does not throw on a download that already succeeded", async () => {
+  // `encodeURIComponent` raises `URIError: URI malformed` on an unpaired surrogate, and the guard in
+  // front of it said such a name was usable — so a `URIError` escaped `handle()` after the bytes
+  // were in hand, on both binary routes including the unauthenticated `/media/dl/:token`. A
+  // surrogate survives `JSON.parse('"\\ud800"')` and `BinaryPayload.filename` is a plain `string`.
+  // The name is not lost either: it is not text, but the ASCII fold of it still is.
+  assert.equal(await dispositionFor("lone\ud800.pdf"), 'attachment; filename="lone_.pdf"');
+  assert.equal(await roundTrip("lone\ud800.pdf"), "lone_.pdf");
+  const signed = implement({ ...handlers, fetchSignedMedia: record({ ...bytes, filename: "\ud83d" }) }).find(
+    (b) => b.path === "/media/dl/:token",
+  );
+  assert.ok(signed);
+  const { res, written } = capture();
+  await signed.handle(request({ params: { token: "v1.abc" } }), res);
+  assert.equal(written.headers["content-disposition"], 'attachment; filename="_"');
+});
+
+void test("a name no filesystem would take does not become an unbounded header", async () => {
+  // The extended parameter percent-encodes, up to seven bytes per accented character where the
+  // plain one was one, and the sender chooses the name through a protobuf field the protocol does
+  // not bound: a 1 KB name was an 8 KB response header, past a reverse proxy's default buffer.
+  const long = "é".repeat(1000) + ".pdf";
+  assert.equal(await dispositionFor(long), "attachment");
+  // And a name that fits is still carried whole, so the bound is a bound and not a truncation.
+  const fits = "é".repeat(120) + ".pdf";
+  assert.equal(await roundTrip(fits), fits);
+});
+
+void test("a disposition a handler cast into place cannot split the header", async () => {
+  // `disposition` is typed `"inline" | "attachment"`, and until now that type was the only thing
+  // between a handler and this header — a cast, or a value read from a row, wrote whatever it held.
+  // It was the last unvalidated path into a header whose other field is guarded twice over.
+  const split = { ...bytes, filename: "a.pdf", disposition: "attachment\r\nX-Evil: 1" as "attachment" };
+  const forged = {
+    ...bytes,
+    filename: "a.pdf",
+    disposition: "inline; filename*=UTF-8''%2E%2E%2Fetc%2Fpasswd" as "inline",
+  };
+  for (const payload of [split, forged]) {
+    const one = implement({ ...handlers, fetchMedia: record(payload) }).find((b) => b.path === "/v1/media/:chat/:id");
+    assert.ok(one);
+    const { res, written } = capture();
+    await one.handle(request({ params: { chat: "c", id: "M1" } }), res);
+    assert.equal(written.headers["content-disposition"], 'attachment; filename="a.pdf"');
+  }
+  // The two the type allows still both arrive, so the fallback is a fallback and not a clamp.
+  assert.equal(await dispositionFor("a.pdf"), 'attachment; filename="a.pdf"');
+  const inline = implement({ ...handlers, fetchMedia: record({ ...bytes, disposition: "inline" }) }).find(
+    (b) => b.path === "/v1/media/:chat/:id",
+  );
+  assert.ok(inline);
+  const { res, written } = capture();
+  await inline.handle(request({ params: { chat: "c", id: "M1" } }), res);
+  assert.equal(written.headers["content-disposition"], "inline");
+});
+
 // --- the refusal that must not echo what it refused -------------------------------------------------------
 
 void test("an enum refusal names the options the schema allows, never the value it received", async () => {
