@@ -203,19 +203,41 @@ Root `package.json`: drop `bin`, drop `dependencies` entirely, keep shared devDe
 
 Note `pnpm run`, not `npm run` — the current root uses `npm run` inconsistently.
 
-Dependency split: `baileys`, `jimp`, `express`, `pino`, `@hapi/boom` (dev), `@types/express` (dev) →
-`packages/api`. `@modelcontextprotocol/sdk`, `express`, `pino` → `packages/mcp`. `zod` →
-`packages/sdk` as its only runtime dependency; `api` and `mcp` get `zod` too because they author
-schemas against it.
+Dependency split — with one **transitional** entry that is easy to get wrong:
 
-`packages/api/tsconfig.build.json` keeps **only** the `fixtures.ts` exclusion; the `harness.ts`
-exclusion moves to `packages/mcp` in Task 11. Do not duplicate both lists into both packages:
+| package | dependencies |
+| --- | --- |
+| `packages/api` | `baileys` (exact pin), `jimp`, `express`, `pino`, `zod`, **`@modelcontextprotocol/sdk`** *(transitional)*; dev: `@hapi/boom`, `@types/express` |
+| `packages/mcp` | `@modelcontextprotocol/sdk`, `express`, `pino`, `zod`; dev: **`@types/express`** |
+| `packages/sdk` | `zod`, and nothing else at runtime |
+
+**`packages/api` keeps `@modelcontextprotocol/sdk` until Task 16.** Task 1 moves *all* of `src/**`
+into it, including `src/mcp/**` and the Streamable-HTTP `src/http.ts`, and those files import the MCP
+SDK. The in-process MCP surface stays live through the side-by-side phase (Task 11) precisely so the
+product never stops working, so the dependency has to stay with it. Task 16 deletes both together.
+Drop it at Task 1 and the very first gate cannot typecheck.
+
+`packages/mcp` needs `@types/express` for the same reason `packages/api` does: Task 12 ports
+`http.ts` verbatim and it imports Express types.
+
+`packages/sdk/package.json` must also be **publishable**, because spec §2 makes "the SDK is still
+published to a registry" the justification for choosing a monorepo over three repos. That means
+`name`, `version`, `license`, `files`, `exports`, `types` and `publishConfig`. Note the scope
+boundary: the *release workflow* (a CI publish job, a versioning policy) is deliberately **not** in
+this plan — see the deferrals list. A publishable package with no automated release is a coherent
+intermediate state; an unpublishable one silently invalidates the topology decision.
+
+`tsconfig.build.json` exclusions follow the files, and the timing matters here too. At Task 1
+`packages/api/src/mcp/tools/harness.ts` still exists, so `packages/api/tsconfig.build.json` must keep
+**both** exclusions for now, or Task 1 ships test scaffolding into `dist/` — the exact thing
+CLAUDE.md documents that exclude list to prevent. `packages/mcp` gets its own `harness.ts` exclusion
+in Task 12; `packages/api` drops its copy in Task 16.
 
 ```json
 {
   "extends": "./tsconfig.json",
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts", "src/whatsapp/fixtures.ts"]
+  "exclude": ["src/**/*.test.ts", "src/whatsapp/fixtures.ts", "src/mcp/tools/harness.ts"]
 }
 ```
 
@@ -232,12 +254,36 @@ nowhere — but confirm with `pnpm -r run lint` that nothing fatals.
 `pnpm-lock.yaml` — it restructures from one `importers: .:` entry to one per package. This diff is
 generated and mechanical; never hand-edit it.
 
+**Also repoint the root `Dockerfile`, in this task.** It currently does
+`COPY tsconfig.json tsconfig.build.json ./` and `COPY src ./src`; both paths cease to exist the
+moment the tree moves. `.github/workflows/docker.yml`'s build job runs on every push to `main`, uses
+`context: .` with no `file:` override, and is not otherwise touched until Task 17 — so leaving this
+alone means the image build fails from Task 1 and stays failing for fifteen tasks, publishing
+nothing to ghcr.io the whole time. That is a silent deployment freeze in the middle of the
+migration.
+
+The fix here is small and temporary: keep one root `Dockerfile` that builds the workspace and runs
+`packages/api`'s entrypoint, so the published image keeps meaning what it means today (the whole
+server, MCP surface included — which is still true until Task 16). Task 17 replaces it with the two
+real per-package Dockerfiles.
+
+```dockerfile
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json ./
+COPY packages ./packages
+RUN pnpm install --frozen-lockfile && pnpm -r run build
+# NOTE: no `pnpm prune --prod` here. It is not workspace-recursive, so at a workspace root it
+# does not do what the single-package Dockerfile used it for. This temporary image is allowed to
+# carry devDependencies; Task 17 slims both real images with `pnpm deploy --filter <pkg> --prod`.
+# runtime CMD becomes: node packages/api/dist/main.js
+```
+
 - [ ] **Step 2: Verify the gate is still green, in the container**
 
 Run: the container command from the Baseline section.
-Expected: 379 pass / 103 fail — **identical to the recorded host baseline in count and file
-distribution is NOT expected**; in the container the 103 ffmpeg failures disappear, so expect
-**482 pass / 0 fail**. If any test fails in the container, the move broke something.
+Expected: **482 pass, 0 fail.** (The host baseline's 379 pass / 103 fail sums to the same 482; the
+container has libwebp, so every one of the 103 ffmpeg-dependent failures now passes.) Do **not**
+expect the host's 379/103 split to reappear here — if it does, you are not running in the container.
+Any other failure means the move broke something.
 
 - [ ] **Step 3: Verify baileys is not reachable from mcp or sdk**
 
@@ -293,6 +339,12 @@ export class MediaUnavailableError extends ApiError {}
 export class MessageNotFoundError extends ApiError {}
 export class ConversionError extends ApiError {}
 export class NotConnectedError extends ApiError {}
+// The four `whatsapp/send.ts` throws. Easy to miss because they never appear in a tool signature —
+// they surface only through `describeError`, which is exactly why omitting them breaks output.
+export class NotFoundError extends ApiError {}
+export class MessageRevokedError extends ApiError {}
+export class NotOwnMessageError extends ApiError {}
+export class SendPathError extends ApiError {}
 export class ApiUnreachableError extends ApiError {}       // client-side only, never on the wire
 
 export function errorFromWire(status: number, body: unknown): ApiError;
@@ -302,11 +354,23 @@ export function errorToWire(err: unknown): { status: number; body: z.infer<typeo
 **This is the highest-risk detail in the whole plan.** `packages/mcp`'s `describeError` renders
 `` `${err.name}: ${err.message}` `` straight into the model's context, and the existing tests assert
 on that text. So each subclass's `name` and `message` must reproduce today's in-process error
-exactly. Concretely, `NotConnectedError` must carry
-`WhatsApp connection unavailable: current state is "<state>"` and — because the current class is
-named `ConnectionUnavailableError` — the SDK class must set `this.name = "ConnectionUnavailableError"`
-despite the class being called `NotConnectedError`. Verify against
-`packages/api/src/whatsapp/connection.ts:46-52` and the assertion at `server.test.ts:229`.
+exactly.
+
+Two specifics, both verified:
+
+1. `NotConnectedError` must carry `WhatsApp connection unavailable: current state is "<state>"`, and
+   because the current class is named `ConnectionUnavailableError`, the SDK class must set
+   `this.name = "ConnectionUnavailableError"` despite being called `NotConnectedError`
+   (`src/whatsapp/connection.ts:46-52`; asserted at `src/mcp/server.test.ts:~661`).
+2. **`src/whatsapp/send.ts` throws four more error types the first draft of this taxonomy missed** —
+   `NotFoundError` (`send.ts:102`, also `:287`, `:325`), `MessageRevokedError` (`:115`, `:288`),
+   `NotOwnMessageError` (`:120`, `:305`) and `SendPathError` (`:125`, `:357`, `:364`). Each needs its
+   own wire code (`not_found`, `message_revoked`, `not_own_message`, `send_path_refused`) and a class
+   preserving its `name` and message. Their messages interpolate ids —
+   ``no message ${id} in chat ${chatId}`` — so the API must send the rendered message and the SDK must
+   not reconstruct it. `SendPathError`'s message must never echo the path it was asked to read.
+
+Add `message_revoked`, `not_own_message` and `send_path_refused` to `API_ERROR_CODES`.
 
 Domain schemas (denormalised per spec §4.1 — resolved names and counts, because a client cannot
 issue one round trip per row):
@@ -322,6 +386,15 @@ export const Message = z.object({
   reactionCount: z.number().int(),
 });
 export const SearchHit = Message.extend({ snippet: z.string(), matchedTranscript: z.boolean() });
+
+/**
+ * The single-message shape, and the reason it exists: `whatsapp_download_media`'s summary embeds
+ * the FULL per-reactor list (`{ emoji, from: { id, name } }[]`) via `presentReactions`, not the
+ * batched `reactionCount` that list and search use. A `getMessage` returning only `Message` would
+ * silently drop that array and change the tool's output. Keep both fields: `reactionCount` so the
+ * shape stays a superset of `Message`, `reactions` for the detail path.
+ */
+export const MessageDetail = Message.extend({ reactions: z.array(Reaction) });
 export const Chat = z.object({
   id: z.string(), name: z.string().nullable(), isGroup: z.boolean(),
   lastMessageTs: z.number().int().nullable(), unreadCount: z.number().int(),
@@ -466,6 +539,11 @@ on `?as=`. That makes **23 operations**; every one must appear in `routes.ts`.
 - A `fetch` rejection (DNS, ECONNREFUSED, timeout) becomes `ApiUnreachableError`, never
   `NotConnectedError` — those two mean different things and the MCP surfaces them differently.
 - `timeoutMs` uses `AbortSignal.timeout`.
+- **Every request carries an `x-request-id` header**, generated by the client when absent. The split
+  turns one greppable log stream into two independent pino streams, and without a shared id an
+  MCP-side tool failure caused by an API-side 500 cannot be tied to its cause. Both sides log it on
+  every request and every error. It costs a header and a `randomUUID()`; recovering the correlation
+  after the fact costs an afternoon per incident.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -505,8 +583,18 @@ void test("every route in the table has a unique method+path", () => {
 **Files:**
 - Modify: `packages/api/src/db/schema.ts`, `packages/api/src/db/messages.ts`,
   `packages/api/src/media/transcribe.ts` callers (`media/autotranscribe.ts`,
-  `mcp/tools/media.ts` call sites), `packages/api/src/mcp/health.ts` (`schema_version` assertion)
+  `mcp/tools/media.ts:290`)
+- Modify (**test call sites — verified by grep, all still on the 4-arg positional form; miss one and
+  Task 4's own acceptance step goes red**): `packages/api/src/db/messages.test.ts`,
+  `packages/api/src/mcp/server.test.ts:540`, `packages/api/src/mcp/tools/reads.test.ts:525,562,563`,
+  `packages/api/src/media/autotranscribe.test.ts:331`, `packages/api/src/media/bias.test.ts:107`
+- Do **not** modify `mcp/health.ts`: it reads `meta.schemaVersion()` dynamically, so bumping the
+  constant needs no edit there. An earlier draft listed it; that was wrong.
 - Test: `packages/api/src/db/messages.test.ts`, `packages/api/src/db/client.test.ts`
+
+The signature changes from four positional arguments to an object, which is a compile error under
+TS strict at every old call site rather than a silent behaviour change — that is the good case, but
+only if the Files list is complete.
 
 **Why:** the spec's `as=transcript` representation returns `{ text, model, language }`, but
 `MessageRow` has `transcript` and `transcriptModel` and **no language column**. The backend
@@ -641,7 +729,18 @@ resolve.
    not survive a restart. Log that fact once at boot.
 4. `verify` throws the *same* `not_found` error for a bad MAC, a bad version, malformed base64 and an
    expired token — never a distinguishing message.
-5. The token is never logged.
+5. **The token is never logged — but the request must still be observable.** "Never logged" plus no
+   rate limit means a validly-minted, still-live link can be fetched without bound and an operator
+   has no way to notice. Forgery is thoroughly handled above; *volume abuse of a real link* is not.
+   So: log a redacted access record — the sha256's first 8 hex characters, the representation, the
+   outcome, and the timestamp — never the token, never the URL, never the chat. And rate-limit the
+   route per token (a small fixed ceiling per TTL window is enough; the link is meant for one or two
+   fetches, not a hundred). This is the only unauthenticated route in the system.
+6. **`X-Content-Type-Options: nosniff` on every media response**, and `Content-Disposition:
+   attachment` for anything that is not an image, audio or video type. WhatsApp attachments include
+   browser-renderable types such as SVG and HTML; serving one unauthenticated, with a
+   browser-trusted `Content-Type` and no sniffing guard, turns the media cache into a hosting
+   provider for stored XSS against whoever opens the link.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -725,7 +824,12 @@ composite key joined by `\u0000`, because a message id is only unique within its
 
 **Middleware order is load-bearing** and mirrors today's `http.ts`:
 1. `GET /health` — before the bearer gate, so a container healthcheck needs no secret.
-2. `GET /v1/media/dl/:token` — before the gate; signed tokens are its authentication.
+2. `GET /media/dl/:token` — **deliberately outside `/v1`**. It must be public, and mounting it under
+   `/v1` would make that a property of registration order rather than of structure. Worse, a route
+   `GET /v1/media/:chat/:id` matches `/v1/media/dl/<token>` with `chat = "dl"`, so the generic media
+   route would shadow or be shadowed by the download depending on which registered first. A separate
+   prefix removes both hazards: no `:chat` pattern can ever match it, and the `/v1` gate cannot
+   apply to it. It is also honest — a signed blob endpoint is not a versioned API resource.
 3. Bearer gate on `/v1` (constant-time compare, `WWW-Authenticate: Bearer` on 401).
 4. `express.json` mounted **on `/v1` behind the gate**, so an anonymous `POST /anything` cannot make
    the server buffer and parse ~90 MB. Limit is `maxUploadBytes` + base64 overhead + 1 MiB.
@@ -733,6 +837,9 @@ composite key joined by `\u0000`, because a message id is only unique within its
 6. Four-argument error middleware last — arity is how Express identifies it. Map `ApiError` → its
    status + `errorToWire`; anything else → 500 `internal`. Log `errorDetail(err)`, never the raw
    error object (Global Constraint 6).
+
+A test must fetch an actual minted URL end to end (Task 9), not merely assert the route exists —
+that is the only thing that catches a shadowing regression.
 
 `GET /health` returns the existing `HealthReport` shape unchanged. `GET /v1/capabilities` returns
 `{ readOnly, apiVersion, features }`.
@@ -779,6 +886,14 @@ void test("a page of messages costs one reaction query, not one per row", () => 
 **Interfaces — Consumes:** `routes` (Task 3), presenters and cursor (Task 7).
 **Produces:** handlers for `listChats`, `listGroups`, `listContacts`, `listMessages`,
 `searchMessages`, `getMessage`.
+
+**`getMessage` returns `MessageDetail`, not `Message`.** `whatsapp_download_media`'s summary embeds
+the full per-reactor array `{ emoji, from: { id, name } }[]` (`src/mcp/tools/media.ts`, `summaryOf`
+→ `presentReactions(ctx.reactions.forMessage(...))`), which is a different thing from the batched
+`reactionCount` that list and search carry. Returning plain `Message` here would drop that array and
+silently change the tool's output — a Global Constraint 2 violation that no type would catch,
+because the field would simply be absent. So this handler calls `reactions.forMessage(chatId, id)`
+and populates `reactions`, while list and search keep using the batched `countsFor` path.
 
 Filters map one-to-one onto the existing `MessageFilter`. The `kind`/`has_media` contradiction
 (`kind: "text"` with `hasMedia: true`) is refused with `bad_request` rather than answered with an
@@ -832,13 +947,26 @@ Task 3; the representations themselves are unchanged.
 | route | response | produced by |
 | --- | --- | --- |
 | `GET /v1/media/:chat/:id` | binary, `?disposition=attachment\|inline` | `MediaStore.fetch` |
-| `GET /v1/media/:chat/:id/jpeg` | binary | `imageJpeg` |
+| `GET /v1/media/:chat/:id/jpeg` | JSON `{ data, mimeType, width, height, source }` | `imageJpeg`, base64 |
 | `GET /v1/media/:chat/:id/link` | JSON `{ url, expiresAt, mimeType, bytes, filename }` | Task 6 signer |
-| `GET /v1/media/:chat/:id/keyframes` | JSON `{ durationSec, frames: [{ index, atSec, mimeType, data }] }` | `keyframes`, base64 |
+| `GET /v1/media/:chat/:id/keyframes` | JSON `{ durationSec, width, height, frames: [{ index, atSec, mimeType, data }], source }` | `keyframes`, base64 |
 | `GET /v1/media/:chat/:id/text` | JSON `{ text, truncated }` | `pdfExtract` |
 | `GET /v1/media/:chat/:id/transcript` | JSON `{ text, model, language } \| null` | `MessageRow` (Task 4) |
 | `GET /v1/media/:chat/:id/meta` | JSON | row + `probeDimensions`/`probeDuration` |
-| `GET /v1/media/dl/:token` | binary, public | Task 6 signer |
+| `GET /media/dl/:token` | binary, public | Task 6 signer — note: **not** under `/v1`, see Task 7 |
+
+`source` is `{ bytes: number, mimetype: string }` — the size and type of the **original** attachment,
+not of the derivative.
+
+**Why `/jpeg` is JSON rather than binary, and why `source` exists at all.** Today's
+`whatsapp_download_media` summary reports `mimetype` and `bytes` on every branch and `width`/`height`
+on the image and video branches, all read from the `MediaFile` and `probeDimensions` in-process. None
+of that survives a binary response: `BinaryPayload` carries the derivative's bytes and mime type and
+nothing about the source. An implementer would then either drop those fields — a Global Constraint 2
+violation on the two heaviest branches — or make a second `/meta` call that this plan elsewhere
+forbids. Embedding the metadata alongside base64 `data` keeps one call per branch and reproduces the
+summary exactly. It costs a UI the ability to `<img src>` a resized derivative directly; the raw
+route still serves the original, and a binary thumbnail endpoint is listed under deferrals.
 
 Each route has exactly one response kind, so each SDK client method has one concrete return type and
 no caller narrows anything.
@@ -962,7 +1090,28 @@ default rather than failing the boot; `WHATSAPP_PHONE_NUMBER` stays the one exce
 Shutdown order gains the REST handle and keeps the existing dependency order: stop accepting
 requests, stop the socket, stop alerting, close the store.
 
-- [ ] **Step 1: Write the failing test** — assert both surfaces answer and share one store.
+- [ ] **Step 1: Write the failing test**
+
+"Share one store" needs an operational definition, or two engineers will test two different things.
+It means: a write through REST is visible to the very next in-process MCP tool call, in the same
+process, against the same `Db` handle.
+
+```ts
+void test("a REST write is visible to the in-process MCP surface immediately", async () => {
+  const app = await bootBoth({ seed: (r) => seedChat(r, ALICE) });
+  await app.rest.post("/v1/chats/" + ALICE + "/read", { messageId: "M1" });
+  const page = resultPage(await app.mcp.callTool({ name: "whatsapp_chats_list", arguments: {} }));
+  assert.equal(page.items[0]!["unread_count"], 0);
+  await app.close();
+});
+
+void test("both surfaces are listening and neither shadows the other", async () => {
+  const app = await bootBoth({});
+  assert.equal((await fetch(`${app.url}/health`)).status, 200);
+  assert.equal((await app.mcp.listTools()).tools.length, 14);
+  await app.close();
+});
+```
 - [ ] **Step 2–4: fail → implement → pass.**
 - [ ] **Step 5: Commit** — `feat(api): mount REST beside the existing MCP surface`
 
@@ -981,7 +1130,10 @@ requests, stop the socket, stop alerting, close the store.
 export type ToolContext = { config: McpConfig; logger: Logger; client: WhatsAppApiClient };
 export type McpConfig = {
   apiUrl: string; apiToken: string | undefined; mcpToken: string | undefined;
-  httpPath: string; port: number; sessionTtlMs: number; maxResultChars: number; requestTimeoutMs: number;
+  httpPath: string; port: number; sessionTtlMs: number; maxResultChars: number;
+  /** From WHATSAPP_MCP_REQUEST_TIMEOUT_MS, default 30000, clamped [1000, 300000]. Feeds
+   *  createClient({ timeoutMs }). Not in spec §9's table — recorded as a deviation. */
+  requestTimeoutMs: number;
 };
 ```
 
@@ -989,13 +1141,27 @@ export type McpConfig = {
 needs data grows an SDK call, not a context field.
 
 **`http.ts` is ported near-verbatim** from `packages/api/src/http.ts` with one change:
-`HttpDeps.buildServer` becomes `() => Promise<McpServer>`. The scout identified the exact trap —
-today's `finally` block unconditionally assumes both `server` and `transport` exist, which a
-rejecting async build breaks. So **both the `await buildServer()` call and the subsequent
-`StreamableHTTPServerTransport` construction move inside the `try`**, and a build rejection gets its
-own error response rather than falling through to `closeSession`. Everything else — `/health` before
-the gate, `express.json` on the MCP path behind it, the session map, the unref'd sweeper, the
-four-argument error middleware, `closeAllConnections` on shutdown — is unchanged.
+`HttpDeps.buildServer` becomes `() => Promise<McpServer>`.
+
+**Be precise about what the risk is, because an earlier draft of this plan overstated it.** There is
+**no bug today**: at `src/http.ts:253-259` both `const server = buildServer()` and the
+`new StreamableHTTPServerTransport({...})` that follows sit *outside* any `try`, and the synchronous
+call cannot reject, so the later `try`/`finally` is always entered with both bound. The hazard is
+created *by this change*, not uncovered by it — once the call is awaited it can reject, and then
+`transport` is never constructed.
+
+So the requirement is narrow and concrete:
+
+1. `await buildServer()` and the transport construction move inside the `try`.
+2. The `finally` currently reads `transport.sessionId` unconditionally. It must guard on the binding
+   existing — `if (transport !== undefined && transport.sessionId === undefined)` — or a rejected
+   build throws a `ReferenceError`/`TypeError` from the cleanup path and masks the real error.
+3. A build rejection returns its own JSON-RPC error response and registers no session.
+
+`wrap()` already forwards a rejection through `next(err)` when nothing has been written, so the
+existing four-argument error middleware handles the response — provided the throw happens before any
+write, which it does. Everything else — `/health` before the gate, `express.json` on the MCP path
+behind it, the session map, the unref'd sweeper, `closeAllConnections` on shutdown — is unchanged.
 
 `health.ts` merges the API's `/health` with the MCP's own reachability:
 
@@ -1008,6 +1174,23 @@ export type McpHealthReport = HealthReport & {
 `api.url` must be the configured base URL with any credentials stripped, and `api.error` a
 `describeError` string, never a raw error.
 
+**`ok` keeps the API's meaning exactly, and this is a contract requirement, not a preference.**
+`buildHealth` today sets `ok: snap.state !== "logged_out"`, and the `whatsapp_health` tool's
+description — which Task 14 copies verbatim — says "`ok` is false only when the account has been
+logged out, which needs a human to re-pair." Making `ok` also mean "and the API answered" would
+silently redefine a field whose own description rules that out, and it is not one of Global
+Constraint 2's three exceptions.
+
+So the two consumers diverge deliberately:
+
+| consumer | API reachable | API unreachable |
+| --- | --- | --- |
+| `whatsapp_health` **tool** | merged report; `ok` is the API's own value | **`isError` result** carrying `ApiUnreachableError`'s text — never a report with invented fields |
+| MCP `GET /health` (container probe) | `ok` mirrors the API's | `ok: false` — an MCP that cannot reach its API is genuinely unhealthy |
+
+Fabricating a `connection`, `counts` or `schema_version` for a report the API never returned would
+be worse than failing: it invents state the model would then reason about.
+
 - [ ] **Step 1: Write the failing test**
 
 ```ts
@@ -1019,11 +1202,18 @@ void test("a rejecting buildServer answers with an error and leaks no session", 
   await h.close();
 });
 
-void test("/health reports the API unreachable rather than throwing", async () => {
+void test("the container probe is unhealthy when the API cannot be reached", async () => {
   const ctx = ctxWith({ fetch: () => Promise.reject(new TypeError("fetch failed")) });
-  const report = await buildHealth(ctx);
+  const report = await buildProbe(ctx);
   assert.equal(report.api.reachable, false);
   assert.equal(report.ok, false);
+});
+
+void test("a disconnected-but-reachable API leaves ok true, exactly as before the split", async () => {
+  const ctx = ctxWith({ health: { ...healthFixture, ok: true, connection: "disconnected" } });
+  const report = await buildProbe(ctx);
+  assert.equal(report.ok, true);
+  assert.equal(report.api.reachable, true);
 });
 ```
 
@@ -1097,10 +1287,26 @@ Tool → SDK call mapping:
 
 `whatsapp_download_media` branches by media kind, exactly as today, each branch calling the one
 media route that serves it: image → `fetchMediaJpeg` → one image block; video → `fetchMediaKeyframes`
-(already base64) plus `fetchMediaTranscript`; audio → `fetchMediaTranscript`, else `fetchMediaMeta`
-with the same fixed pointer text; PDF → `fetchMediaText`; anything else → `fetchMediaLink`. **The
-document branch is the one deliberate output change**: `extra.path` becomes `extra.url`. One SDK
-call per branch — never fetch bytes to inspect them.
+(already base64) plus `fetchMediaTranscript`; audio → `fetchMediaTranscript`, else `fetchMediaMeta`;
+PDF → `fetchMediaText`; any other document → `fetchMediaLink`. One SDK call per branch — never fetch
+bytes in order to inspect them. The summary's `reactions` array comes from `getMessage`'s
+`MessageDetail.reactions` (Task 8), not from `reactionCount`.
+
+Three details that are easy to get wrong, each of which would silently change output:
+
+1. **The `path` → `url` change covers *both* document sub-branches, not just one.** `summaryOf` is
+   called with `{ path: subject.file.path }` **unconditionally**, before the PDF test — so today the
+   PDF branch carries the same on-disk path the non-PDF one does. Both become `url`. The
+   extraction-failure note must be rewritten too: it currently reads "The document itself is intact
+   and cached at the path in the summary above", which would point at a field that no longer exists.
+   This is all one exception, not two — spec §7.1's exception 1, stated more precisely than the spec
+   stated it.
+2. **The audio branch takes only `.text`.** `fetchMediaTranscript` returns
+   `{ text, model, language }`, but today's `audioAnswer` puts only the transcript text in a text
+   block and only `transcribed: boolean` in the summary. Discard `model` and `language`; leaking them
+   into the summary changes the shape.
+3. **The untranscribed-audio pointer text is a fixed string** and must be reproduced byte for byte,
+   along with `duration_sec` from `fetchMediaMeta`.
 
 `buildMcpServer` registers reads and media always, writes only when `!caps.readOnly`. Capabilities
 come from the API per session, so flipping the API to read-only takes effect on the next client
@@ -1171,10 +1377,27 @@ void test("a read-only API makes the MCP advertise eight tools", async () => {
 });
 ```
 
-- [ ] **Step 1: Write `fake-socket.ts`** by unioning the three existing partial fakes.
+- [ ] **Step 1: Write `fake-socket.ts`.** Start from the union of the three existing partial fakes
+  (`connection.test.ts`, `send.test.ts`, `ingest.test.ts`), then add what none of them has:
+  **`updateMediaMessage`**. `MediaStore.fetch` passes it to Baileys' `downloadMediaMessage` to retry
+  an expired URL, so it is on the cache-miss path that `whatsapp_download_media` exercises — the
+  union alone leaves the most interesting media path untestable. Also confirm the one combination no
+  existing fake provides: driving `connection.update`, `ev.on("messages.upsert")` **and**
+  `sendMessage`/`readMessages` off a single object.
 - [ ] **Step 2: Write the e2e test, see it fail.**
-- [ ] **Step 3: Write the harness and port the suites**, changing assertions only where Global
-  Constraint 2's three documented exceptions apply.
+- [ ] **Step 3: Write the harness and port the suites.** Assertions may change **only** where Global
+  Constraint 2's documented exceptions apply. Make that mechanical rather than a matter of care:
+
+```bash
+# Every assertion that changed must be one you can name.
+git show HEAD:src/mcp/tools/reads.test.ts | grep -o 'assert\.[a-zA-Z]*(.*' | sort > /tmp/before.txt
+grep -o 'assert\.[a-zA-Z]*(.*' packages/mcp/src/tools/reads.test.ts | sort > /tmp/after.txt
+diff /tmp/before.txt /tmp/after.txt   # every line of output needs a documented reason
+```
+
+  This check exists because the two worst defects hardening found in this plan — a changed
+  `whatsapp_health.ok` semantic and a dropped reaction array — were both invisible assertion-level
+  drift that a green suite would have happily reported as success.
 - [ ] **Step 4: Run everything in the container, see it pass.**
 - [ ] **Step 5: Commit** — `test: port the tool suite and prove the API/MCP pair end to end`
 
@@ -1186,6 +1409,12 @@ void test("a read-only API makes the MCP advertise eight tools", async () => {
 - Delete: `packages/api/src/mcp/**`, `packages/api/src/http.ts` (the Streamable-HTTP one)
 - Modify: `packages/api/src/main.ts`, `packages/api/src/config.ts`,
   `packages/api/src/media/convert.ts` (drop `imageBlock`/`videoKeyframes`, now unused),
+  `packages/api/src/media/convert.test.ts` (**imports both symbols directly at lines 19-27 and has
+  8 tests exercising them at :121-:222 — deleting the exports without touching this file is a
+  compile error that reddens the whole package suite**). Before deleting those 8 tests, confirm
+  Task 5's `imageJpeg`/`keyframes` tests cover what they covered: WebP decoding, a missing input
+  file, and the size loop terminating on an unreachable cap. If they do not, port those cases
+  across rather than losing them,
   `packages/api/tsconfig.build.json` (drop the `harness.ts` exclusion if still present)
 
 **Only start this once Task 15 is green.** Clean cutover: no shims, no re-exports, no deprecated
@@ -1226,6 +1455,34 @@ install of ffmpeg + poppler after `check` and before `test` (fast gate fails fir
 of scope for this split — but fix the stale comment, which currently blames whisper.cpp, a
 dependency that no longer exists.
 
+**Both Dockerfiles must carry a `HEALTHCHECK`.** These are written from scratch, and the current
+root Dockerfile's `HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3` polling
+`/health` is easy to simply not retype — silently losing the restart signal every orchestrator
+relies on. Each image polls **its own** `/health` on its own port, with the same parameters.
+
+Slim each runtime image with `pnpm deploy --filter <pkg> --prod <dir>`, which resolves one package's
+production closure out of the workspace. Do not reach for `pnpm prune --prod`: it is not
+workspace-recursive.
+
+**Ship a worked `docker-compose.yml`** for the split topology, because there is no longer a
+single-container option and the volume is the account:
+
+```yaml
+services:
+  api:
+    image: ghcr.io/spare-cycles/whatsapp-mcp-api
+    volumes: [whatsapp-data:/data/whatsapp]     # unchanged path, unchanged contents
+    environment: [WHATSAPP_API_TOKEN, WHATSAPP_PHONE_NUMBER]
+  mcp:
+    image: ghcr.io/spare-cycles/whatsapp-mcp
+    depends_on: [api]
+    environment:
+      WHATSAPP_API_URL: http://api:8080
+      WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN}   # the same secret on both sides
+      WHATSAPP_MCP_TOKEN: ${WHATSAPP_MCP_TOKEN}
+volumes: { whatsapp-data: }
+```
+
 - [ ] **Step 1: Write both Dockerfiles and the workflow changes.**
 - [ ] **Step 2: Build both images locally.**
 
@@ -1255,6 +1512,22 @@ grep -rn '@lid\|@s\.whatsapp\.net\|@g\.us\|canonicalId' packages/mcp/src/    # m
 ```
 
 The `node:sqlite` / Node-24 compatibility note is `packages/api`-specific and moves there.
+
+**`README.md` must state the guarantee this split weakens.** Spec §8 asks for it explicitly: "Read
+tools work in every connection state" becomes "whenever the API is reachable", trading a
+process-local guarantee for a network one. It cannot be said in the tool descriptions — Task 14
+copies those verbatim, and `reads.ts`'s `OFFLINE` constant still says "answers offline, while the
+WhatsApp connection is down", which stays true of the *API*. So `README.md` and
+`packages/mcp/CLAUDE.md` are the only homes for it: name `api_unreachable` as a first-class,
+expected failure mode, and say plainly that an unreachable API now fails reads that used to succeed.
+Leave it out and the one real cost of this architecture is documented nowhere.
+
+**`README.md` gains an upgrade section**, and it is the highest-stakes paragraph in the docs. An
+existing deployment is one container with one volume, and that volume holds credentials that cannot
+be recovered without re-pairing the account. State plainly: the volume attaches to the **api**
+container unchanged, at the same `/data/whatsapp` path, and needs no migration; the old single image
+tag is superseded by two new ones; and a new `WHATSAPP_API_TOKEN` must be generated and given to
+both containers. Anyone who guesses at this can lose an account.
 
 `smoke.mjs` gains an API-only mode (`--api`) hitting `/health` and `GET /v1/chats` with
 `WHATSAPP_API_TOKEN`. **The existing MCP-mode assertions must not change** — tool count 14/8, every
@@ -1288,14 +1561,16 @@ name matching `/^whatsapp_/`, `whatsapp_chats_list` — because they are the mig
 | **`baileys` reachable from mcp via hoisting** | Task 1 Step 3 asserts `pnpm --filter whatsapp-mcp why baileys` is empty. |
 | **`packageExtensions` silently dropped** when splitting manifests | Global Constraint 13; it goes in `pnpm-workspace.yaml`, verified by a clean `pnpm install`. |
 | **`linkIdentity` spans four tables in one transaction** | Out of scope. It stays intact behind one `Db` in `packages/api`. Do not decompose it. |
-| **Async `buildServer` leaks a session on rejection** | Task 12 moves both the await and the transport construction inside the `try`, with a test. |
+| **Async `buildServer` leaks a session on rejection** | Task 12: the await and the transport construction move inside the `try`, **and** the `finally` guards on `transport` being bound. No bug exists today — this change creates the hazard. |
 | **Signed links leak conversation content** | Task 6: payload keyed on sha256 (never a JID), fixed verification order, indistinguishable failures, short TTL, never logged. |
 
 ## Assumptions recorded for handoff
 
 These were resolved without the human, who was unavailable, and should be reviewed:
 
-1. Schema **V3** adds `transcript_language` rather than dropping `language` from the contract.
+1. Schema **V3** adds `transcript_language`. Note this is *not* a free choice: spec §5.1 requires
+   `{ text, model, language }` for the transcript representation, so dropping the field would itself
+   violate the spec. V3 closes a pre-existing implementation gap rather than deviating from anything.
 2. Docker builds the SDK **from workspace source**, not from a registry.
 3. Directory names **flatten** inside each package (`packages/mcp/src/tools/`, not `src/mcp/tools/`).
 4. Build ordering uses **pnpm's topological `-r`**, not TypeScript project references.
@@ -1305,3 +1580,15 @@ These were resolved without the human, who was unavailable, and should be review
 8. **Spec §5.1's single `?as=` media endpoint became seven sub-path routes.** Forced by the type
    system, not preference: one route carrying both a JSON and a binary response makes
    `HandlerResult<R>` resolve to `never`. The representations and their payloads are unchanged.
+
+## Deferred, deliberately
+
+Named here so they are visible omissions rather than oversights:
+
+1. **The SDK release workflow.** `packages/sdk` is made *publishable* in Task 1 (manifest fields), but
+   no CI publish job and no versioning policy are in scope. Spec §2 leans on registry publication to
+   justify the monorepo, so this needs a follow-up before an external consumer exists.
+2. **Deployment migration for existing installs.** The volume is the account, and this split changes
+   the process topology. No task covers upgrading a live deployment from one container to two.
+3. **Published image architecture.** Stays amd64-only; only the stale whisper.cpp comment is fixed.
+4. **An event stream (SSE/webhooks).** Spec §1 already lists it as a non-goal; a web UI will want it.
