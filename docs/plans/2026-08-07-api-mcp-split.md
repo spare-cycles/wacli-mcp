@@ -481,6 +481,8 @@ renderings today.
 | `whatsapp/send.ts:261` — ``cannot @mention "${mention}"…`` | `Error: ` |
 | `whatsapp/send.ts:337` — `file exceeds the maximum upload size…` | `Error: ` |
 | `whatsapp/send.ts:400` — ``WhatsApp accepted the send to ${chatId} but returned no message id`` | `Error: ` |
+| `mcp/tools/writes.ts:163` — ``give either `data` … or `path` …, not both`` | `Error: ` |
+| `mcp/tools/writes.ts:167` — ``provide exactly one of `data` … under WHATSAPP_SEND_FILE_DIR`` | `Error: ` |
 | `mcp/cursor.ts:13` — `CursorError`, thrown by `decodeCursor` for every paginated read | `CursorError: ` |
 | `mcp/tools/reads.ts:172` — the `kind`/`has_media` contradiction | `Error: ` |
 
@@ -531,9 +533,10 @@ unmapped throw degrades rather than leaking a stack. The mapping is exhaustive a
 | `ZodError` from `implement()`'s own parse | `bad_request` | 400 |
 | body-parser `PayloadTooLargeError` | `payload_too_large` | 413 |
 | `SendPathError` | `send_path_refused` | 400 |
-| bare `Error` from `recipient.ts:101`, `send.ts:261`, `send.ts:337`, `send.ts:400` | `bad_request` | 400 |
+| bare `Error` from `recipient.ts:101`, `send.ts:261`, `send.ts:337`, `send.ts:400`, `mcp/tools/writes.ts:163`, `:167` | `bad_request` | 400 |
 | `RecipientNotFoundError` | `recipient_not_found` | 404 |
-| `NotFoundError`, `MessageNotFoundError` | `message_not_found` | 404 |
+| `NotFoundError` (`send.ts:287,:325`) | `not_found` | 404 |
+| `MessageNotFoundError` (`media/store.ts:67`, `mcp/tools/media.ts:209`) | `message_not_found` | 404 |
 | `AmbiguousRecipientError` | `ambiguous_recipient` | 409 |
 | `MessageRevokedError`, `NotOwnMessageError` | `message_revoked` / `not_own_message` | 409 |
 | read-only refusal | `read_only` | 403 |
