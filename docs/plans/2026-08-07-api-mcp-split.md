@@ -94,13 +94,19 @@ docker run --rm -e CI=true \
     apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg poppler-utils >/dev/null
     corepack enable
     pnpm config set store-dir /tmp/pnpm-store
-    pnpm install --frozen-lockfile && pnpm -r run test'
+    pnpm install --frozen-lockfile && pnpm test'
 ```
 
 Two details are not optional. **`-e CI=true`**: without it pnpm aborts with
 `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` whenever a host `node_modules` exists in the mount.
 **`store-dir` outside the mount**: otherwise the run leaves a ~136 MB `.pnpm-store/` inside the repo,
 which a subsequent `git add -A` will happily commit.
+
+**Use root `pnpm test`, not `pnpm -r run test`.** They are equivalent today and diverge from Task 3
+onward: the root script builds the SDK before running suites, and once `api` and `mcp` import
+`whatsapp-api-sdk` their tests need `packages/sdk/dist` to exist. `pnpm -r run test` never builds,
+so it would pass now and start failing later for a reason that looks unrelated to the change that
+triggered it.
 
 ### The expected count
 
@@ -934,7 +940,9 @@ void test("pdfExtract reports truncation rather than hiding it", async () => {
 **Interfaces — Produces:**
 
 ```ts
-export type LinkPayload = { s: string; r: MediaRepresentation; m: string; f: string; e: number };
+/** Only the two binary representations are link-mintable. See below. */
+export type LinkableRepresentation = "raw" | "jpeg";
+export type LinkPayload = { s: string; r: LinkableRepresentation; m: string; f: string; e: number };
 export type MediaLinkSigner = {
   mint: (p: Omit<LinkPayload, "e">) => { token: string; expiresAt: number };
   verify: (token: string) => LinkPayload;   // throws ApiError("not_found") on any failure
@@ -942,17 +950,34 @@ export type MediaLinkSigner = {
 export function makeMediaLinkSigner(deps: { apiToken: string | undefined; ttlSec: number; now?: () => number }): MediaLinkSigner;
 ```
 
-**Token format** — `v1.<base64url(payload)>.<base64url(hmac)>`, where the HMAC is SHA-256 over the
-literal bytes `"v1." + payload`, keyed by HKDF over `WHATSAPP_API_TOKEN`. A MAC verifies data, it
-does not carry it, so the payload must travel in the token or the download route has nothing to
-resolve.
+**Token format** — `v1.<base64url( iv ‖ ciphertext ‖ tag )>`. AES-256-GCM, key derived via HKDF from
+`WHATSAPP_API_TOKEN`, a fresh 96-bit random IV per token. The plaintext is the compact record
+`{ s, r, m, f, e }` above.
+
+A MAC verifies data but does not carry it, so the payload has to travel inside the token — and once
+it travels, **base64url is encoding, not secrecy**. A signed-and-readable token hands anyone holding
+the URL the file's sha256, its mimetype and its *filename*, and a filename is frequently the most
+sensitive part of an attachment. GCM is authenticated encryption, so it replaces the separate HMAC
+rather than adding to it: a tampered token fails the tag check and never decrypts.
+
+**Only `raw` and `jpeg` are link-mintable**, which is why `LinkableRepresentation` is narrower than
+`MediaRepresentation`. Those are the two binary representations — the ones a browser can render or
+download directly, and the only ones for which an unauthenticated URL buys anything. `text`,
+`transcript`, `meta` and `keyframes` are JSON, and a caller that can parse JSON can just as easily
+send an `Authorization` header. This also closes a gap an earlier hardening round flagged: a token
+minted for a JSON representation had no defined redemption behaviour at a route that returns binary.
+
+`for=jpeg` is regenerated from the raw cached file on each fetch rather than materialised into a
+second cache. The conversion is deterministic and cheap, and a derivative cache would need its own
+key, eviction and invalidation against a media cache documented as never evicted.
 
 **Security requirements, all testable:**
-1. **Verification order is fixed**: parse version → recompute MAC → `timingSafeEqual` → *then* check
-   expiry. Checking expiry first gives a forged token a different error than a stale one, which is a
-   free distinguishing oracle.
+1. **Verification order is fixed**: decrypt and check the GCM tag → *then* check expiry. Checking
+   expiry first gives a forged token a different error than a stale one, which is a free
+   distinguishing oracle.
 2. **The payload names a sha256, never a JID.** A chat id is a phone number, and this URL exists to
-   be shared. Keying on the content hash carries no identity.
+   be shared. Keying on the content hash carries no identity — and now the payload is unreadable
+   anyway, so this is defence in depth rather than the only barrier.
 3. When `apiToken` is undefined, derive from 32 random bytes generated at construction, so links do
    not survive a restart. Log that fact once at boot.
 4. `verify` throws the *same* `not_found` error for a bad MAC, a bad version, malformed base64 and an
@@ -968,12 +993,13 @@ draft listed them here, where nothing could implement or test them.
 - [ ] **Step 1: Write the failing test**
 
 ```ts
-void test("a tampered payload is refused", () => {
+void test("a tampered token is refused", () => {
   const s = makeMediaLinkSigner({ apiToken: "k", ttlSec: 900 });
   const { token } = s.mint({ s: "a".repeat(64), r: "raw", m: "image/jpeg", f: "x.jpg" });
-  const [v, payload, mac] = token.split(".");
-  const forged = [v, Buffer.from('{"s":"b"}').toString("base64url"), mac].join(".");
-  assert.throws(() => s.verify(forged), /not_found/);
+  const [v, body] = token.split(".");
+  const raw = Buffer.from(body!, "base64url");
+  raw[raw.length - 1] ^= 0xff;                       // flip a bit in the GCM tag
+  assert.throws(() => s.verify(`${v}.${raw.toString("base64url")}`), /not_found/);
 });
 
 void test("an expired token and a forged token are indistinguishable", () => {
@@ -981,23 +1007,38 @@ void test("an expired token and a forged token are indistinguishable", () => {
   const s = makeMediaLinkSigner({ apiToken: "k", ttlSec: 10, now: () => now });
   const { token } = s.mint({ s: "a".repeat(64), r: "raw", m: "image/jpeg", f: "x.jpg" });
   now = 5000;
-  const expired = (() => { try { s.verify(token); return null; } catch (e) { return (e as Error).message; } })();
-  const forged = (() => { try { s.verify("v1.aaaa.bbbb"); return null; } catch (e) { return (e as Error).message; } })();
-  assert.equal(expired, forged);
+  const msg = (t: string) => { try { s.verify(t); return null; } catch (e) { return (e as Error).message; } };
+  assert.equal(msg(token), msg("v1.aaaaaaaaaaaaaaaaaaaaaaaa"));
 });
 
-void test("the payload carries no chat id or phone number", () => {
+void test("the token is opaque — the payload is not readable from it", () => {
   const s = makeMediaLinkSigner({ apiToken: "k", ttlSec: 900 });
-  const { token } = s.mint({ s: "a".repeat(64), r: "raw", m: "image/jpeg", f: "x.jpg" });
-  const payload = Buffer.from(token.split(".")[1]!, "base64url").toString("utf8");
-  assert.doesNotMatch(payload, /@|\d{8,}/);
+  const sha = "a".repeat(64);
+  const { token } = s.mint({ s: sha, r: "raw", m: "image/jpeg", f: "settlement.pdf" });
+  const body = Buffer.from(token.split(".")[1]!, "base64url").toString("latin1");
+  // Encryption, not encoding: neither the hash nor the filename survives in the ciphertext.
+  assert.doesNotMatch(body, /settlement/);
+  assert.ok(!body.includes(sha));
+});
+
+void test("a token round-trips to exactly what was minted", () => {
+  const s = makeMediaLinkSigner({ apiToken: "k", ttlSec: 900, now: () => 1000 });
+  const p = { s: "b".repeat(64), r: "jpeg" as const, m: "image/jpeg", f: "photo.jpg" };
+  assert.deepEqual(s.verify(s.mint(p).token), { ...p, e: 1900 });
+});
+
+void test("rotating the API token invalidates outstanding links", () => {
+  const a = makeMediaLinkSigner({ apiToken: "k1", ttlSec: 900 });
+  const b = makeMediaLinkSigner({ apiToken: "k2", ttlSec: 900 });
+  const { token } = a.mint({ s: "c".repeat(64), r: "raw", m: "image/jpeg", f: "x.jpg" });
+  assert.throws(() => b.verify(token), /not_found/);
 });
 ```
 
 - [ ] **Step 2: Run and see it fail.**
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run and see it pass.**
-- [ ] **Step 5: Commit** — `feat(api): signed, self-describing media download tokens`
+- [ ] **Step 5: Commit** — `feat(api): encrypted, self-describing media download tokens`
 
 ---
 
@@ -1184,7 +1225,7 @@ Task 3; the representations themselves are unchanged.
 | --- | --- | --- |
 | `GET /v1/media/:chat/:id` | binary, `?disposition=attachment\|inline` | `MediaStore.fetch` |
 | `GET /v1/media/:chat/:id/jpeg` | JSON `{ data, mimeType, width, height, source }` | `imageJpeg`, base64 |
-| `GET /v1/media/:chat/:id/link` | JSON `{ url, expiresAt, mimeType, bytes, filename }` | Task 6 signer |
+| `GET /v1/media/:chat/:id/link` | JSON `{ url, expiresAt, mimeType, bytes, filename }`; `?for=raw\|jpeg`, default `raw` | Task 6 signer |
 | `GET /v1/media/:chat/:id/keyframes` | JSON `{ durationSec, width, height, frames: [{ index, atSec, mimeType, data }], source }` | `keyframes`, base64 |
 | `GET /v1/media/:chat/:id/text` | JSON `{ text, truncated }` | `pdfExtract` |
 | `GET /v1/media/:chat/:id/transcript` | JSON `{ text, model, language } \| null` | `MessageRow` (Task 4) |
@@ -1915,9 +1956,12 @@ Expected: both build; the MCP image reports no ffmpeg.
 - Modify: `README.md`, `CLAUDE.md`, `smoke.mjs`
 - Create: `packages/api/CLAUDE.md`, `packages/mcp/CLAUDE.md`
 
-`CLAUDE.md` splits by package. The JID grep retargets to `packages/api/src/`, and `packages/mcp`
-gains a **stricter** rule with no exemptions — no `canonicalId` import, no JID literal anywhere,
-tests included:
+`CLAUDE.md` splits by package. Both JID greps already exist in the root `CLAUDE.md` in their final
+form — Task 1 split the single `packages/*/src/` command into an api-scoped one (exempting
+`*.test.ts`, `jid.ts` and `fixtures.ts`) and an mcp-scoped one with **no** exemptions that also bans
+`canonicalId`, because the combined command could neither catch a JID literal in an mcp test nor
+leave `packages/e2e/src/fake-socket.ts` alone. So this step *moves* each command into the package
+file it governs; it does not redesign them. The mcp one, verbatim:
 
 ```bash
 grep -rn '@lid\|@s\.whatsapp\.net\|@g\.us\|canonicalId' packages/mcp/src/    # must print nothing

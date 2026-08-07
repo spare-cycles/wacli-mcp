@@ -140,8 +140,7 @@ media download route.
 | `PATCH /v1/messages/:chat/:id` | Edit. |
 | `DELETE /v1/messages/:chat/:id` | Revoke for everyone. |
 | `POST /v1/messages/:chat/:id/reaction` | React; empty emoji removes. |
-| `POST /v1/messages/:chat/:id/transcribe` | Transcribe. Costs money, mutates the store. `202` + job id (§4.4). |
-| `GET /v1/jobs/:jobId` | Status and result of an async job (§4.4). |
+| `POST /v1/messages/:chat/:id/transcribe` | Transcribe. Costs money, mutates the store. Synchronous. |
 | `POST /v1/chats/:chat/read` | Mark read up to a message. |
 
 ### 4.1 Rows are denormalized, and this is load-bearing
