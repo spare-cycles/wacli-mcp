@@ -698,6 +698,14 @@ export type Route = {
    * reachable without a token.
    */
   auth: "bearer" | "public" | "signed";
+  /**
+   * The 2xx a successful handler produces. Defaults to 200; `sendText` and `sendFile` set 201,
+   * because they create a resource. Without this field `implement()` has no way to express what
+   * Task 10 pins, and would write 200 for every JSON route. Nothing the MCP does observes the
+   * difference — the client treats any 2xx as success — but the API is a product surface with
+   * other consumers, and a create that answers 200 is a small lie in the contract.
+   */
+  successStatus?: number;
 };
 export const routes = { /* … */ } as const satisfies Record<string, Route>;
 export type Routes = typeof routes;
@@ -754,7 +762,19 @@ export type ClientMethod<R extends Route> = keyof Declared<R> extends never
 
 export type WhatsAppApiClient = { [K in keyof Routes]: ClientMethod<Routes[K]> };
 export function createClient(opts: {
-  baseUrl: string; token?: string; fetch?: typeof globalThis.fetch; timeoutMs?: number;
+  baseUrl: string;
+  token?: string | undefined;
+  fetch?: typeof globalThis.fetch | undefined;
+  /** Default deadline for every route. */
+  timeoutMs?: number | undefined;
+  /**
+   * Per-route overrides, keyed by operation name. Exists for exactly one case today:
+   * `transcribe` can legitimately run for the API's full `transcribeTimeoutMs` (900 000 ms
+   * default), which is three times the ceiling on the shared `requestTimeoutMs`. One client with
+   * an override beats two clients or a hand-rolled deadline-applying `fetch` — see Task 12, which
+   * passes `{ transcribe: config.transcribeTimeoutMs }`.
+   */
+  timeoutMsByRoute?: Partial<Record<keyof Routes, number>> | undefined;
 }): WhatsAppApiClient;
 ```
 
