@@ -1,5 +1,10 @@
 # whatsapp-mcp container image — one Node 24 process, ffmpeg and pdftotext.
 #
+# ⚠️ **Temporary, and workspace-shaped.** The tree is now a pnpm workspace, so this builds every
+# package and runs `packages/api`'s entrypoint. That keeps the published image meaning exactly what
+# it means today — the whole server, in-process MCP surface included — which stays true until the
+# cutover removes it. Task 17 replaces this file with two real per-package images.
+#
 # There is no compiler in this file: the server is TypeScript and storage is `node:sqlite` (built
 # in), so the whole build is `pnpm install && tsc`.
 #
@@ -19,11 +24,12 @@
 FROM node:24-slim AS build
 RUN corepack enable
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
-COPY tsconfig.json tsconfig.build.json ./
-COPY src ./src
-RUN pnpm build && pnpm prune --prod
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json ./
+COPY packages ./packages
+RUN pnpm install --frozen-lockfile && pnpm -r run build
+# NOTE: no `pnpm prune --prod` here. It is not workspace-recursive, so at a workspace root it does
+# not do what the single-package build used it for. This temporary image is allowed to carry
+# devDependencies; Task 17 slims both real images with `pnpm deploy --filter <pkg> --prod`.
 
 # ── 2) Runtime ───────────────────────────────────────────────────────────────
 FROM node:24-slim
@@ -33,8 +39,11 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg poppler-utils ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+# The workspace layout is preserved verbatim, not flattened: `packages/api`'s dependencies are
+# symlinks inside `packages/api/node_modules` pointing at `../../node_modules/.pnpm/…`, so moving
+# `dist/` up to `/app/dist` would leave `baileys` unresolvable at runtime.
 COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
+COPY --from=build /app/packages ./packages
 COPY package.json ./
 RUN mkdir -p /data/whatsapp && chown -R node:node /data/whatsapp
 ENV NODE_ENV=production \
@@ -44,4 +53,4 @@ USER node
 EXPOSE 8080
 HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>r.json()).then(b=>process.exit(b.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["node", "dist/main.js"]
+CMD ["node", "packages/api/dist/main.js"]

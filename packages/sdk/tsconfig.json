@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    // This package is published, so consumers need its declarations.
+    "declaration": true
+  },
+  "include": ["src/**/*.ts"]
+}

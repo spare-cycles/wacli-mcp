@@ -1,40 +1,24 @@
 {
-  "name": "whatsapp-mcp",
+  "name": "whatsapp-mcp-workspace",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.33.0",
-  "description": "MCP server for WhatsApp, built on Baileys",
+  "description": "Workspace root for the whatsapp-api service, its SDK, and the whatsapp-mcp consumer",
   "engines": {
     "node": ">=24"
   },
-  "bin": {
-    "whatsapp-mcp": "dist/main.js"
-  },
   "scripts": {
-    "dev": "tsx src/main.ts",
-    "build": "tsc -p tsconfig.build.json",
-    "start": "node dist/main.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint .",
-    "lint:fix": "eslint . --fix",
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "lint": "pnpm -r run lint",
+    "test": "pnpm -r run test",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --import tsx --test 'src/**/*.test.ts'",
-    "check": "npm run format:check && npm run lint && npm run typecheck"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "baileys": "7.0.0-rc14",
-    "express": "^5.2.1",
-    "jimp": "^1.6.1",
-    "pino": "^9.6.0",
-    "zod": "^3.25.76"
+    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
-    "@hapi/boom": "9.1.4",
-    "@types/express": "^5.0.0",
     "@types/node": "^24.0.0",
     "eslint": "^9.13.0",
     "eslint-config-prettier": "^9.1.0",
@@ -42,16 +26,5 @@
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.10.0"
-  },
-  "pnpm": {
-    "packageExtensions": {
-      "baileys": {
-        "peerDependenciesMeta": {
-          "sharp": {
-            "optional": true
-          }
-        }
-      }
-    }
   }
 }

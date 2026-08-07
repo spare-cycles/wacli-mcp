@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests driving the real MCP server against the real API. Ships nowhere.",
+  "engines": {
+    "node": ">=24"
+  },
+  "//": "No `build` script on purpose: `pnpm -r run build` skips a package that lacks one, and nothing consumes this package's output.",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "node --import tsx --test 'src/**/*.test.ts'"
+  }
+}

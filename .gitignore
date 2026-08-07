@@ -1,5 +1,9 @@
 node_modules/
 dist/
+# The authoritative test run is a container with the repo bind-mounted, and pnpm puts its store on
+# the project's own filesystem when the home directory is on a different device. Untracked, that
+# 136 MB of content-addressed tarballs lands in the next `git add -A`.
+.pnpm-store/
 *.log
 .env
 .env.*

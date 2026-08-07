@@ -1,0 +1,39 @@
+{
+  "name": "whatsapp-api-sdk",
+  "version": "1.0.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Typed contract and client for the whatsapp-api REST service",
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "dist"
+  ],
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "//": "In the workspace the entrypoint is the TypeScript source, so `api` and `mcp` typecheck without a prior build; `publishConfig` swaps in the compiled `dist/` paths at publish time.",
+  "publishConfig": {
+    "access": "public",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "node --import tsx --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "zod": "^3.25.76"
+  }
+}

@@ -4,8 +4,6 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "lib": ["ES2023"],
-    "outDir": "dist",
-    "rootDir": "src",
 
     // --- maximum type strictness ---
     "strict": true,
@@ -31,6 +29,5 @@
 
     "declaration": false,
     "sourceMap": false
-  },
-  "include": ["src/**/*.ts"]
+  }
 }
