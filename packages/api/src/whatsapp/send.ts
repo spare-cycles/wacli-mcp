@@ -108,10 +108,10 @@ export class NotFoundError extends Error {
  * The caller named a message that has been revoked. Its row is a tombstone, not a message.
  *
  * A sibling of `NotFoundError` rather than a reuse of it, because the two ask the caller for
- * different corrections and `errorResult` puts the class name in front of the model
- * (`mcp/result.ts`'s `describeError` renders `name: message`). "Not found" says *try another id*;
- * this says *that id is right and the operation is refused for good*. Calling a row that is
- * demonstrably in the store "not found" would send a model looking for a typo it will not find.
+ * different corrections and the class name is what a client reads in front of the message. "Not
+ * found" says *try another id*; this says *that id is right and the operation is refused for good*.
+ * Calling a row that is demonstrably in the store "not found" would send a model looking for a typo
+ * it will not find.
  */
 export class MessageRevokedError extends Error {
   override name = "MessageRevokedError";

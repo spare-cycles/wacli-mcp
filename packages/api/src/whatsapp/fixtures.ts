@@ -1,8 +1,7 @@
 /**
  * Hand-built `WAMessage`-shaped objects for tests. Not production code, and not loaded by it —
- * only `*.test.ts` files and `src/mcp/tools/harness.ts` import this module. Neither ships, and
- * neither does this file: all three are named in `tsconfig.build.json`'s `exclude`, because the
- * `*.test.ts` glob there catches none of them.
+ * only `*.test.ts` files import this module. It does not ship either: it is not a `*.test.ts` file,
+ * so `tsconfig.build.json`'s glob cannot catch it and it is named in that `exclude` list by hand.
  *
  * This file is one of the two sanctioned exceptions to Global Constraint 11 (all raw JID
  * interpretation lives in `src/whatsapp/jid.ts`): it holds JID **literals as data**, which a fixture for

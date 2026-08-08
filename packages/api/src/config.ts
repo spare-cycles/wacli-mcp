@@ -52,14 +52,10 @@ export type Config = {
   mediaDir: string; // WHATSAPP_MEDIA_DIR, default `${dataDir}/media`
   phoneNumber: string | undefined; // WHATSAPP_PHONE_NUMBER, digits only, 8..15
   port: number; // PORT, default 8080, clamped [1, 65535]
-  httpPath: string; // MCP_HTTP_PATH, default "/mcp"
-  mcpToken: string | undefined; // WHATSAPP_MCP_TOKEN
   /**
    * WHATSAPP_API_TOKEN — the bearer the REST surface's `/v1` gate compares against.
    *
-   * Separate from `mcpToken`, which gates the in-process MCP endpoint: the two surfaces are
-   * separate products with separate audiences, and one image serving both must be able to rotate
-   * either credential without touching the other. Unset fails **closed** for `/v1` — every route
+   * Unset fails **closed** for `/v1` — every route
    * behind the gate answers 401 while `/health` keeps answering — because an API that accepts
    * unauthenticated writes to a WhatsApp account when a variable is missing is not a defensible
    * default. It is also the ikm the media-link signer derives its key from (`rest/medialink.ts`),
@@ -115,8 +111,15 @@ export type Config = {
    * token at mint, so lowering it never revokes one already handed out.
    */
   mediaLinkTtlSec: number;
-  maxResultChars: number; // WHATSAPP_MCP_MAX_RESULT_CHARS, default 200_000
-  sessionTtlMs: number; // fixed 30 * 60_000
+  /**
+   * WHATSAPP_MCP_MAX_RESULT_CHARS, default 200_000, clamped [1_000, 50_000_000] — the ceiling on
+   * `GET /v1/media/:chat/:id/text`.
+   *
+   * The name is the MCP's and the variable is shared with it: both processes cut extracted PDF text
+   * at the same number, and an operator who raised it for the MCP would be surprised to find the
+   * API still answering the default.
+   */
+  maxResultChars: number;
   ntfy: NtfyConfig | undefined;
 };
 
@@ -221,8 +224,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     mediaDir: env["WHATSAPP_MEDIA_DIR"] || `${dataDir}/media`,
     phoneNumber: parsePhoneNumber(env["WHATSAPP_PHONE_NUMBER"]),
     port: envInt(env["PORT"], 8080, 1, 65535),
-    httpPath: env["MCP_HTTP_PATH"] || "/mcp",
-    mcpToken: env["WHATSAPP_MCP_TOKEN"],
     // `|| undefined`, so an empty string is absent: `WHATSAPP_API_TOKEN=` in a compose file is a
     // variable someone meant to fill in, and treating it as a token would gate `/v1` behind the
     // empty string. The signer applies the same rule to the same value.
@@ -251,7 +252,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     videoKeyframes: envInt(env["WHATSAPP_VIDEO_KEYFRAMES"], 4, 1, 16),
     mediaLinkTtlSec: envInt(env["WHATSAPP_MEDIA_LINK_TTL"], 900, 60, 86_400),
     maxResultChars: envInt(env["WHATSAPP_MCP_MAX_RESULT_CHARS"], 200_000, 1_000, 50_000_000),
-    sessionTtlMs: 30 * 60_000,
     ntfy: parseNtfy(env),
   };
 }

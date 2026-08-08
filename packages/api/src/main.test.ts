@@ -37,7 +37,8 @@ import { setImmediate as tick } from "node:timers/promises";
 import type { Logger } from "pino";
 import type { Alerter } from "./alerts.js";
 import { openDb, type Db } from "./db/client.js";
-import { installProcessHandlers, shutdown, type ProcessEvents, type ServerHandle, type ShutdownDeps } from "./main.js";
+import { installProcessHandlers, shutdown, type ProcessEvents, type ShutdownDeps } from "./main.js";
+import type { RestHandle } from "./rest/server.js";
 import type { WhatsAppConnection } from "./whatsapp/connection.js";
 
 const root = mkdtempSync(join(tmpdir(), "whatsapp-main-"));
@@ -81,7 +82,7 @@ function rig(broken: { server?: boolean; conn?: boolean } = {}): Rig {
   seq += 1;
   const db = openDb(join(root, `shutdown-${seq}.db`));
 
-  const server: ServerHandle = {
+  const server: RestHandle = {
     url: "http://127.0.0.1:8080",
     close: () => {
       order.push("server");

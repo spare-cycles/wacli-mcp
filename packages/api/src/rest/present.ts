@@ -12,8 +12,7 @@
  * that talks to the repo, and it issues exactly one grouped query for a whole page.
  *
  * Row shaping lives here and nowhere else, so `listMessages` and `searchMessages` cannot drift into
- * two different message shapes — the same rule `mcp/result.ts` holds for the in-process surface,
- * which stays where it is until Task 16 removes it.
+ * two different message shapes.
  */
 
 import type { Chat, Contact, Message, SearchHit } from "whatsapp-api-sdk";

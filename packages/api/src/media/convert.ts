@@ -1,13 +1,13 @@
 /**
- * Turning an attachment into something a language model or an HTTP client can actually consume:
- * JPEG bytes and base64 image blocks, video keyframes, 16 kHz mono audio and PDF text.
+ * Turning an attachment into something an HTTP client can actually consume: JPEG bytes, video
+ * keyframes, 16 kHz mono audio and PDF text.
  *
  * Nothing here touches Baileys, the database or the network — every function takes a path on disk
  * and either shells out to a system binary or works in-process with jimp. Two rules shape it:
  *
  * 1. **Every external process carries a timeout.** A malformed file can make ffmpeg spin forever,
- *    and an MCP tool call that never returns is worse than one that fails: the client has no way to
- *    tell the difference between "slow" and "wedged". `runTool` is the only spawn point.
+ *    and a request that never returns is worse than one that fails: the caller has no way to tell
+ *    the difference between "slow" and "wedged". `runTool` is the only spawn point.
  * 2. **Every size loop provably terminates.** `fitToCap` — the one shrink loop, shared by the
  *    single-image and the whole-strip conversions — halves the longest edge down to a floor and
  *    then stops, returning the smallest attempt rather than chasing a cap it cannot reach.
@@ -19,16 +19,13 @@ import { Jimp } from "jimp";
 import type { Logger } from "pino";
 import { logger as defaultLogger } from "../logger.js";
 
-export type ImageBlock = { data: string; mimeType: string };
-
 export type Dimensions = { width: number; height: number };
 
 /**
  * A JPEG as bytes, and the size those bytes actually are.
  *
- * `ImageBlock` is the MCP's shape: base64, and no dimensions. The REST layer reports the size of the
- * derivative next to it, and that size has to be the size of *these* bytes rather than of the source
- * file — anything the cap forced down has been downscaled since.
+ * The size is reported next to the derivative, and it has to be the size of *these* bytes rather
+ * than of the source file — anything the cap forced down has been downscaled since.
  */
 export type JpegBytes = { bytes: Buffer; mimeType: "image/jpeg"; width: number; height: number };
 
@@ -149,12 +146,7 @@ const KEYFRAME_MARGIN = 0.05;
  */
 const MAX_KEYFRAMES = 16;
 
-/**
- * What an external process left behind. Named for the process and not for the tool call: `ToolResult`
- * is `src/mcp/result.ts`'s MCP content-block envelope, and `src/mcp/tools/media.ts` imports from both
- * files — two exported types of the same name and no relation is one careless auto-import away from a
- * confusing compile error, or from none at all.
- */
+/** What an external process left behind. Named for the process, not for the call that spawned it. */
 export type ProcessOutput = { stdout: Buffer; stderr: string };
 
 /** A jimp image, named off the factory so the enormous structural type never has to be written out. */
@@ -234,10 +226,8 @@ export function runTool(bin: string, args: readonly string[], timeoutMs: number)
  *
  * All three byte-returning conversions come through here, so they cannot answer differently for the
  * identical cause; `describe` carries each one's own account of what it was about to do with the file.
- * `videoKeyframes` and `pdfText` deliberately do not: they are the in-process MCP's paths and their
- * behaviour is frozen until Task 16 moves them. Note this catches only a *directory* component
- * denying us — a mode-000 file stats fine and fails inside the tool, landing on `internal` through
- * `toolFailure`: the same answer, by the same rule.
+ * Note this catches only a *directory* component denying us — a mode-000 file stats fine and fails
+ * inside the tool, landing on `internal` through `toolFailure`: the same answer, by the same rule.
  */
 async function requireReadable(path: string, describe: (errno: string) => string): Promise<void> {
   try {
@@ -248,10 +238,6 @@ async function requireReadable(path: string, describe: (errno: string) => string
     const kind: ConversionErrorKind = errno === "ENOENT" || errno === "ENOTDIR" ? "source-missing" : "internal";
     throw new ConversionError(kind, describe(errno));
   }
-}
-
-function toBlock(jpeg: Buffer): ImageBlock {
-  return { data: jpeg.toString("base64"), mimeType: JPEG_MIME };
 }
 
 async function encodeJpeg(img: Image, quality: number): Promise<Buffer> {
@@ -380,12 +366,6 @@ async function fitToCap(images: readonly [Image, ...Image[]], maxBytes: number, 
   return smallest;
 }
 
-/** Re-encode an image file to a base64 JPEG at or under `maxBytes`, downscaling as needed. */
-export async function imageBlock(path: string, maxBytes: number, log: Logger = defaultLogger): Promise<ImageBlock> {
-  const { frames } = await fitToCap([await decodeImage(path)], maxBytes, log);
-  return toBlock(frames[0]);
-}
-
 /**
  * Re-encode an image file to JPEG **bytes** at or under `maxBytes`, with the size they came out at.
  *
@@ -450,41 +430,6 @@ async function extractFrame(path: string, at: number): Promise<Buffer> {
     throw new ConversionError("source-unsupported", `ffmpeg produced no frame at ${at.toFixed(3)}s of this video`);
   }
   return stdout;
-}
-
-/**
- * `count` evenly spaced frames as JPEG image blocks.
- *
- * Extractions run **sequentially**. Firing `count` ffmpeg processes at once on the NAS this deploys
- * to trades a small wall-clock win for a spike that starves the WhatsApp connection's event loop of
- * CPU, which is exactly the wrong trade for a background attachment read.
- */
-export async function videoKeyframes(
-  path: string,
-  count: number,
-  maxBytes: number,
-  log: Logger = defaultLogger,
-): Promise<ImageBlock[]> {
-  if (count <= 0) return [];
-  const duration = await probeDuration(path);
-  if (duration === undefined) {
-    throw new ConversionError(
-      "source-unsupported",
-      "could not read a duration for this video, so no keyframes can be sampled from it",
-    );
-  }
-
-  const blocks: ImageBlock[] = [];
-  for (const at of keyframeTimestamps(duration, count)) {
-    const frame = await extractFrame(path, at);
-    if (frame.byteLength <= maxBytes) {
-      blocks.push(toBlock(frame));
-      continue;
-    }
-    const { frames } = await fitToCap([await decodeImage(frame)], maxBytes, log);
-    blocks.push(toBlock(frames[0]));
-  }
-  return blocks;
 }
 
 /** One extracted frame: the JPEG ffmpeg wrote, and the point in the clip it was sampled at. */
@@ -595,7 +540,7 @@ function requireSameSize(head: Shot, size: Dimensions, shot: Shot): void {
  * `size` is the size every shot already is: `keyframes` establishes it frame by frame through
  * `requireSameSize` while it extracts them, so a mixed strip never reaches here and the fast path
  * has nothing left to measure. When ffmpeg's own frames are inside the cap they are passed through
- * untouched, as `videoKeyframes` does, and nothing is decoded at all. Overrunning the cap is what
+ * untouched and nothing is decoded at all. Overrunning the cap is what
  * costs a decode per frame, because a strip can only be resized as a unit if all of it is in memory
  * at once — the resident cost `MAX_KEYFRAMES` bounds.
  */
@@ -622,8 +567,10 @@ async function fitStrip(
  *
  * The labels come from `keyframeTimestamps`, the same helper that decides where to seek, rather than
  * from a second copy of the spacing rule — two spacings that disagreed would put a strip and its
- * captions out of step with nothing to catch it. Extraction is sequential for `videoKeyframes`'
- * reason, and every frame is measured against the first one's size as it arrives, so a strip that
+ * captions out of step with nothing to catch it. Extraction is sequential — firing `count` ffmpeg
+ * processes at once on the NAS this deploys to trades a small wall-clock win for a spike that
+ * starves the WhatsApp connection's event loop of CPU — and every frame is measured against the
+ * first one's size as it arrives, so a strip that
  * could never report one size is refused on the frame that shows it rather than after the last one.
  * The strip is then fitted to `maxBytes` as a unit, so `width`/`height` describe every frame rather
  * than only the first. A source that is not there is refused before the probe, so it is answered as
@@ -764,12 +711,6 @@ async function readPdfText(path: string): Promise<string> {
   return stdout.toString("utf8").replace(/\f/g, "\n").trim();
 }
 
-/** The text of a PDF, capped at `maxChars`. */
-export async function pdfText(path: string, maxChars: number): Promise<string> {
-  const text = await readPdfText(path);
-  return text.length <= maxChars ? text : text.slice(0, maxChars);
-}
-
 /**
  * `text` cut to at most `maxChars`, never through a surrogate pair.
  *
@@ -779,8 +720,7 @@ export async function pdfText(path: string, maxChars: number): Promise<string> {
  * a high and a low surrogate leaves an unpaired high surrogate behind and the client renders U+FFFD
  * where a character used to be. Dropping the orphan costs one unit out of `maxChars`, and only on
  * the boundaries that would otherwise be broken. `truncated` is decided before the cut, so it is
- * right either way. `pdfText` keeps the raw slice: it is the in-process MCP's path and Task 16 has
- * not moved it yet, so its output stays byte-for-byte what it has always been.
+ * right either way.
  */
 export function cutToChars(text: string, maxChars: number): PdfExtract {
   if (text.length <= maxChars) return { text, truncated: false };
@@ -794,14 +734,13 @@ export function cutToChars(text: string, maxChars: number): PdfExtract {
 /**
  * The text of a PDF, capped at `maxChars`, saying whether the cap cut anything off.
  *
- * `pdfText` truncates silently, which is fine for a model reading a summary into a prompt and wrong
- * for an API: a client that cannot tell a whole document from the first paragraph of one has no way
- * to know it should ask for more, and no way to say so to whoever is reading its answer.
+ * Truncating silently would be fine for a summary read into a prompt and is wrong for an API: a
+ * client that cannot tell a whole document from the first paragraph of one has no way to know it
+ * should ask for more, and no way to say so to whoever is reading its answer.
  *
  * A source that is not there is refused before `pdftotext` runs, for `keyframes`' reason: poppler
  * answers a missing path with `exit 1` and "I/O Error: Couldn't open file", which is indistinguishable
- * here from a poppler that is not installed, and so `internal`. `pdfText` keeps going straight to the
- * tool: its behaviour is the MCP's and is frozen.
+ * here from a poppler that is not installed, and so `internal`.
  */
 export async function pdfExtract(path: string, maxChars: number): Promise<PdfExtract> {
   await requireReadable(

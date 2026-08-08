@@ -11,9 +11,8 @@
  * it is making progress. Over HTTP that error is `bad_request`/400 — `rest/errors.ts` maps this
  * class — and it keeps the name `CursorError` on the wire, so what a model reads is unchanged.
  *
- * It lives under `rest/` because the encoding belongs to the API. The in-process MCP tool layer
- * still imports it while the two surfaces run side by side; Task 16 removes that caller, and the
- * encoding is unchanged by the move.
+ * It lives under `rest/` because the encoding belongs to the API: the cursor a client pages with is
+ * this module's, and nothing outside the REST surface mints one.
  */
 
 export class CursorError extends Error {

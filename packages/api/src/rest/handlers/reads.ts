@@ -1,8 +1,8 @@
 /**
  * The six read routes. Every one of them answers from SQLite alone: none reaches for the socket, so
  * a listing, a search and a single message all keep working while the connection is down — the
- * property `mcp/tools/reads.ts` has always had and the one a model relies on when WhatsApp is
- * flapping.
+ * property the retired in-process tool layer always had, and the one a model relies on when
+ * WhatsApp is flapping.
  *
  * Three things live here rather than below, and each is a boundary rather than a convenience.
  *
@@ -59,7 +59,7 @@ export type ReadHandlers = Pick<
 /**
  * The page size when a caller names none.
  *
- * 50, matching `limitSchema` in `mcp/tools/reads.ts` — that is the number a model has been reading
+ * 50, matching the MCP's own `limitSchema` — that is the number a model has been reading
  * off the advertised tool schema, and a default that differed would change every unparameterised
  * listing's length. The wire schema deliberately carries no `.default()`, so the number lives in
  * exactly one place: here.

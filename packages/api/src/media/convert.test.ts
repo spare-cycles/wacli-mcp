@@ -28,18 +28,15 @@ import {
   ConversionError,
   type ConversionErrorKind,
   cutToChars,
-  imageBlock,
   imageJpeg,
   jpegSize,
   keyframes,
   keyframeTimestamps,
   pdfExtract,
-  pdfText,
   probeDimensions,
   probeDuration,
   runTool,
   toOpus16k,
-  videoKeyframes,
 } from "./convert.js";
 
 const run = promisify(execFile);
@@ -132,10 +129,6 @@ function captureLogger(): { logger: Logger; entries: Captured[] } {
   return { logger, entries };
 }
 
-function bytesOf(base64: string): number {
-  return Buffer.from(base64, "base64").byteLength;
-}
-
 /** Float comparison for timestamps: 100 * 0.05 is not exactly 5 in IEEE 754. */
 function near(actual: number, expected: number): boolean {
   return Math.abs(actual - expected) < 1e-6;
@@ -196,66 +189,8 @@ before(async () => {
 
 // --- images -----------------------------------------------------------------------------------
 
-void test("imageBlock returns base64 JPEG under the cap", async () => {
-  const b = await imageBlock(png, 20_000);
-  assert.equal(b.mimeType, "image/jpeg");
-  assert.ok(bytesOf(b.data) <= 20_000, `expected <= 20000 bytes, got ${bytesOf(b.data)}`);
-});
-
-void test("a large cap leaves the image at its original size rather than upscaling it", async () => {
-  const b = await imageBlock(png, 5_000_000);
-  const decoded = await Jimp.read(Buffer.from(b.data, "base64"));
-  assert.equal(decoded.width, 1280);
-  assert.equal(decoded.height, 720);
-});
-
-void test("imageBlock terminates on an unreachable cap, returning the smallest attempt and warning", async () => {
-  const { logger, entries } = captureLogger();
-  // 500 bytes is below what a 320px JPEG of this pattern can reach, so every attempt overshoots and
-  // the loop has to stop on its own. An implementation that keeps halving would never return here.
-  const b = await imageBlock(png, 500, logger);
-  assert.equal(b.mimeType, "image/jpeg");
-  assert.ok(bytesOf(b.data) > 500, "the test is vacuous unless the cap really is unreachable");
-
-  const full = await imageBlock(png, 5_000_000);
-  assert.ok(bytesOf(b.data) < bytesOf(full.data), "the returned attempt must be the shrunken one");
-  assert.ok(
-    entries.some((e) => e.level === "warn"),
-    "giving up on the cap must be logged",
-  );
-
-  // Downscaling must set one edge and let the other follow; setting both would squash the picture.
-  // Tolerance rather than equality because each step rounds to whole pixels.
-  const decoded = await Jimp.read(Buffer.from(b.data, "base64"));
-  const ratio = decoded.width / decoded.height;
-  assert.ok(Math.abs(ratio - 1280 / 720) < 0.02, `aspect ratio drifted: ${decoded.width}x${decoded.height}`);
-});
-
 void test("keyframeTimestamps asked for no frames returns none", () => {
   assert.deepEqual(keyframeTimestamps(100, 0), []);
-});
-
-void test("imageBlock decodes WebP, which jimp cannot read, through the ffmpeg fallback", async () => {
-  const b = await imageBlock(webp, 5_000_000);
-  assert.equal(b.mimeType, "image/jpeg");
-  const decoded = await Jimp.read(Buffer.from(b.data, "base64"));
-  assert.equal(decoded.width, 512);
-});
-
-void test("a file that is not there is named as such, and costs no ffmpeg process", async () => {
-  // jimp reports a missing file and a format it does not ship with the same opaque error, so without
-  // an explicit check both fall through to the ffmpeg fallback — where a missing *input* is reported
-  // as "ffmpeg is not installed or not on PATH" on any image built without ffmpeg, which sends the
-  // reader to rebuild a runtime that was fine.
-  await assert.rejects(
-    () => imageBlock(join(dir, "does-not-exist.png"), 1000),
-    (err: unknown) => {
-      assert.ok(err instanceof ConversionError, `expected ConversionError, got ${String(err)}`);
-      assert.match(err.message, /ENOENT/, "the error must name what is actually wrong");
-      assert.doesNotMatch(err.message, /ffmpeg/, "and must not blame the transcoder for it");
-      return true;
-    },
-  );
 });
 
 void test("imageJpeg returns bytes, and reports the size those bytes actually are", async () => {
@@ -306,34 +241,23 @@ void test("imageJpeg decodes WebP through the same ffmpeg fallback", async () =>
   assert.equal(out.height, 512);
 });
 
-void test("imageJpeg names a file that is not there", async () => {
-  await assert.rejects(() => imageJpeg(join(dir, "does-not-exist.png"), { maxBytes: 1000 }), ConversionError);
+void test("imageJpeg names a file that is not there, and costs no ffmpeg process to say so", async () => {
+  // jimp reports a missing file and a format it does not ship with the same opaque error, so without
+  // an explicit check both fall through to the ffmpeg fallback — where a missing *input* is reported
+  // as "ffmpeg is not installed or not on PATH" on any image built without ffmpeg, which sends the
+  // reader to rebuild a runtime that was fine.
+  await assert.rejects(
+    () => imageJpeg(join(dir, "does-not-exist.png"), { maxBytes: 1000 }),
+    (err: unknown) => {
+      assert.ok(err instanceof ConversionError, `expected ConversionError, got ${String(err)}`);
+      assert.match(err.message, /ENOENT/, "the error must name what is actually wrong");
+      assert.doesNotMatch(err.message, /ffmpeg/, "and must not blame the transcoder for it");
+      return true;
+    },
+  );
 });
 
 // --- video ------------------------------------------------------------------------------------
-
-void test("videoKeyframes returns the requested number of distinct frames", async () => {
-  const frames = await videoKeyframes(mp4, 3, 100_000);
-  assert.equal(frames.length, 3);
-  assert.notEqual(frames[0]?.data, frames[2]?.data, "frames must be sampled across the video, not duplicated");
-  for (const f of frames) assert.equal(f.mimeType, "image/jpeg");
-});
-
-void test("videoKeyframes with a count of one samples the middle of the video", async () => {
-  const frames = await videoKeyframes(mp4, 1, 100_000);
-  assert.equal(frames.length, 1);
-  assert.ok(bytesOf(frames[0]?.data ?? "") > 0);
-});
-
-void test("videoKeyframes shrinks a frame that overruns the cap", async () => {
-  const [big] = await videoKeyframes(hdMp4, 1, 5_000_000);
-  const [small] = await videoKeyframes(hdMp4, 1, 20_000);
-  assert.ok(big !== undefined && small !== undefined);
-  assert.ok(
-    bytesOf(small.data) < bytesOf(big.data),
-    `a capped frame must be smaller: ${bytesOf(small.data)} vs ${bytesOf(big.data)}`,
-  );
-});
 
 void test("keyframeTimestamps skips the first and last 5% and spaces the rest evenly", () => {
   const three = keyframeTimestamps(100, 3);
@@ -345,10 +269,6 @@ void test("keyframeTimestamps skips the first and last 5% and spaces the rest ev
   const one = keyframeTimestamps(100, 1);
   assert.equal(one.length, 1);
   assert.ok(near(one[0] ?? -1, 50), "a single sample belongs in the middle");
-});
-
-void test("videoKeyframes refuses a file it cannot read a duration from", async () => {
-  await assert.rejects(() => videoKeyframes(notMedia, 2, 100_000), ConversionError);
 });
 
 void test("keyframes carry their index and timestamp, in order", async () => {
@@ -697,29 +617,14 @@ void test("probeDimensions on a file that is not media raises ConversionError", 
 
 // --- documents --------------------------------------------------------------------------------
 
-void test("pdfText extracts the page text", async () => {
-  const text = await pdfText(pdf, 10_000);
-  assert.match(text, new RegExp(PDF_TEXT));
-});
-
-void test("pdfText truncates to maxChars", async () => {
-  const text = await pdfText(pdf, 5);
-  assert.equal(text.length, 5);
-  assert.equal(text, PDF_TEXT.slice(0, 5));
-});
-
-void test("pdfText names the missing tool when pdftotext is not installed", async () => {
+void test("pdfExtract names the missing tool when pdftotext is not installed", async () => {
   const path = process.env["PATH"];
   process.env["PATH"] = join(dir, "empty-bin"); // a directory that holds no binaries
   try {
-    await assert.rejects(() => pdfText(pdf, 10_000), /pdftotext/);
+    await assert.rejects(() => pdfExtract(pdf, 10_000), /pdftotext/);
   } finally {
     process.env["PATH"] = path;
   }
-});
-
-void test("pdfText refuses a file that is not a PDF", async () => {
-  await assert.rejects(() => pdfText(notMedia, 10_000), ConversionError);
 });
 
 void test("cutToChars never leaves half of a character behind", () => {

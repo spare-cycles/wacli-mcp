@@ -5,9 +5,8 @@
  * **`readOnly` is enforced here, and this is the only place it is enforced.** A separate process
  * cannot be trusted to police itself: the MCP additionally *discovers* the flag so it never
  * advertises a tool that cannot work, but that is a courtesy layered on top of this gate, not a
- * substitute for it. The gate covers exactly the six operations `mcp/tools/writes.ts` registers
- * today — `registerWriteTools` is skipped wholesale when `config.readOnly` is set — so a read-only
- * deployment behaves identically on both surfaces. `transcribe` and `resolveRecipient` are
+ * substitute for it. The gate covers exactly the six sends — a read-only deployment refuses every
+ * one of them here, whatever the caller. `transcribe` and `resolveRecipient` are
  * deliberately outside it: `whatsapp_transcribe` lives in `registerMediaTools` and answers today in
  * a read-only deployment, and resolving a recipient sends nothing at all.
  *
@@ -51,8 +50,8 @@ type FileBody = { data?: string | undefined; path?: string | undefined };
  *
  * "Exactly one of `data`/`path`" is enforced here rather than by a `.refine()` on the wire schema,
  * because the two spellings of wrong are different mistakes with different advice and an
- * `invalid_union` could only say "invalid". Both messages are the ones `mcp/tools/writes.ts`
- * already produces, character for character, so nothing a model reads moves.
+ * `invalid_union` could only say "invalid". Both messages are the ones the retired in-process tool
+ * layer produced, character for character, so nothing a model reads moves.
  */
 function fileSource(body: FileBody): FileSource {
   if (body.path !== undefined && body.data !== undefined) {

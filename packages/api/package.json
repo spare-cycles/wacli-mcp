@@ -27,7 +27,6 @@
   },
   "dependencies": {
     "whatsapp-api-sdk": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.30.0",
     "baileys": "7.0.0-rc14",
     "express": "^5.2.1",
     "jimp": "^1.6.1",

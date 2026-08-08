@@ -10,7 +10,6 @@ void test("defaults are applied", () => {
   assert.equal(c.dbPath, "/tmp/whatsapp/whatsapp.db");
   assert.equal(c.mediaDir, "/tmp/whatsapp/media");
   assert.equal(c.port, 8080);
-  assert.equal(c.httpPath, "/mcp");
   assert.equal(c.readOnly, false);
   assert.deepEqual(c.transcribeBackends, ["runpod", "mistral"]);
   assert.equal(c.transcribeMaxSeconds, 900);

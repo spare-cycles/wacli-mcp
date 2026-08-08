@@ -30,21 +30,13 @@
  * is last and four-argument; and every bearer route really is under the gate's prefix, which is the
  * boot invariant's job rather than the ordering's.
  *
- * ⚠️ **That changes in Task 11**, and whoever restructures this file needs to know it. `mountMcp`
- * mounts on `config.httpPath`, which is *configurable* — a deployment setting `MCP_HTTP_PATH=/`
- * puts the MCP's own gate over everything, `/health` included, and then the relative order of the
- * public routes and that gate is the only thing keeping a container healthcheck credential-free.
- * `http.ts` says the same thing about its own `/health`, and it is why the route is registered
- * first there. The order here is cheap insurance against exactly that; do not "simplify" it away
- * on the grounds that today's suite cannot tell the difference.
- *
  * **`GET /media/dl/:token` sits outside `/v1` by path, and that is a separate mechanism from its
  * `auth` value.** `GET /v1/media/:chat/:id` also matches `/v1/media/dl/<token>` with `chat = "dl"`,
  * so had the download stayed under `/v1` the two would shadow each other depending on registration
  * order. The distinct prefix removes that structurally; partitioning on `auth` then handles the
  * gate. Neither substitutes for the other.
  *
- * Global Constraint 8 lives here as much as in `http.ts`: this module holds `WHATSAPP_API_TOKEN`,
+ * Global Constraint 8 lives here: this module holds `WHATSAPP_API_TOKEN`,
  * and it is never logged, never echoed in a refusal, and never reachable from a response. No log
  * line here carries request headers — which is where a caller's credential is — and none is ever
  * handed a raw error object; see `errorDetail` in `./errors.js` for why that second one is not
@@ -76,11 +68,8 @@ import type { MediaLinkSigner } from "./medialink.js";
 /**
  * Everything a REST handler is allowed to reach.
  *
- * The same shape as the in-process MCP's `ToolContext` plus the media-link signer, and that is
- * deliberate rather than incidental: while both surfaces run side by side (Tasks 11 through 16)
- * they answer from the same objects, which is what makes comparing them meaningful. It is a plain
- * record — handlers receive it, `main.ts` constructs it, and a test builds the same shape with
- * whichever parts it needs stubbed.
+ * A plain record — handlers receive it, `main.ts` constructs it, and a test builds the same shape
+ * with whichever parts it needs stubbed.
  */
 export type RestDeps = {
   config: Config;
@@ -109,24 +98,6 @@ export type RestDeps = {
    * response they accept today into a 500 is a behaviour change nobody asked for.
    */
   validateResponses?: boolean | undefined;
-  /**
-   * A guest router, registered **after every REST binding and before the terminal error
-   * middleware**. Absent in a suite that only drives REST.
-   *
-   * The seam exists because the two positions around it are both load-bearing and neither is
-   * negotiable. After the bindings: the in-process MCP's path is `MCP_HTTP_PATH`, which a
-   * deployment may set to `/`, and only a guest registered behind every REST route is guaranteed
-   * not to shadow `/health` — the endpoint the container healthcheck polls without a credential —
-   * or a `/v1` route the REST gate is supposed to answer for. Before the error middleware: Express
-   * identifies a terminal handler by arity and there can be exactly one, so a guest that wanted
-   * its own would have to be mounted ahead of ours, and every REST failure would come back in the
-   * guest's envelope.
-   *
-   * It takes the app rather than a router because that is what the guest needs: `mountMcp` calls
-   * `app.use(path, …)` for its gate and its parser, which a `Router` handed to `app.use` would
-   * scope differently.
-   */
-  mount?: ((app: Express) => void) | undefined;
 };
 
 export type RestHandle = {
@@ -137,17 +108,6 @@ export type RestHandle = {
 
 /** The prefix the bearer gate covers. Every bearer route lives under it; nothing else may. */
 const V1 = "/v1";
-
-/**
- * The top-level path segments this surface answers on, as a lookup a guest can consult.
- *
- * Written out rather than derived at import time because the consumer is `http.ts`, which has no
- * bindings to derive from: `mountMcp` refuses an `MCP_HTTP_PATH` that claims one of these. Written
- * out **and checked** — `assertRestOwnsDeclaredSegments` compares it against the live route table
- * at boot, so a route added under a fourth prefix cannot leave this list quietly stale and hand a
- * guest a path the REST surface has started answering on.
- */
-export const REST_PATH_SEGMENTS: Record<string, true> = { health: true, media: true, v1: true };
 
 const BEARER = /^Bearer[ \t]+(\S.*)$/;
 
@@ -169,7 +129,7 @@ type RouteLocals = { restRoutePattern?: string };
  * rather than a 401. It leaks the configured token's length, which is not a secret worth the
  * alternative.
  *
- * The pattern is case-sensitive on `Bearer`, unlike `http.ts`'s: RFC 9110 makes the scheme
+ * The pattern is case-sensitive on `Bearer`: RFC 9110 makes the scheme
  * case-insensitive, so this is stricter than the spec requires. It is left strict deliberately —
  * every client of this API is generated from `packages/sdk`, which sends exactly this spelling, and
  * a gate that accepts fewer shapes than it must is a smaller surface than one that accepts more.
@@ -206,29 +166,6 @@ export function assertGateReachesEveryBearerRoute(bindings: readonly RouteBindin
     }
     if (binding.auth !== "bearer" && underV1) {
       throw new Error(`route ${binding.method} ${binding.path} is "${binding.auth}" but sits behind the ${V1} gate`);
-    }
-  }
-}
-
-/**
- * `REST_PATH_SEGMENTS` against the paths the route table actually declares, both directions, once
- * at boot.
- *
- * The list is a promise made to a guest — `mountMcp` refuses `MCP_HTTP_PATH` on the strength of it
- * — and a promise nothing checks is a promise about last month's route table. A new prefix missing
- * from the list would let the MCP be mounted on top of a REST route; a stale entry would refuse an
- * `MCP_HTTP_PATH` that is in fact free. Both are boot-time contract bugs, so both refuse to start.
- */
-export function assertRestOwnsDeclaredSegments(bindings: readonly RouteBinding[]): void {
-  const live = new Set(bindings.map((binding) => binding.path.split("/").find((segment) => segment !== "") ?? ""));
-  for (const segment of live) {
-    if (!Object.hasOwn(REST_PATH_SEGMENTS, segment)) {
-      throw new Error(`the route table answers on /${segment}, which REST_PATH_SEGMENTS does not declare`);
-    }
-  }
-  for (const segment of Object.keys(REST_PATH_SEGMENTS)) {
-    if (!live.has(segment)) {
-      throw new Error(`REST_PATH_SEGMENTS declares /${segment}, which no route in the table answers on`);
     }
   }
 }
@@ -306,7 +243,6 @@ export function startRest(deps: RestDeps, handlers: Handlers): Promise<RestHandl
 
   const bindings = implement(handlers, { validateResponses: deps.validateResponses });
   assertGateReachesEveryBearerRoute(bindings);
-  assertRestOwnsDeclaredSegments(bindings);
 
   // Step 0. `X-Content-Type-Options: nosniff`, ahead of every route including the open ones.
   //
@@ -357,12 +293,7 @@ export function startRest(deps: RestDeps, handlers: Handlers): Promise<RestHandl
   // Step 4. Everything the gate protects.
   for (const binding of gated) mount(app, binding, logger);
 
-  // Step 5. The guest, if this deployment mounts one. Behind every REST route above, so it can
-  // shadow none of them however its own path is configured, and ahead of the error middleware
-  // below, which is the only terminal handler in the process.
-  deps.mount?.(app);
-
-  // Step 6. Last, and with four parameters: Express identifies error middleware by arity alone.
+  // Step 5. Last, and with four parameters: Express identifies error middleware by arity alone.
   app.use(((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     // The first action, and not an `instanceof ApiError` test: every domain error in this package
     // extends plain `Error`, so a bare `instanceof` sends all of them as 500 and turns the 400 for

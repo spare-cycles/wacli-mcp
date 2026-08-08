@@ -37,9 +37,6 @@ importers:
 
   packages/api:
     dependencies:
-      '@modelcontextprotocol/sdk':
-        specifier: ^1.30.0
-        version: 1.30.0(zod@3.25.76)
       baileys:
         specifier: 7.0.0-rc14
         version: 7.0.0-rc14(jimp@1.6.1)
