@@ -1,0 +1,40 @@
+{
+  "name": "whatsapp-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WhatsApp service built on Baileys: SQLite store, media pipeline, REST surface",
+  "engines": {
+    "node": ">=24"
+  },
+  "//files": "What `pnpm deploy --prod` copies into a runtime image. Without it the deploy carries `src/` - every `*.test.ts`, both test-scaffolding modules and the fixtures - into a published container. The SDK already declares the same thing for the same reason.",
+  "files": [
+    "dist"
+  ],
+  "bin": {
+    "whatsapp-api": "dist/main.js"
+  },
+  "//scripts": "Every script that reads `whatsapp-api-sdk` — at type level or at runtime — builds it first via `build:deps`, so a bare `pnpm --filter whatsapp-api <script>` cannot outrun the SDK build the way it would if only the root scripts sequenced it. `^...` is pnpm for \"this package's workspace dependencies, excluding itself\", so the list does not have to be maintained by hand. The SDK's own build is `tsc -b`, which is up-to-date-aware: when `dist/` is already current the nested call writes nothing, so the root's parallel `pnpm -r` fan-out cannot have two compilers emitting into `packages/sdk/dist` at once. `start` is deliberately not in the list: it runs the built artifact and presupposes a build.",
+  "scripts": {
+    "build:deps": "pnpm --filter \"whatsapp-api^...\" run build",
+    "dev": "pnpm run build:deps && tsx src/main.ts",
+    "build": "pnpm run build:deps && tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "typecheck": "pnpm run build:deps && tsc -p tsconfig.json --noEmit",
+    "lint": "pnpm run build:deps && eslint .",
+    "lint:fix": "pnpm run build:deps && eslint . --fix",
+    "test": "pnpm run build:deps && node --import tsx --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "whatsapp-api-sdk": "workspace:*",
+    "baileys": "7.0.0-rc14",
+    "express": "^5.2.1",
+    "jimp": "^1.6.1",
+    "pino": "^9.6.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@hapi/boom": "9.1.4",
+    "@types/express": "^5.0.0"
+  }
+}

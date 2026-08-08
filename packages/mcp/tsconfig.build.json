@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/**/*.ts"],
+  "//": "`src/tools/harness.ts` is named explicitly beside the *.test.ts glob: scaffolding that is not itself a test file is not caught by that glob, and without this line it compiles into dist/ and ships in the image as dead code nothing imports.",
+  "exclude": ["src/**/*.test.ts", "src/tools/harness.ts"]
+}

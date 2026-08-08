@@ -1,40 +1,25 @@
 {
-  "name": "whatsapp-mcp",
+  "name": "whatsapp-mcp-workspace",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.33.0",
-  "description": "MCP server for WhatsApp, built on Baileys",
+  "description": "Workspace root for the whatsapp-api service, its SDK, and the whatsapp-mcp consumer",
   "engines": {
     "node": ">=24"
   },
-  "bin": {
-    "whatsapp-mcp": "dist/main.js"
-  },
+  "//": "Every entry point builds first. `whatsapp-api-sdk` exports `./dist/`, the same paths npm publish and `pnpm deploy --prod` resolve, so a tree that has never been built has nothing for `api` and `mcp` to typecheck, lint or import against. `api` and `mcp` also each build the SDK from their own `build:deps`, and `pnpm -r` runs those two concurrently: on an already-built tree the SDK's `tsc -b` makes both a no-op, but on a cold tree two compilers would emit into `packages/sdk/dist` at once and one could read the other's half-written `index.d.ts`. Building once up front is what keeps that from being reachable, which is why `check` calls `pnpm -r run lint`/`typecheck` directly rather than going through the wrapped `lint`/`typecheck` scripts and building three times.",
   "scripts": {
-    "dev": "tsx src/main.ts",
-    "build": "tsc -p tsconfig.build.json",
-    "start": "node dist/main.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint .",
-    "lint:fix": "eslint . --fix",
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm run build && pnpm -r run typecheck",
+    "lint": "pnpm run build && pnpm -r run lint",
+    "test": "pnpm run build && pnpm -r run test",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --import tsx --test 'src/**/*.test.ts'",
-    "check": "npm run format:check && npm run lint && npm run typecheck"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "baileys": "7.0.0-rc14",
-    "express": "^5.2.1",
-    "jimp": "^1.6.1",
-    "pino": "^9.6.0",
-    "zod": "^3.25.76"
+    "check": "pnpm run build && pnpm run format:check && pnpm -r run lint && pnpm -r run typecheck"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
-    "@hapi/boom": "9.1.4",
-    "@types/express": "^5.0.0",
     "@types/node": "^24.0.0",
     "eslint": "^9.13.0",
     "eslint-config-prettier": "^9.1.0",
@@ -42,16 +27,5 @@
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.10.0"
-  },
-  "pnpm": {
-    "packageExtensions": {
-      "baileys": {
-        "peerDependenciesMeta": {
-          "sharp": {
-            "optional": true
-          }
-        }
-      }
-    }
   }
 }

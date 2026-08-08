@@ -1,0 +1,28 @@
+{
+  "name": "whatsapp-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests driving the real MCP server against the real API. Ships nowhere.",
+  "engines": {
+    "node": ">=24"
+  },
+  "//": "No `build` script on purpose: `pnpm -r run build` skips a package that lacks one, and nothing consumes this package's output.",
+  "//scripts": "`build:deps` builds this package's workspace dependencies — the SDK, whose `dist/` both product packages compile against. `whatsapp-api` and `whatsapp-mcp` are consumed as TypeScript *source* through their `src/**` subpaths (neither publishes types, and neither has an `exports` map that would stop it), which is what lets an e2e test inject a fake Baileys socket into the real connection.",
+  "scripts": {
+    "build:deps": "pnpm --filter \"whatsapp-e2e^...\" run build",
+    "typecheck": "pnpm run build:deps && tsc -p tsconfig.json --noEmit",
+    "lint": "pnpm run build:deps && eslint .",
+    "lint:fix": "pnpm run build:deps && eslint . --fix",
+    "test": "pnpm run build:deps && node --import tsx --test 'src/**/*.test.ts'"
+  },
+  "//devDependencies": "Every dependency is a dev one: nothing imports this package and it ships nowhere. `whatsapp-api` and `whatsapp-mcp` are here so the pair under test is the real one, and `baileys` is here for the `WASocket` type the fake socket satisfies. Keeping all three off `whatsapp-mcp`'s own manifest is what keeps `pnpm --filter whatsapp-mcp why baileys` empty (Global Constraint 1).",
+  "devDependencies": {
+    "whatsapp-api": "workspace:*",
+    "whatsapp-api-sdk": "workspace:*",
+    "whatsapp-mcp": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "baileys": "7.0.0-rc14",
+    "pino": "^9.6.0"
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "name": "whatsapp-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for WhatsApp, a stateless consumer of whatsapp-api",
+  "engines": {
+    "node": ">=24"
+  },
+  "//files": "What `pnpm deploy --prod` copies into a runtime image - see `packages/api`'s note. Without it the deploy carries `src/` into a published container.",
+  "files": [
+    "dist"
+  ],
+  "bin": {
+    "whatsapp-mcp": "dist/main.js"
+  },
+  "//scripts": "Same arrangement as `packages/api`: every script that reads `whatsapp-api-sdk` builds it first, so a bare `pnpm --filter whatsapp-mcp <script>` is self-sufficient. See that package's `//scripts` for why `^...` and why the SDK build is `tsc -b`.",
+  "scripts": {
+    "build:deps": "pnpm --filter \"whatsapp-mcp^...\" run build",
+    "dev": "pnpm run build:deps && tsx src/main.ts",
+    "build": "pnpm run build:deps && tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "typecheck": "pnpm run build:deps && tsc -p tsconfig.json --noEmit",
+    "lint": "pnpm run build:deps && eslint .",
+    "lint:fix": "pnpm run build:deps && eslint . --fix",
+    "test": "pnpm run build:deps && node --import tsx --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "whatsapp-api-sdk": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "express": "^5.2.1",
+    "pino": "^9.6.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0"
+  }
+}

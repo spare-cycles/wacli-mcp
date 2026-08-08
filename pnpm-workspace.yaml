@@ -1,0 +1,10 @@
+packages:
+  - "packages/*"
+
+# Workspace-scoped, not `packages/api/package.json`: `packageExtensions` is resolver
+# configuration, and pnpm only reads it from the workspace root.
+packageExtensions:
+  baileys:
+    peerDependenciesMeta:
+      sharp:
+        optional: true

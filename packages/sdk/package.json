@@ -1,0 +1,36 @@
+{
+  "name": "whatsapp-api-sdk",
+  "version": "1.0.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Typed contract and client for the whatsapp-api REST service",
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "//": "One entrypoint, `dist/`, in the workspace and when published: `npm publish` does not apply `publishConfig.exports`, and `pnpm deploy --prod` with `files: [\"dist\"]` would copy a package whose exports named a file it did not ship. The cost is that `dist/` must exist before anything typechecks against this package, which the root `check`/`test` scripts and `api`/`mcp`'s own `build:deps` both guarantee by building first.",
+  "//build": "The build script is `tsc -b`, not `-p`, because `api` and `mcp` each call it from their own `build:deps` and the root fans those out in parallel. Build mode compares input and output timestamps and writes nothing when `dist/` is already current, so the concurrent case is a no-op rather than two compilers emitting into the same directory. It points at `tsconfig.build.json`, not `tsconfig.json`, so `*.test.ts` is excluded from emit and `files: [\"dist\"]` cannot publish the tests; `tsconfig.json` remains the typecheck and lint project, which is what keeps the tests checked. Build mode always writes a `.tsbuildinfo`; the `tsBuildInfoFile` inherited from `tsconfig.json` redirects it into the root `node_modules/.cache/` so nothing untracked appears in the package and nothing extra ships.",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -b tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "node --import tsx --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "zod": "^3.25.76"
+  }
+}
