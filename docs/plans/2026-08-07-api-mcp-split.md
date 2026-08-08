@@ -1350,6 +1350,14 @@ API's configured values are both the defaults and the ceilings, so a client cann
 3. **Token length leaks filename length.** Not fixed — padding was not in scope — and probably
    acceptable, but it is a real side channel on an unauthenticated URL and belongs in the open as a
    conscious carry-forward.
+4. **The payload's mimetype is unconstrained, and it is the field that reaches a header.** `s` gets a
+   sha256 regex, `r` gets the two-value enum, `e` gets `.int()` — but `m` is a bare `z.string()`, and
+   `sdk/server.ts` does `res.header("content-type", result.mimeType)`. Its source is fully
+   sender-chosen: `media/store.ts:92-93` reads `body.mimetype` verbatim out of the WhatsApp protobuf
+   and only checks it is non-empty. Encrypting and authenticating it *launders* it — a downstream
+   reader sees a value the token vouches for. The inline allowlist and `nosniff` below are what
+   actually neutralise a sender-chosen `text/html`, so this is a reason those are not optional
+   rather than a hole on its own.
 
 **Response-layer security, owned here because this is where the response exists.**
 

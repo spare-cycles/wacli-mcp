@@ -168,9 +168,17 @@ export function makeMediaLinkSigner(deps: {
         const decipher = createDecipheriv("aes-256-gcm", key, raw.subarray(0, IV_BYTES));
         decipher.setAuthTag(raw.subarray(raw.length - TAG_BYTES));
         const ciphertext = raw.subarray(IV_BYTES, raw.length - TAG_BYTES);
+        // The tag is what makes the plaintext trustworthy, and the ordering that guarantees it is
+        // **this expression's**, not the primitive's. `decipher.update()` will happily hand back
+        // plaintext under a wrong tag — verified: with a zeroed 16-byte tag, `update(ct)` returns
+        // the cleartext and only `final()` throws. What makes this line safe is that the array
+        // literal is abandoned when `final()` throws, so `plaintext` is never assigned and those
+        // bytes are unreachable. Keep both calls inside the one `Buffer.concat`: splitting them, or
+        // any `try { return update(ct) } finally { final() }` shape, returns unauthenticated
+        // plaintext while looking equivalent.
         plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
       } catch {
-        // `final()` throws when the tag does not match. Nothing decrypted, so there is nothing to
+        // `final()` throws when the tag does not match. Nothing was assigned, so there is nothing to
         // report but the refusal itself — in particular no OpenSSL message, which would name the
         // failure mode this whole design is hiding.
         return refuse();
