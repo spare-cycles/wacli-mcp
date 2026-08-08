@@ -1337,6 +1337,20 @@ the call site.
 `maxBytes` / `maxEdge` / `frames` are optional query parameters on the routes that use them; the
 API's configured values are both the defaults and the ceilings, so a client cannot request a 4K strip.
 
+**Three constraints Task 6 discovered and handed forward — all are this task's to honour.**
+
+1. **Bound the filename before it reaches `mint`.** The token carries the filename, so token length
+   is filename length plus overhead: a sender-chosen 4 KB name mints a ~5.5 KB token, and `verify`
+   has no length cap of its own — the only ceiling is Node's 16 KB `maxHeaderSize`, which is a
+   coincidence rather than a decision. Truncate or refuse at a stated limit here.
+2. **Never hand `mint` an unvalidated `?for=`.** Zod's `invalid_enum_value` echoes the received
+   value, so passing a raw query parameter into a validation error puts caller-controlled text on an
+   error path. Parse `for` against the two-value enum at the route boundary and hand `mint` the
+   parsed value.
+3. **Token length leaks filename length.** Not fixed — padding was not in scope — and probably
+   acceptable, but it is a real side channel on an unauthenticated URL and belongs in the open as a
+   conscious carry-forward.
+
 **Response-layer security, owned here because this is where the response exists.**
 
 1. **`X-Content-Type-Options: nosniff` on every media response**, signed or bearer-gated.
