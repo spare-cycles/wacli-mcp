@@ -21,6 +21,8 @@
  * `whatsapp/jid.ts` do that, and this module works with the opaque ids they return.
  */
 
+import { BadRequestError } from "whatsapp-api-sdk";
+
 import type { ChatsRepo } from "../db/chats.js";
 import type { ContactsRepo } from "../db/contacts.js";
 import { canonicalId, parseRecipient } from "./jid.js";
@@ -98,7 +100,12 @@ export function resolveRecipient(to: string, pick: number | undefined, deps: Rec
   const form = parseRecipient(to);
   if (form.kind !== "name") {
     if (pick !== undefined) {
-      throw new Error("`pick` only applies when the recipient is named by name; it is not needed for a JID or number");
+      // `BadRequestError`, not a bare `Error`: over HTTP this has to answer 400 rather than 500, and
+      // the SDK class carries the `name` `"Error"` precisely so the model-visible rendering — which
+      // `describeError` builds from `name` and `message` — does not move. See `CODE_SPEC`.
+      throw new BadRequestError(
+        "`pick` only applies when the recipient is named by name; it is not needed for a JID or number",
+      );
     }
     return canonicalId(form.jid, deps.contacts);
   }

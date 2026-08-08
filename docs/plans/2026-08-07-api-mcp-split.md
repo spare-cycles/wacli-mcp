@@ -399,7 +399,7 @@ git commit -m "refactor: convert to a pnpm workspace, move the server into packa
 ```ts
 export const API_ERROR_CODES = [
   "bad_request", "unauthorized", "not_found", "message_not_found", "media_unavailable",
-  "conversion_failed", "ambiguous_recipient", "recipient_not_found", "read_only",
+  "conversion_failed", "unsupported_media", "ambiguous_recipient", "recipient_not_found", "read_only",
   "not_connected", "transcription_unavailable", "budget_exhausted", "payload_too_large",
   "internal",
 ] as const;
@@ -523,33 +523,59 @@ check:
 export function toApiError(err: unknown): ApiError;
 ```
 
-It is a total function: anything unrecognised becomes `internal` with `name: "Error"`, so an
-unmapped throw degrades rather than leaking a stack. The mapping is exhaustive and testable:
+It is a total function: anything unrecognised becomes `internal`/500, carrying the throw's own
+`name` and `message` and never its stack. The mapping is exhaustive and testable:
 
 | domain throw | code | status |
 | --- | --- | --- |
+| any `ApiError` (a throw site that already chose its code) | *unchanged* | *unchanged* |
 | `CursorError` | `bad_request` | 400 |
-| the `kind`/`has_media` contradiction (bare `Error`) | `bad_request` | 400 |
-| `ZodError` from `implement()`'s own parse | `bad_request` | 400 |
-| body-parser `PayloadTooLargeError` | `payload_too_large` | 413 |
+| the `kind`/`has_media` contradiction (`BadRequestError`, thrown by the handler) | `bad_request` | 400 |
+| `ZodError` from a schema parsed inside a handler | `bad_request` | 400 |
+| body-parser `entity.too.large` | `payload_too_large` | 413 |
+| every other body-parser failure | `bad_request` | 400 |
 | `SendPathError` | `send_path_refused` | 400 |
-| bare `Error` from `recipient.ts:101`, `send.ts:261`, `send.ts:337`, `send.ts:400`, `mcp/tools/writes.ts:163`, `:167` | `bad_request` | 400 |
+| `recipient.ts:101`, `send.ts:261`, `send.ts:337`, `send.ts:400` (**now `BadRequestError`**) | `bad_request` | 400 |
 | `RecipientNotFoundError` | `recipient_not_found` | 404 |
 | `NotFoundError` (`send.ts:287,:325`) | `not_found` | 404 |
 | `MessageNotFoundError` (`media/store.ts:67`, `mcp/tools/media.ts:209`) | `message_not_found` | 404 |
 | `AmbiguousRecipientError` | `ambiguous_recipient` | 409 |
 | `MessageRevokedError`, `NotOwnMessageError` | `message_revoked` / `not_own_message` | 409 |
-| read-only refusal | `read_only` | 403 |
+| read-only refusal (`new ApiError("read_only", …)`) | `read_only` | 403 |
 | `ConnectionUnavailableError` | `not_connected` | 503 |
 | `MediaUnavailableError` | `media_unavailable` | 503 |
-| `ConversionError` | `conversion_failed` | 502 |
+| `ConversionError`, `kind: "invalid-argument"` | `bad_request` | 400 |
+| `ConversionError`, `kind: "source-missing"` | `not_found` | 404 |
+| `ConversionError`, `kind: "source-unsupported"` | `unsupported_media` | 415 |
+| `ConversionError`, `kind: "internal"` | `conversion_failed` | 502 |
 | `TranscriptionError` | `transcription_unavailable` | 503 |
 | budget exhausted | `budget_exhausted` | 429 |
 | anything else | `internal` | 500 |
 
+**Two rows changed during Task 7, and both are recorded here so plan and code do not disagree.**
+
+1. **`ConversionError` is four rows, not one.** Task 5 gave the class a `ConversionErrorKind`
+   precisely so this layer need not read its prose, and the four kinds want four different answers:
+   a permanently unconvertible attachment answered as a server fault is retried and alerted on
+   forever, for a condition no retry and no parameter can change. `unsupported_media`/415 is a **new
+   code** in `API_ERROR_CODES` rather than a second status under `conversion_failed`: consumers
+   branch on the code, so folding the permanent case in with the transient one would make them
+   indistinguishable to exactly the audience the taxonomy exists for. Its `name` stays
+   `ConversionError`, because that is the one in-process class behind all four.
+2. **The four bare `Error` throws are now `BadRequestError`s at the throw site.** The earlier plan
+   had `toApiError` recognise them, which is only possible by matching their message text — a wire
+   status coupled to human prose, silently broken by the next person who improves the wording. The
+   SDK's `BadRequestError` carries the `name` `"Error"` for exactly this purpose, so
+   `describeError` renders them byte for byte as before (proved in `rest/errors.test.ts`, and
+   `send.test.ts` and `recipient.test.ts` pass unmodified). A bare `new Error(...)` is therefore now
+   unambiguously a **fault**, which is what `implement()` already documented it to be — it throws
+   one for a handler that answered the wrong shape and expects a 500.
+
 `toApiError` always carries the **original** `err.name` and `err.message` onto the wire — that is
 what the `name` field exists for, and it is why a bare `Error` must arrive at the client rendering
-as `Error: …` and not `ApiError: …`.
+as `Error: …` and not `ApiError: …`. The **one** exception is a body-parser failure, where Global
+Constraint 5 overrules it: body-parser's message quotes the payload it choked on, so it is a body
+echo and gets a canned message instead. The parser's own `type` still travels to the log.
 
 Two codes have no throw site today and must not be invented into one: `budget_exhausted` is
 currently only *read* for the health report (`media/budget.ts` → `mcp/health.ts`), and nothing
@@ -737,7 +763,12 @@ export type RouteBinding = {
   handle: (req: RawRequest, res: RawResponse) => Promise<void>;
 };
 export type RawRequest = {
-  params: Record<string, string>; query: Record<string, unknown>; body: unknown;
+  // Task 7 correction: `string | string[]`, not `string`. `@types/express` v5's `ParamsDictionary`
+  // indexes to the union — a path may repeat a name and a wildcard capture yields an array — so the
+  // narrower declaration made "Express's Request satisfies it as-is" false, and `startRest` was the
+  // first caller to compile against it and find out. Nothing loosens downstream: every route's
+  // `params` schema is a `z.object` of `z.string()`, so an array is a `bad_request`.
+  params: Record<string, string | string[]>; query: Record<string, unknown>; body: unknown;
 };
 export type RawResponse = {
   status: (code: number) => RawResponse;
@@ -1152,13 +1183,30 @@ export type RestDeps = {
   links: MediaLinkSigner;
   biasTermsFor: (chatId: string) => readonly string[];
   autoTranscriber?: AutoTranscriber | undefined;
+  /** Task 7 addition: check each JSON result against its route's schema. Off in production. */
+  validateResponses?: boolean | undefined;
 };
 export type RestHandle = {
   url: string;
   close: () => Promise<void>;
 };
-export function startRest(deps: RestDeps): Promise<RestHandle>;
+// Task 7 change: `handlers` is a second parameter, not built inside.
+export function startRest(deps: RestDeps, handlers: Handlers): Promise<RestHandle>;
+// Task 7 produces the meta slice; Tasks 8, 9 and 10 produce the other three, and Task 11 composes
+// all four at the one call site.
+export function metaHandlers(deps: RestDeps): Pick<Handlers, "getHealth" | "capabilities">;
 ```
+
+**`startRest` takes the handler map, and it has to.** `implement()`'s `Handlers` is an exhaustive
+mapped type over all 24 routes — deliberately, and it must not be weakened to a `Partial` — so a
+`startRest(deps)` that built the map internally could not compile until Tasks 8, 9 and 10 had all
+landed. The alternatives were both worse than a second parameter: stub the 22 missing handlers, and
+ship placeholders that answer 500 to a route the table says exists; or weaken the mapped type, and
+throw away the compile-time guarantee that every route has a handler. Passing the map keeps that
+guarantee exactly where it belongs — at the composition site, which is `main.ts` in Task 11 — while
+letting this task deliver the seam with only the two handlers it owns. Task 11's call is
+`startRest(deps, { ...metaHandlers(d), ...readHandlers(d), ...mediaHandlers(d), ...writeHandlers(d) })`,
+and a missing slice is a compile error there.
 
 **Denormalisation is the point** (spec §4.1). `presentMessage` resolves the sender's display name and
 takes an already-batched reaction count. `reactionCounts` issues **one** grouped query per page via

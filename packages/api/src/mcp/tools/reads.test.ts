@@ -4,7 +4,7 @@ import { loadConfig } from "../../config.js";
 import type { MessageKind } from "../../db/messages.js";
 import { SCHEMA_VERSION } from "../../db/schema.js";
 import type { ToolContext } from "../context.js";
-import { decodeCursor } from "../cursor.js";
+import { decodeCursor } from "../../rest/cursor.js";
 import { harness, resultJson, resultPage, resultText } from "./harness.js";
 
 const READ_TOOLS = [

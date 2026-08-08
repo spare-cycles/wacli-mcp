@@ -28,6 +28,7 @@ export const API_ERROR_CODES = [
   "message_not_found",
   "media_unavailable",
   "conversion_failed",
+  "unsupported_media",
   "ambiguous_recipient",
   "recipient_not_found",
   "read_only",
@@ -80,14 +81,17 @@ export type WireError = z.infer<typeof wireError>;
  * introduces.
  */
 const CODE_SPEC: Record<ApiErrorCode, { status: number; name: string }> = {
-  // `whatsapp/recipient.ts:101`, `whatsapp/send.ts:261`, `:337`, `:400`, `mcp/tools/reads.ts:173`
-  // and `mcp/tools/writes.ts:163`, `:167` all throw a bare `Error`, and `implement()`'s own
-  // `ZodError` parse failure lands here too. "Error" is the name every one of those renders with
-  // today. `mcp/cursor.ts:29`'s `CursorError` is here as well, keeping only its `name`; see the
-  // note where its class used to be. The list is load-bearing, not documentation: Task 7's
-  // `toApiError` maps off it, and a bare `Error` missing from it falls through to `internal`/500 —
-  // a server-fault status for an argument-validation refusal. `LIVE_THROWS` in `errors.test.ts`
-  // pins each one's message.
+  // `mcp/tools/reads.ts:173` and `mcp/tools/writes.ts:163`, `:167` throw a bare `Error`, and
+  // `implement()`'s own `ZodError` parse failure lands here too. "Error" is the name every one of
+  // those renders with today, which is why this code's fallback name is that literal string rather
+  // than a class name — `BadRequestError` is the one class here whose `name` is deliberately not
+  // its own. That is what let Task 7 convert the four bare throws in `whatsapp/send.ts` and
+  // `whatsapp/recipient.ts` into `BadRequestError`s without moving a byte of what a model reads;
+  // the remaining bare sites above are the MCP tool layer's, which Tasks 8 and 10 replace.
+  // `rest/cursor.ts`'s `CursorError` is here as well, keeping only its `name`; see the note where
+  // its class used to be. `LIVE_THROWS` in `errors.test.ts` pins each one's message, and
+  // `packages/api`'s `rest/errors.ts` maps every domain throw that is *not* already an `ApiError`
+  // onto one of these codes — anything it does not recognise degrades to `internal`/500.
   bad_request: { status: 400, name: "Error" },
   send_path_refused: { status: 400, name: "SendPathError" },
   unauthorized: { status: 401, name: "Error" },
@@ -99,6 +103,15 @@ const CODE_SPEC: Record<ApiErrorCode, { status: number; name: string }> = {
   message_revoked: { status: 409, name: "MessageRevokedError" },
   not_own_message: { status: 409, name: "NotOwnMessageError" },
   payload_too_large: { status: 413, name: "PayloadTooLargeError" },
+  // 415, and a code of its own rather than a second status under `conversion_failed`. The two are
+  // different answers to different questions: this one says the attachment can never become what
+  // was asked for, and no retry and no parameter will change that, while `conversion_failed` says
+  // the machinery broke. Consumers branch on the *code*, so folding them together would make the
+  // permanent case indistinguishable from the transient one for exactly the audience the taxonomy
+  // exists to serve. The name stays `ConversionError` because that is the in-process class behind
+  // it — `media/convert.ts` raises one `ConversionError` carrying a `kind`, and `rest/errors.ts`
+  // splits that kind across these codes.
+  unsupported_media: { status: 415, name: "ConversionError" },
   // Reserved and mapped, but nothing throws it: today an exhausted budget is only *read*, for the
   // health report. Adding a refusal under cover of a refactor would be new behaviour.
   budget_exhausted: { status: 429, name: "Error" },
@@ -231,6 +244,22 @@ export class ConversionError extends ApiError {
 }
 
 /**
+ * The attachment cannot become the representation that was asked for — no duration to sample from,
+ * no frame at a sample point, a resolution that changes mid-stream.
+ *
+ * A sibling of `ConversionError` rather than a variant of it, because the two ask for different
+ * behaviour from a caller: this one is permanent and a retry is wasted, while `conversion_failed`
+ * is the machinery having broken. Its `name` is still `"ConversionError"` — the in-process class
+ * behind both is the single `ConversionError` in `media/convert.ts`, and `describeError` must go on
+ * rendering the word the model has always read.
+ */
+export class UnsupportedMediaError extends ApiError {
+  constructor(message: string, options: ApiErrorOptions = {}) {
+    super("unsupported_media", message, options);
+  }
+}
+
+/**
  * The class name and the `name` field differ on purpose: the code is `not_connected`, but the
  * in-process class this replaces was `ConnectionUnavailableError` and the model has been reading
  * that word for as long as the tool has existed.
@@ -275,6 +304,7 @@ const CONSTRUCT: Record<ApiErrorCode, (message: string, options: ApiErrorOptions
   budget_exhausted: (m, o) => new ApiError("budget_exhausted", m, o),
   internal: (m, o) => new ApiError("internal", m, o),
   conversion_failed: (m, o) => new ConversionError(m, o),
+  unsupported_media: (m, o) => new UnsupportedMediaError(m, o),
   not_connected: (m, o) => new NotConnectedError(m, o),
   media_unavailable: (m, o) => new MediaUnavailableError(m, o),
   transcription_unavailable: (m, o) => new TranscriptionError(m, o),

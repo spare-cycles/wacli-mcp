@@ -34,7 +34,7 @@ import {
 } from "../../db/messages.js";
 import { canonicalId } from "../../whatsapp/jid.js";
 import type { ToolContext } from "../context.js";
-import { decodeCursor, encodeCursor } from "../cursor.js";
+import { decodeCursor, encodeCursor } from "../../rest/cursor.js";
 import { buildHealth } from "../health.js";
 import { failedResult, jsonResult, presentChat, presentContact, presentMessage, type ToolResult } from "../result.js";
 

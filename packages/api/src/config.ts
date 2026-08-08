@@ -54,6 +54,19 @@ export type Config = {
   port: number; // PORT, default 8080, clamped [1, 65535]
   httpPath: string; // MCP_HTTP_PATH, default "/mcp"
   mcpToken: string | undefined; // WHATSAPP_MCP_TOKEN
+  /**
+   * WHATSAPP_API_TOKEN — the bearer the REST surface's `/v1` gate compares against.
+   *
+   * Separate from `mcpToken`, which gates the in-process MCP endpoint: the two surfaces are
+   * separate products with separate audiences, and one image serving both must be able to rotate
+   * either credential without touching the other. Unset fails **closed** for `/v1` — every route
+   * behind the gate answers 401 while `/health` keeps answering — because an API that accepts
+   * unauthenticated writes to a WhatsApp account when a variable is missing is not a defensible
+   * default. It is also the ikm the media-link signer derives its key from (`rest/medialink.ts`),
+   * so rotating it invalidates every outstanding download link, which is what rotating a leaked
+   * secret is supposed to do.
+   */
+  apiToken: string | undefined;
   readOnly: boolean; // WHATSAPP_MCP_READONLY, truthy = 1/true/yes/on
   /** WHATSAPP_TRANSCRIBE_BACKENDS, comma-separated, default "runpod,mistral". Order is try-order. */
   transcribeBackends: readonly TranscribeBackend[];
@@ -210,6 +223,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     port: envInt(env["PORT"], 8080, 1, 65535),
     httpPath: env["MCP_HTTP_PATH"] || "/mcp",
     mcpToken: env["WHATSAPP_MCP_TOKEN"],
+    // `|| undefined`, so an empty string is absent: `WHATSAPP_API_TOKEN=` in a compose file is a
+    // variable someone meant to fill in, and treating it as a token would gate `/v1` behind the
+    // empty string. The signer applies the same rule to the same value.
+    apiToken: env["WHATSAPP_API_TOKEN"] || undefined,
     readOnly: envTruthy(env["WHATSAPP_MCP_READONLY"]),
     transcribeBackends: parseBackends(env["WHATSAPP_TRANSCRIBE_BACKENDS"]),
     // `WHATSAPP_WHISPER_MAX_SECONDS` is kept as a deprecated alias for one release: it is the only

@@ -34,9 +34,20 @@ export type Handler<R extends Route> = (input: {
 
 export type Handlers = { [K in keyof Routes]: Handler<Routes[K]> };
 
-/** The request fields a binding reads. Structural, so Express's `Request` satisfies it as-is. */
+/**
+ * The request fields a binding reads. Structural, so Express's `Request` satisfies it as-is.
+ *
+ * `params` values are `string | string[]`, not `string`, and that is Express's shape rather than a
+ * defensive widening: `@types/express` v5's `ParamsDictionary` indexes to `string | string[]`,
+ * because a path can repeat a name (`/:a/:a`) and a wildcard or regex capture group produces an
+ * array. The narrower declaration this replaces made the doc comment above false — Express's
+ * `Request` did *not* satisfy it, and `packages/api`'s `startRest` is the first caller to find out.
+ * Nothing downstream loosens: every route's `params` schema is a `z.object` of `z.string()`, so an
+ * array arriving where a string belongs is refused as `bad_request` by `parsePart` rather than
+ * reaching a handler.
+ */
 export type RawRequest = {
-  params: Record<string, string>;
+  params: Record<string, string | string[]>;
   query: Record<string, unknown>;
   body: unknown;
 };

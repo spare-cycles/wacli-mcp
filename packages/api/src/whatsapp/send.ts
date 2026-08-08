@@ -29,6 +29,7 @@
 import { proto, type AnyMessageContent, type WAMessage, type WAMessageKey } from "baileys";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
+import { BadRequestError } from "whatsapp-api-sdk";
 import type { ChatsRepo } from "../db/chats.js";
 import type { ContactsRepo } from "../db/contacts.js";
 import type { MessageRow, MessagesRepo } from "../db/messages.js";
@@ -258,7 +259,12 @@ export function makeSender(deps: SendDeps): Sender {
     return mentions.map((mention) => {
       const form = parseRecipient(mention);
       if (form.kind === "name") {
-        throw new Error(`cannot @mention "${mention}": a mention must be a phone number or a user JID, not a name`);
+        // `BadRequestError` rather than a bare `Error`, here and at the two sites below: each is an
+        // argument the caller got wrong, and over HTTP that has to be a 400, not a 500. The class's
+        // `name` is the literal `"Error"`, so what `describeError` renders is unchanged.
+        throw new BadRequestError(
+          `cannot @mention "${mention}": a mention must be a phone number or a user JID, not a name`,
+        );
       }
       return canonicalId(form.jid, contacts);
     });
@@ -334,7 +340,7 @@ export function makeSender(deps: SendDeps): Sender {
 
   function assertWithinLimit(bytes: number): void {
     if (bytes > maxUploadBytes) {
-      throw new Error(`file exceeds the maximum upload size (${bytes} > ${maxUploadBytes} bytes)`);
+      throw new BadRequestError(`file exceeds the maximum upload size (${bytes} > ${maxUploadBytes} bytes)`);
     }
   }
 
@@ -397,7 +403,11 @@ export function makeSender(deps: SendDeps): Sender {
     reingest(sent);
     const messageId = sent?.key.id;
     if (messageId == null || messageId === "") {
-      throw new Error(`WhatsApp accepted the send to ${chatId} but returned no message id`);
+      // The one of the three that is not the caller's fault — WhatsApp accepted and answered with
+      // nothing — but `bad_request` is what the taxonomy pins for this site (`LIVE_THROWS` in the
+      // SDK's `errors.test.ts`), because it is what the model reads today and a 500 here would ask
+      // for a retry of a send that may well have landed.
+      throw new BadRequestError(`WhatsApp accepted the send to ${chatId} but returned no message id`);
     }
     return { chatId, messageId };
   }

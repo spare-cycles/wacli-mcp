@@ -23,6 +23,7 @@ export {
   RecipientNotFoundError,
   SendPathError,
   TranscriptionError,
+  UnsupportedMediaError,
   errorFromWire,
   errorToWire,
   wireError,

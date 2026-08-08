@@ -17,6 +17,7 @@ import {
   RecipientNotFoundError,
   SendPathError,
   TranscriptionError,
+  UnsupportedMediaError,
   errorFromWire,
   errorToWire,
   wireError,
@@ -152,7 +153,7 @@ const LIVE_THROWS = [
     // `bad_request`, not a code of its own: the envelope carries `name`, so the code does not have
     // to encode it. The assertion that matters is the rendered string below, which is identical
     // either way — and `ctor` is `BadRequestError` because that is genuinely what comes back.
-    site: "mcp/cursor.ts:29",
+    site: "rest/cursor.ts:35",
     code: "bad_request",
     name: "CursorError",
     message:
@@ -278,6 +279,11 @@ void test("each class carries its code's canonical status and legacy name with n
     [new MessageRevokedError("m"), "MessageRevokedError", 409],
     [new NotOwnMessageError("m"), "NotOwnMessageError", 409],
     [new ConversionError("m"), "ConversionError", 502],
+    // Same name, different code and status: `media/convert.ts` raises one class across four
+    // outcomes and tags each with a `kind`, and `packages/api`'s `rest/errors.ts` splits that kind
+    // across codes. The name is what the model reads and it must not move; the code is what a
+    // consumer branches on, and "permanently unconvertible" is not "the machinery broke".
+    [new UnsupportedMediaError("m"), "ConversionError", 415],
     [new NotConnectedError("m"), "ConnectionUnavailableError", 503],
     [new MediaUnavailableError("m"), "MediaUnavailableError", 503],
     [new TranscriptionError("m"), "TranscriptionError", 503],
