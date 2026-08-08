@@ -35,6 +35,7 @@ export const API_ERROR_CODES = [
   "not_connected",
   "transcription_unavailable",
   "budget_exhausted",
+  "rate_limited",
   "payload_too_large",
   "internal",
   "message_revoked",
@@ -115,6 +116,12 @@ const CODE_SPEC: Record<ApiErrorCode, { status: number; name: string }> = {
   // Reserved and mapped, but nothing throws it: today an exhausted budget is only *read*, for the
   // health report. Adding a refusal under cover of a refactor would be new behaviour.
   budget_exhausted: { status: 429, name: "Error" },
+  // Shares 429 with `budget_exhausted` and means something entirely different: the caller is asking
+  // too fast, and the same request will succeed shortly. An exhausted budget will not. Both are
+  // "come back later", but only one comes back on its own, so a client that retries on the wrong one
+  // burns its attempts against a wall. Two codes over one status is exactly what a closed taxonomy
+  // buys - the status is for HTTP, the code is for the consumer.
+  rate_limited: { status: 429, name: "Error" },
   internal: { status: 500, name: "Error" },
   conversion_failed: { status: 502, name: "ConversionError" },
   not_connected: { status: 503, name: "ConnectionUnavailableError" },
@@ -162,9 +169,9 @@ export class ApiError extends Error {
 
 /**
  * One subclass per code that has a legacy in-process class behind it, so a consumer can narrow with
- * `instanceof` exactly where it used to. The five codes without one (`unauthorized`, `read_only`,
- * `payload_too_large`, `budget_exhausted`, `internal`) are plain `ApiError`s — inventing a class
- * for a failure that has never had one would be a shape nobody can name.
+ * `instanceof` exactly where it used to. The six codes without one (`unauthorized`, `read_only`,
+ * `payload_too_large`, `budget_exhausted`, `rate_limited`, `internal`) are plain `ApiError`s -
+ * inventing a class for a failure that has never had one would be a shape nobody can name.
  *
  * Each takes the same `(message, options)` pair as the base so `errorFromWire` can hand every one
  * of them the wire's `name` and `status` without a special case per class.
@@ -302,6 +309,7 @@ const CONSTRUCT: Record<ApiErrorCode, (message: string, options: ApiErrorOptions
   not_own_message: (m, o) => new NotOwnMessageError(m, o),
   payload_too_large: (m, o) => new ApiError("payload_too_large", m, o),
   budget_exhausted: (m, o) => new ApiError("budget_exhausted", m, o),
+  rate_limited: (m, o) => new ApiError("rate_limited", m, o),
   internal: (m, o) => new ApiError("internal", m, o),
   conversion_failed: (m, o) => new ConversionError(m, o),
   unsupported_media: (m, o) => new UnsupportedMediaError(m, o),

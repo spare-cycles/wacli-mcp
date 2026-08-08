@@ -455,12 +455,11 @@ export function mediaHandlers(deps: RestDeps): MediaHandlers {
       const bucket = fetches.get(params.token) ?? { count: 0, expiresAt: payload.e };
       if (bucket.count >= MAX_FETCHES_PER_TOKEN) {
         logAccess(payload, "rate_limited", at);
-        // 429, and `budget_exhausted` is the only code the closed taxonomy maps to it. The name is
-        // the wrong shade — the taxonomy's "budget" is the transcription ledger's — but a 404 would
-        // read as a broken link to whoever hit the ceiling honestly, and inventing a code means
-        // changing a contract two packages compile against.
+        // `rate_limited`, not `budget_exhausted`: both are 429, but only this one comes back on its
+        // own. A client that cannot tell them apart retries against a wall, or gives up on a ceiling
+        // that would have lifted.
         throw new ApiError(
-          "budget_exhausted",
+          "rate_limited",
           `this media link has been fetched ${String(MAX_FETCHES_PER_TOKEN)} times, which is its limit; ask for a new one`,
         );
       }

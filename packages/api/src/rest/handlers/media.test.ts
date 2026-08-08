@@ -397,7 +397,9 @@ void test("the 21st fetch of one token is refused", async (t) => {
   }
   const refused = await h.anon(link.url);
   assert.equal(refused.status, 429);
-  assert.equal(((await refused.json()) as WireErrorBody).error.code, "budget_exhausted");
+  // `rate_limited`, not `budget_exhausted`: this ceiling lifts by itself, the transcription budget
+  // does not, and a client retries on one but not the other.
+  assert.equal(((await refused.json()) as WireErrorBody).error.code, "rate_limited");
 
   // Per token, not per attachment: a fresh link to the same bytes still works.
   const second = MediaLink.parse(await h.json(`/v1/media/${CHAT}/M1/link`));
