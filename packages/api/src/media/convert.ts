@@ -1,6 +1,6 @@
 /**
- * Turning an attachment into something a language model can actually consume: JPEG image blocks,
- * video keyframes, 16 kHz mono audio and PDF text.
+ * Turning an attachment into something a language model or an HTTP client can actually consume:
+ * JPEG bytes and base64 image blocks, video keyframes, 16 kHz mono audio and PDF text.
  *
  * Nothing here touches Baileys, the database or the network — every function takes a path on disk
  * and either shells out to a system binary or works in-process with jimp. Two rules shape it:
@@ -8,8 +8,9 @@
  * 1. **Every external process carries a timeout.** A malformed file can make ffmpeg spin forever,
  *    and an MCP tool call that never returns is worse than one that fails: the client has no way to
  *    tell the difference between "slow" and "wedged". `runTool` is the only spawn point.
- * 2. **Every size loop provably terminates.** `imageBlock` halves the longest edge down to a floor
- *    and then stops, returning the smallest attempt rather than chasing a cap it cannot reach.
+ * 2. **Every size loop provably terminates.** `fitToCap` — the one shrink loop, shared by the
+ *    single-image and the whole-strip conversions — halves the longest edge down to a floor and
+ *    then stops, returning the smallest attempt rather than chasing a cap it cannot reach.
  */
 
 import { execFile, type ExecFileException } from "node:child_process";
@@ -21,6 +22,38 @@ import { logger as defaultLogger } from "../logger.js";
 export type ImageBlock = { data: string; mimeType: string };
 
 export type Dimensions = { width: number; height: number };
+
+/**
+ * A JPEG as bytes, and the size those bytes actually are.
+ *
+ * `ImageBlock` is the MCP's shape: base64, and no dimensions. The REST layer reports the size of the
+ * derivative next to it, and that size has to be the size of *these* bytes rather than of the source
+ * file — anything the cap forced down has been downscaled since.
+ */
+export type JpegBytes = { bytes: Buffer; mimeType: "image/jpeg"; width: number; height: number };
+
+/**
+ * One sampled frame of a video, with what a caller needs to caption it.
+ *
+ * The SDK exports a `Keyframe` of the same name for the wire, carrying the same frame base64'd in
+ * `data`. Same concept, deliberately the same word, and not the same type: this side produces bytes
+ * and the route encodes them, so an auto-import that swaps one for the other will not compile.
+ */
+export type Keyframe = { index: number; atSec: number; bytes: Buffer; mimeType: "image/jpeg" };
+
+/**
+ * A whole strip, and the one size every frame in it has.
+ *
+ * `width`/`height` are the frames' size, not the video stream's, and they are returned here rather
+ * than left to a separate `probeDimensions` call in the handler so that the strip and its reported
+ * size cannot disagree. They would: ffmpeg applies a video's rotation matrix when it writes a frame
+ * while ffprobe reports the coded size, so a portrait phone video comes out of `probeDimensions`
+ * turned on its side — and a strip the cap forced down is smaller than either.
+ */
+export type KeyframeStrip = { durationSec: number; width: number; height: number; frames: Keyframe[] };
+
+/** A PDF's text and whether `maxChars` cut it short. Structurally the SDK's `PdfExtract` wire shape. */
+export type PdfExtract = { text: string; truncated: boolean };
 
 /** A conversion could not be performed: a missing tool, a bad exit, a timeout, an undecodable file. */
 export class ConversionError extends Error {
@@ -174,45 +207,98 @@ async function decodeImage(source: string | Buffer): Promise<Image> {
   }
 }
 
+/** One encode of every image at one quality: the bytes, the size they were made at, and the worst. */
+type Attempt = { frames: [Buffer, ...Buffer[]]; width: number; height: number; worst: number };
+
 /**
- * Encode `img` as the largest JPEG that fits `maxBytes`, shrinking until it does or until it can't.
+ * Encode every image at `quality`.
+ *
+ * The images share a size — a strip's frames all come out of one video through one ffmpeg
+ * invocation — so the first one answers for the whole attempt. `worst` is the largest frame, which
+ * is what the cap has to be judged against: a strip fits only when all of it fits.
+ */
+async function encodeAll(images: readonly [Image, ...Image[]], quality: number): Promise<Attempt> {
+  const [head, ...rest] = images;
+  const frames: [Buffer, ...Buffer[]] = [await encodeJpeg(head, quality)];
+  for (const img of rest) frames.push(await encodeJpeg(img, quality));
+  let worst = 0;
+  for (const frame of frames) worst = Math.max(worst, frame.byteLength);
+  return { frames, width: head.width, height: head.height, worst };
+}
+
+/**
+ * Encode `images` as the largest JPEGs that each fit `maxBytes`, shrinking until they do or can't.
+ *
+ * One loop for a single image and for a whole keyframe strip, because a strip is fitted as a unit:
+ * every frame is resized by the same step and the attempt is judged by its largest frame, so the one
+ * width and height the strip reports is true of every frame in it. Fitting each frame on its own
+ * would let two frames of the same video end up at different sizes, and then at most one of them
+ * matches what the strip claims.
  *
  * Termination: each pass that fails the cap halves the longest edge, so `longest` strictly decreases
  * and reaches `MIN_EDGE_PX` in at most log2(longest / 320) passes, at which point the loop breaks —
- * and `MAX_SHRINK_PASSES` bounds it regardless. An image that simply cannot be squeezed under a tiny
- * cap therefore returns the smallest attempt: a warning and an oversized block beat an unbounded
- * loop or an exception. Downscaling only ever sets one edge, so the aspect ratio is preserved.
+ * and `MAX_SHRINK_PASSES` bounds it regardless. Images that simply cannot be squeezed under a tiny
+ * cap therefore come back as the smallest attempt: a warning and an oversized result beat an
+ * unbounded loop or an exception. Downscaling only ever sets one edge, so the aspect ratio holds.
  */
-async function fitToCap(img: Image, maxBytes: number, log: Logger): Promise<ImageBlock> {
+async function fitToCap(images: readonly [Image, ...Image[]], maxBytes: number, log: Logger): Promise<Attempt> {
   // Seeded with the full-size, high-quality encode so "smallest so far" is never undefined.
-  let smallest = await encodeJpeg(img, HIGH_QUALITY);
-  if (smallest.byteLength <= maxBytes) return toBlock(smallest);
+  let smallest = await encodeAll(images, HIGH_QUALITY);
+  if (smallest.worst <= maxBytes) return smallest;
 
   for (let pass = 0; pass < MAX_SHRINK_PASSES; pass += 1) {
-    const lower = await encodeJpeg(img, LOW_QUALITY);
-    if (lower.byteLength <= maxBytes) return toBlock(lower);
-    if (lower.byteLength < smallest.byteLength) smallest = lower;
+    const lower = await encodeAll(images, LOW_QUALITY);
+    if (lower.worst <= maxBytes) return lower;
+    if (lower.worst < smallest.worst) smallest = lower;
 
-    const longest = Math.max(img.width, img.height);
+    const longest = Math.max(lower.width, lower.height);
     if (longest <= MIN_EDGE_PX) break;
     const next = Math.max(MIN_EDGE_PX, Math.floor(longest / 2));
-    img.resize(img.width >= img.height ? { w: next } : { h: next });
+    for (const img of images) img.resize(img.width >= img.height ? { w: next } : { h: next });
 
-    const higher = await encodeJpeg(img, HIGH_QUALITY);
-    if (higher.byteLength <= maxBytes) return toBlock(higher);
-    if (higher.byteLength < smallest.byteLength) smallest = higher;
+    const higher = await encodeAll(images, HIGH_QUALITY);
+    if (higher.worst <= maxBytes) return higher;
+    if (higher.worst < smallest.worst) smallest = higher;
   }
 
   log.warn(
-    { bytes: smallest.byteLength, maxBytes, width: img.width, height: img.height },
+    { bytes: smallest.worst, maxBytes, width: smallest.width, height: smallest.height },
     "media: image could not be brought under the size cap; returning the smallest attempt",
   );
-  return toBlock(smallest);
+  return smallest;
 }
 
 /** Re-encode an image file to a base64 JPEG at or under `maxBytes`, downscaling as needed. */
 export async function imageBlock(path: string, maxBytes: number, log: Logger = defaultLogger): Promise<ImageBlock> {
-  return await fitToCap(await decodeImage(path), maxBytes, log);
+  const { frames } = await fitToCap([await decodeImage(path)], maxBytes, log);
+  return toBlock(frames[0]);
+}
+
+/**
+ * Re-encode an image file to JPEG **bytes** at or under `maxBytes`, with the size they came out at.
+ *
+ * `maxEdge` is applied before the cap and only ever shrinks: an edge larger than the image already
+ * has would upscale it, inventing detail and spending bytes to do it. It is a caller's deliberate
+ * ceiling, so it is honoured below `MIN_EDGE_PX` too — that floor governs the automatic shrinking,
+ * which then has nothing left to do and stops on its first pass. A `maxEdge` below one pixel, or one
+ * that is not a finite number, is no ceiling at all and is ignored — the route's query schema
+ * refuses those before they can reach here, and jimp would throw on a resize to zero.
+ */
+export async function imageJpeg(
+  path: string,
+  opts: { maxBytes: number; maxEdge?: number },
+  log: Logger = defaultLogger,
+): Promise<JpegBytes> {
+  const img = await decodeImage(path);
+  const { maxEdge } = opts;
+  if (maxEdge !== undefined && Number.isFinite(maxEdge) && maxEdge >= 1) {
+    const edge = Math.floor(maxEdge);
+    if (Math.max(img.width, img.height) > edge) {
+      img.resize(img.width >= img.height ? { w: edge } : { h: edge });
+    }
+  }
+  const { frames, width, height } = await fitToCap([img], opts.maxBytes, log);
+  return { bytes: frames[0], mimeType: JPEG_MIME, width, height };
 }
 
 /**
@@ -228,6 +314,24 @@ export function keyframeTimestamps(duration: number, count: number): number[] {
   const span = duration * (1 - 2 * KEYFRAME_MARGIN);
   if (count === 1) return [start + span / 2];
   return Array.from({ length: count }, (_, i) => start + (span * i) / (count - 1));
+}
+
+/**
+ * One frame, as the JPEG ffmpeg itself wrote.
+ *
+ * `-ss` before `-i` seeks on the input, which is the fast path and still frame-accurate.
+ */
+async function extractFrame(path: string, at: number): Promise<Buffer> {
+  const { stdout } = await runTool(
+    FFMPEG,
+    // prettier-ignore
+    ["-v", "error", "-ss", at.toFixed(3), "-i", path, "-frames:v", "1", "-q:v", "4", "-f", "image2", "-c:v", "mjpeg", "pipe:1"],
+    FFMPEG_TIMEOUT_MS,
+  );
+  if (stdout.byteLength === 0) {
+    throw new ConversionError(`ffmpeg produced no frame at ${at.toFixed(3)}s of this video`);
+  }
+  return stdout;
 }
 
 /**
@@ -251,21 +355,86 @@ export async function videoKeyframes(
 
   const blocks: ImageBlock[] = [];
   for (const at of keyframeTimestamps(duration, count)) {
-    // `-ss` before `-i` seeks on the input, which is the fast path and still frame-accurate.
-    const { stdout } = await runTool(
-      FFMPEG,
-      // prettier-ignore
-      ["-v", "error", "-ss", at.toFixed(3), "-i", path, "-frames:v", "1", "-q:v", "4", "-f", "image2", "-c:v", "mjpeg", "pipe:1"],
-      FFMPEG_TIMEOUT_MS,
-    );
-    if (stdout.byteLength === 0) {
-      throw new ConversionError(`ffmpeg produced no frame at ${at.toFixed(3)}s of this video`);
+    const frame = await extractFrame(path, at);
+    if (frame.byteLength <= maxBytes) {
+      blocks.push(toBlock(frame));
+      continue;
     }
-    blocks.push(
-      stdout.byteLength <= maxBytes ? toBlock(stdout) : await fitToCap(await decodeImage(stdout), maxBytes, log),
-    );
+    const { frames } = await fitToCap([await decodeImage(frame)], maxBytes, log);
+    blocks.push(toBlock(frames[0]));
   }
   return blocks;
+}
+
+/** One extracted frame: the JPEG ffmpeg wrote, and the point in the clip it was sampled at. */
+type Shot = { atSec: number; bytes: Buffer };
+
+/**
+ * Bring a strip inside `maxBytes` at one shared size, and answer what that size is.
+ *
+ * The fast path decodes exactly one frame, and only to measure it: when ffmpeg's own frames are
+ * already inside the cap they are passed through untouched, as `videoKeyframes` does. The size read
+ * off that one frame is the size of all of them — they came out of one video through one invocation
+ * of one command. Overrunning the cap is what costs a decode per frame, because a strip can only be
+ * resized as a unit if all of it is in memory at once.
+ */
+async function fitStrip(
+  shots: readonly [Shot, ...Shot[]],
+  maxBytes: number,
+  log: Logger,
+): Promise<{ width: number; height: number; frames: Buffer[] }> {
+  const [head, ...rest] = shots;
+  if (shots.every((shot) => shot.bytes.byteLength <= maxBytes)) {
+    const measured = await decodeImage(head.bytes);
+    return { width: measured.width, height: measured.height, frames: shots.map((shot) => shot.bytes) };
+  }
+
+  const images: [Image, ...Image[]] = [await decodeImage(head.bytes)];
+  for (const shot of rest) images.push(await decodeImage(shot.bytes));
+  const { frames, width, height } = await fitToCap(images, maxBytes, log);
+  return { width, height, frames };
+}
+
+/**
+ * A keyframe strip as bytes: `count` evenly spaced frames, each labelled with its position in the
+ * clip, plus the duration and the size the frames came out at.
+ *
+ * The labels come from `keyframeTimestamps`, the same helper that decides where to seek, rather than
+ * from a second copy of the spacing rule — two spacings that disagreed would put a strip and its
+ * captions out of step with nothing to catch it. Extraction is sequential for `videoKeyframes`'
+ * reason, and the whole strip is then fitted to `maxBytes` as a unit so `width`/`height` describe
+ * every frame rather than only the first.
+ */
+export async function keyframes(
+  path: string,
+  opts: { count: number; maxBytes: number },
+  log: Logger = defaultLogger,
+): Promise<KeyframeStrip> {
+  const durationSec = await probeDuration(path);
+  if (durationSec === undefined) {
+    throw new ConversionError("could not read a duration for this video, so no keyframes can be sampled from it");
+  }
+
+  const [firstAt, ...restAt] = keyframeTimestamps(durationSec, opts.count);
+  // A strip reports one width and one height; with no frames there is nothing for them to describe,
+  // so an empty request is refused rather than answered with zeroes that mean nothing.
+  if (firstAt === undefined) {
+    throw new ConversionError("a keyframe strip needs at least one frame, and none was asked for");
+  }
+
+  const shots: [Shot, ...Shot[]] = [{ atSec: firstAt, bytes: await extractFrame(path, firstAt) }];
+  for (const at of restAt) shots.push({ atSec: at, bytes: await extractFrame(path, at) });
+
+  const fitted = await fitStrip(shots, opts.maxBytes, log);
+  const frames: Keyframe[] = [];
+  for (const [index, shot] of shots.entries()) {
+    const bytes = fitted.frames[index];
+    // The fitter answers one buffer per shot, in order. The compiler cannot see that, and a mismatch
+    // would otherwise pair a frame with another frame's timestamp — silently, and forever.
+    if (bytes === undefined) throw new ConversionError("a frame went missing while the strip was being resized");
+    frames.push({ index, atSec: shot.atSec, bytes, mimeType: JPEG_MIME });
+  }
+  return { durationSec, width: fitted.width, height: fitted.height, frames };
 }
 
 /**
@@ -325,14 +494,32 @@ export async function probeDimensions(path: string): Promise<Dimensions | undefi
 }
 
 /**
- * The text of a PDF, capped at `maxChars`.
+ * The whole text of a PDF, with the page separators turned into newlines.
  *
  * `pdftotext` comes from **poppler-utils**, which the runtime image must install; when it is
  * missing the error names the binary, because that is the only clue a misbuilt image gives.
  */
-export async function pdfText(path: string, maxChars: number): Promise<string> {
+async function readPdfText(path: string): Promise<string> {
   const { stdout } = await runTool(PDFTOTEXT, ["-enc", "UTF-8", path, "-"], PDFTOTEXT_TIMEOUT_MS);
   // pdftotext separates pages with a form feed, which is noise in a chat transcript.
-  const text = stdout.toString("utf8").replace(/\f/g, "\n").trim();
+  return stdout.toString("utf8").replace(/\f/g, "\n").trim();
+}
+
+/** The text of a PDF, capped at `maxChars`. */
+export async function pdfText(path: string, maxChars: number): Promise<string> {
+  const text = await readPdfText(path);
   return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
+/**
+ * The text of a PDF, capped at `maxChars`, saying whether the cap cut anything off.
+ *
+ * `pdfText` truncates silently, which is fine for a model reading a summary into a prompt and wrong
+ * for an API: a client that cannot tell a whole document from the first paragraph of one has no way
+ * to know it should ask for more, and no way to say so to whoever is reading its answer.
+ */
+export async function pdfExtract(path: string, maxChars: number): Promise<PdfExtract> {
+  const text = await readPdfText(path);
+  if (text.length <= maxChars) return { text, truncated: false };
+  return { text: text.slice(0, maxChars), truncated: true };
 }
