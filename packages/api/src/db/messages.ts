@@ -56,6 +56,14 @@ export type TranscriptInput = { text: string; model: string; language: string | 
  * `transcriptModel`. Any one of them could be derived from another; all three could not.
  */
 export const TRANSCRIPT_FIELDS = {
+  // Every `column` below carries the `transcript_` prefix by convention, and that convention is the
+  // only thing guarding it. The bound parameters are namespaced `:t_<field>` by construction, so a
+  // field called `id` cannot displace the `:id` the WHERE reads — `column` has no equivalent. Mapping
+  // one onto an existing column (say `text`) is the single combination in this chain that is silent
+  // end to end: zero tsc errors, zero lint warnings, and `setTranscript` writes the transcript into
+  // the message's own `text`. Every other omission is loud — a field with no entry fails the
+  // `satisfies` and both mapped types, an entry with no column fails at `db.prepare`, and a `row`
+  // colliding with an existing property fails TS2783. Keep the prefix.
   text: { column: "transcript", row: "transcript" },
   /** Which model produced the text. NULL means the whisper.cpp era, before schema V2. */
   model: { column: "transcript_model", row: "transcriptModel" },

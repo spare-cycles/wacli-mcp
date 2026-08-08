@@ -150,10 +150,19 @@ ALTER TABLE messages ADD COLUMN transcript_language TEXT;
  * principle asserted in code and contradicted by the data is worse than either alone — it will be
  * read as a guarantee by the first consumer built on it.
  *
- * Only the tombstones are touched. `transcript` and `text` on those rows are already NULL (that is
- * what `deleted_ts IS NOT NULL` bought them), so the `messages_au` trigger fires on a row with no
- * indexed content in either direction: its delete-then-insert pair contributes no tokens, and the
- * FTS index comes out of this migration byte-identical.
+ * Only the tombstones are touched, and the FTS index is untouched with them — but not for the
+ * reason it looks like. It is *not* that those rows are empty: `upsert`'s ON CONFLICT does
+ * `text = COALESCE(excluded.text, messages.text)` and never clears `deleted_ts`, so a history sync
+ * or a reconnect redelivery of a revoked message puts non-NULL `text` back on a live tombstone. On
+ * a store holding one of those, this migration does change the index's bytes.
+ *
+ * What makes it safe is stronger and independent of that: **the statement writes neither indexed
+ * column**. `messages_au`'s delete-then-insert pair therefore removes and re-adds identical values,
+ * whatever they hold. Verified with FTS5 `integrity-check` on tombstones of both shapes, and by
+ * confirming every term stays findable across the migration.
+ *
+ * Stated precisely because the weaker version — "tombstones are empty" — is exactly the invariant a
+ * later migration would reuse to justify rewriting `text`, where it is false.
  */
 const V4_SQL = `
 UPDATE messages

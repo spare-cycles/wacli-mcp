@@ -129,8 +129,10 @@ function storeAt(name: string, upTo: number): string {
   );
   // From V2 on, provenance exists to be recorded: `OLD` is a live transcript that has some, and
   // `REVOKED` is a row tombstoned while `markDeleted` still left it behind — the state V4 clears.
-  // A V1 store has no `transcript_model` column to hold either. The tombstone's `transcript` and
-  // `text` are NULL, as a tombstone's always are, so it contributes nothing to the index.
+  // A V1 store has no `transcript_model` column to hold either. This particular tombstone's
+  // `transcript` and `text` happen to be NULL, so it contributes nothing to the index — but that is
+  // this fixture's shape, not a property of tombstones: a redelivery after a revoke re-COALESCEs
+  // `text` back onto one. See the V4 comment in `schema.ts` for why the migration is safe anyway.
   if (upTo >= 2) {
     db.prepare(
       `INSERT INTO messages (chat_id, id, sender_id, ts, from_me, kind, transcript_model, deleted_ts)
