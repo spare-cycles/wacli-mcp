@@ -59,8 +59,14 @@ export type RecipientCandidate = { id: string; label: string; exact: boolean };
  * both repositories when a LID mapping arrives, so neither is expected to hand back a LID that has a
  * phone JID. It stays because every id crossing a boundary in this codebase goes through it, and an
  * exception here would be the thing a later change quietly relies on.
+ *
+ * Exported for `rest/handlers/writes.ts`, which needs the list itself rather than the one id
+ * `resolveRecipient` picks from it: `POST /v1/recipients/resolve` answers with it, and an
+ * `ambiguous_recipient` refusal carries it as `details.candidates`. Re-deriving it there rather
+ * than parsing it back out of the refusal message is what keeps the numbers a client is offered and
+ * the numbers `pick` will index into the product of one function.
  */
-function candidatesFor(name: string, deps: RecipientDeps): RecipientCandidate[] {
+export function candidatesFor(name: string, deps: RecipientDeps): RecipientCandidate[] {
   const wanted = name.toLowerCase();
   const byId = new Map<string, RecipientCandidate>();
 

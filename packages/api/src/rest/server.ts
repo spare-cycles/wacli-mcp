@@ -229,6 +229,21 @@ export function startRest(deps: RestDeps, handlers: Handlers): Promise<RestHandl
   const bindings = implement(handlers, { validateResponses: deps.validateResponses });
   assertGateReachesEveryBearerRoute(bindings);
 
+  // Step 0. `X-Content-Type-Options: nosniff`, ahead of every route including the open ones.
+  //
+  // It belongs to the media responses — `rest/handlers/media.ts` serves sender-chosen bytes under a
+  // sender-chosen mimetype, and `/media/dl/:token` serves them with no bearer token at all — but a
+  // handler cannot set it: `BinaryPayload` carries bytes, a type and a disposition, and nothing
+  // else. Without the header a browser is free to sniff a document out of an attachment the inline
+  // allowlist refused to render, which puts that whole defence back into content inspection.
+  //
+  // Set for every response rather than only the media ones because no response here wants to be
+  // sniffed, and a header a future route has to remember is a header a future route will forget.
+  app.use(((_req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    next();
+  }) satisfies RequestHandler);
+
   // Step 1. The partition, which *is* the mount order. Written as one pass rather than two filters
   // so the two halves cannot fall out of step with each other.
   const open: RouteBinding[] = [];
