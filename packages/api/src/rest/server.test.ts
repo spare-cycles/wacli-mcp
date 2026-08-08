@@ -33,7 +33,7 @@ import type { Sender } from "../whatsapp/send.js";
 import type { MediaLinkSigner } from "./medialink.js";
 import { CursorError } from "./cursor.js";
 import { metaHandlers } from "./handlers/meta.js";
-import { startRest, type RestDeps, type RestHandle } from "./server.js";
+import { assertGateReachesEveryBearerRoute, startRest, type RestDeps, type RestHandle } from "./server.js";
 
 const TOKEN = "s3cr3t-api-token";
 const AUTH = { authorization: `Bearer ${TOKEN}` };
@@ -198,6 +198,31 @@ void test("every bearer route really is behind the gate", async (t) => {
   }
 });
 
+void test("the boot invariant refuses a table the gate and the partition disagree about", () => {
+  // The guard the test above depends on. Driving it through `startRest` is impossible — the
+  // bindings come from the frozen route table — so it is exercised directly, in both directions,
+  // because each is a different production failure: an unauthenticated write, and a `/health` that
+  // starts answering 401 to a container healthcheck with no token to give.
+  const handle = (): Promise<void> => Promise.resolve();
+  assert.throws(() => {
+    assertGateReachesEveryBearerRoute([{ method: "POST", path: "/messages", auth: "bearer", handle }]);
+  }, /outside \/v1/);
+  assert.throws(() => {
+    assertGateReachesEveryBearerRoute([{ method: "GET", path: "/v1/health", auth: "public", handle }]);
+  }, /behind the \/v1 gate/);
+  // `/v1abc` is not under the gate, which `app.use("/v1")` agrees with — the two rules have to
+  // read the prefix the same way or the check would bless a route the gate never sees.
+  assert.throws(() => {
+    assertGateReachesEveryBearerRoute([{ method: "GET", path: "/v1abc", auth: "bearer", handle }]);
+  }, /outside \/v1/);
+  assertGateReachesEveryBearerRoute([
+    { method: "GET", path: "/v1", auth: "bearer", handle },
+    { method: "GET", path: "/v1/chats", auth: "bearer", handle },
+    { method: "GET", path: "/health", auth: "public", handle },
+    { method: "GET", path: "/media/dl/:token", auth: "signed", handle },
+  ]);
+});
+
 void test("a bad, short, long or empty bearer is a 401 rather than a crash", async (t) => {
   // `timingSafeEqual` throws on buffers of unequal length, so an implementation that drops the
   // length guard answers the short and long cases with a 500 or a dead socket.
@@ -346,6 +371,21 @@ void test("an anonymous POST is refused before anything is parsed", async (t) =>
     body: "{not json",
   });
   assert.equal(res.status, 401);
+});
+
+void test("the parser is scoped to /v1, not merely mounted after the gate", async (t) => {
+  // The distinction the test above cannot make. `app.use(express.json())` placed at the same point
+  // in the chain is also behind the gate for /v1 — and parses the body of every unauthenticated
+  // request to the signed-download prefix as well. A parse error here would say it ran; a plain 404
+  // (there is no POST route under /media/dl) says it did not.
+  const { handle } = await start(t);
+  const res = await fetch(`${handle.url}/media/dl/x`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: '{"data":"LEAKMARKER"',
+  });
+  assert.equal(res.status, 404);
+  assert.doesNotMatch(await res.text(), /LEAKMARKER/);
 });
 
 void test("an oversized body is payload_too_large", async (t) => {

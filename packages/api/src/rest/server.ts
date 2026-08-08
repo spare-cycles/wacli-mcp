@@ -1,8 +1,8 @@
 /**
  * The REST surface: the 24 routes of the contract, mounted in the one order that is correct.
  *
- * **The order is load-bearing, and it is data-driven.** It comes from partitioning the bindings
- * `implement()` returns on `binding.auth`, never from hand-mounting the two exceptions:
+ * **The order is data-driven.** It comes from partitioning the bindings `implement()` returns on
+ * `binding.auth`, never from hand-mounting the two exceptions:
  *
  * 1. Bindings whose `auth` is not `bearer` — `getHealth` and `fetchSignedMedia`. Mounted first, so
  *    no gate applies. A healthcheck has no credential, and a signed link is shareable precisely
@@ -19,6 +19,24 @@
  * and the day a third public route is added it would be mounted behind the gate by omission. The
  * partition cannot make that mistake, and `assertGateReachesEveryBearerRoute` refuses to boot if
  * the table and the gate's prefix ever disagree.
+ *
+ * **Be precise about which parts of that order are actually observable, because two of them are
+ * not.** `app.use(V1, …)` is path-scoped, and `/health` and `/media/dl/:token` are outside `/v1`,
+ * so moving step 1 after step 4 changes no behaviour at all — a mutation that swaps them passes
+ * the whole suite, and pretending otherwise would be a comment that lies. What is genuinely load-
+ * bearing, and is each pinned by a test: the gate sits ahead of the parser (an anonymous malformed
+ * `POST /v1/…` is a 401, not a 400); the parser is *scoped* to `/v1` rather than merely mounted
+ * after the gate (a malformed `POST /media/dl/x` is a 404, not a parse error); the error middleware
+ * is last and four-argument; and every bearer route really is under the gate's prefix, which is the
+ * boot invariant's job rather than the ordering's.
+ *
+ * ⚠️ **That changes in Task 11**, and whoever restructures this file needs to know it. `mountMcp`
+ * mounts on `config.httpPath`, which is *configurable* — a deployment setting `MCP_HTTP_PATH=/`
+ * puts the MCP's own gate over everything, `/health` included, and then the relative order of the
+ * public routes and that gate is the only thing keeping a container healthcheck credential-free.
+ * `http.ts` says the same thing about its own `/health`, and it is why the route is registered
+ * first there. The order here is cheap insurance against exactly that; do not "simplify" it away
+ * on the grounds that today's suite cannot tell the difference.
  *
  * **`GET /media/dl/:token` sits outside `/v1` by path, and that is a separate mechanism from its
  * `auth` value.** `GET /v1/media/:chat/:id` also matches `/v1/media/dl/<token>` with `chat = "dl"`,
@@ -145,8 +163,12 @@ function bearerMatches(expected: string, header: string | undefined): boolean {
  * `/health` starts answering 401 to a container healthcheck that has no token to give. Refusing to
  * start is the only honest response to either: both are contract bugs, and a server that boots into
  * one hides it.
+ *
+ * Exported only so it can be exercised directly: `implement()` reads the frozen route table, so
+ * there is no way to drive a bad binding through `startRest` from outside, and a guard against a
+ * future mistake that is never run is a guard nobody knows works.
  */
-function assertGateReachesEveryBearerRoute(bindings: readonly RouteBinding[]): void {
+export function assertGateReachesEveryBearerRoute(bindings: readonly RouteBinding[]): void {
   for (const binding of bindings) {
     const underV1 = binding.path === V1 || binding.path.startsWith(`${V1}/`);
     if (binding.auth === "bearer" && !underV1) {
