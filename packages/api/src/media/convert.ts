@@ -55,9 +55,48 @@ export type KeyframeStrip = { durationSec: number; width: number; height: number
 /** A PDF's text and whether `maxChars` cut it short. Structurally the SDK's `PdfExtract` wire shape. */
 export type PdfExtract = { text: string; truncated: boolean };
 
-/** A conversion could not be performed: a missing tool, a bad exit, a timeout, an undecodable file. */
+/**
+ * What a caller can do about a conversion that failed — and therefore what an HTTP handler in front
+ * of this module has to answer with. Every `ConversionError` carries one.
+ *
+ * One class spans four outcomes with four different statuses, and a handler that cannot tell them
+ * apart has two options, both bad: match on message text, or serve one status for all of them. The
+ * second is the sharp one — a permanently unconvertible attachment answered with 500 is retried and
+ * alerted on forever, for a condition no retry and no parameter can change.
+ *
+ * - `invalid-argument` — the arguments are wrong and only the caller can fix them (**400**).
+ *   Decided before anything is spawned or read; the same call fails the same way every time.
+ * - `source-missing` — the file to convert is not there, or cannot be read (**404**). Nobody's
+ *   parameters are at fault, and nothing helps until the bytes come back.
+ * - `source-unsupported` — the file is there and cannot be turned into what was asked for
+ *   (**415**): no duration to sample, no frame at a sample point, a resolution that changes
+ *   mid-stream. Permanent, diagnosable from the message, never worth a retry.
+ * - `internal` — a tool is missing, timed out, produced too much, exited non-zero, or this module
+ *   broke one of its own invariants (**500**). The only kind that is this machine's fault, and so
+ *   the only one worth waking anyone for.
+ *
+ * A tool that *ran* and then exited non-zero is `internal` too, deliberately: ffmpeg refusing a
+ * corrupt attachment and ffmpeg built without the codec it needs are the same exit status and the
+ * same class of stderr, and telling them apart means matching on that text. The place that can
+ * refuse a wrong or unconvertible attachment honestly is the handler, which knows the stored
+ * mimetype before it calls in here — not a catch block reading ffmpeg's prose afterwards.
+ */
+export type ConversionErrorKind = "invalid-argument" | "source-missing" | "source-unsupported" | "internal";
+
+/**
+ * A conversion could not be performed: a missing tool, a bad exit, a timeout, an undecodable file.
+ *
+ * `kind` is a required constructor argument rather than a defaulted field, so a new failure has to
+ * say which of the four it is instead of silently inheriting whichever default was convenient.
+ */
 export class ConversionError extends Error {
   override name = "ConversionError";
+  readonly kind: ConversionErrorKind;
+
+  constructor(kind: ConversionErrorKind, message: string) {
+    super(message);
+    this.kind = kind;
+  }
 }
 
 const FFMPEG = "ffmpeg";
@@ -130,17 +169,20 @@ function toolFailure(bin: string, timeoutMs: number, err: ExecFileException, std
   // or poppler-utils will surface, and "spawn failed" would send the reader looking at the wrong
   // layer entirely.
   if (err.code === "ENOENT") {
-    return new ConversionError(`${bin} is not installed or not on PATH, and this conversion needs it`);
+    return new ConversionError("internal", `${bin} is not installed or not on PATH, and this conversion needs it`);
   }
   if (err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
-    return new ConversionError(`${bin} produced more than ${MAX_OUTPUT_BYTES} bytes of output and was stopped`);
+    return new ConversionError(
+      "internal",
+      `${bin} produced more than ${MAX_OUTPUT_BYTES} bytes of output and was stopped`,
+    );
   }
   if (err.killed === true) {
-    return new ConversionError(`${bin} timed out after ${timeoutMs}ms and was killed`);
+    return new ConversionError("internal", `${bin} timed out after ${timeoutMs}ms and was killed`);
   }
   const detail = tail(stderr.toString("utf8"));
   const status = typeof err.code === "number" ? `exit ${err.code}` : (err.signal ?? "unknown failure");
-  return new ConversionError(`${bin} failed (${status})${detail === "" ? "" : `: ${detail}`}`);
+  return new ConversionError("internal", `${bin} failed (${status})${detail === "" ? "" : `: ${detail}`}`);
 }
 
 /**
@@ -203,14 +245,17 @@ async function decodeImage(source: string | Buffer): Promise<Image> {
   }
   // Only a file on disk can be handed to ffmpeg; in-memory sources here are frames ffmpeg itself
   // just produced, so a jimp failure on one of those is a real corruption rather than a format gap.
-  if (typeof source !== "string") throw new ConversionError("the image data could not be decoded");
+  if (typeof source !== "string") throw new ConversionError("internal", "the image data could not be decoded");
 
   // Before the spawn, not after it. An unreadable path costs an ffmpeg process for a failure that is
   // already decided — and on an image without ffmpeg installed it is then reported as "ffmpeg is not
   // installed or not on PATH", which sends whoever reads it to rebuild an image that was fine.
   const unreadable = await statusOfFile(source);
   if (unreadable !== undefined) {
-    throw new ConversionError(`the file to decode could not be read (${unreadable}), so nothing can be made of it`);
+    throw new ConversionError(
+      "source-missing",
+      `the file to decode could not be read (${unreadable}), so nothing can be made of it`,
+    );
   }
 
   const { stdout } = await runTool(
@@ -221,7 +266,7 @@ async function decodeImage(source: string | Buffer): Promise<Image> {
   try {
     return await Jimp.read(stdout);
   } catch {
-    throw new ConversionError("the image could not be decoded even after transcoding it with ffmpeg");
+    throw new ConversionError("internal", "the image could not be decoded even after transcoding it with ffmpeg");
   }
 }
 
@@ -371,7 +416,9 @@ async function extractFrame(path: string, at: number): Promise<Buffer> {
     FFMPEG_TIMEOUT_MS,
   );
   if (stdout.byteLength === 0) {
-    throw new ConversionError(`ffmpeg produced no frame at ${at.toFixed(3)}s of this video`);
+    // ffmpeg exited 0 and wrote nothing: the seek landed past the last frame, which means the
+    // container declares more running time than it holds. A property of the file, not of the run.
+    throw new ConversionError("source-unsupported", `ffmpeg produced no frame at ${at.toFixed(3)}s of this video`);
   }
   return stdout;
 }
@@ -392,7 +439,10 @@ export async function videoKeyframes(
   if (count <= 0) return [];
   const duration = await probeDuration(path);
   if (duration === undefined) {
-    throw new ConversionError("could not read a duration for this video, so no keyframes can be sampled from it");
+    throw new ConversionError(
+      "source-unsupported",
+      "could not read a duration for this video, so no keyframes can be sampled from it",
+    );
   }
 
   const blocks: ImageBlock[] = [];
@@ -420,11 +470,16 @@ type Shot = { atSec: number; bytes: Buffer };
  * hundred bytes of a JPEG ffmpeg wrote and allocates nothing. The input is always ffmpeg's own
  * `-c:v mjpeg` output, so anything unreadable here is a broken toolchain and is reported as one.
  *
+ * Exported for testing. The malformed headers it has to survive are ones ffmpeg does not write, so
+ * no fixture reaches them through `keyframes` — and "unreachable today" is containment, not a
+ * property: this returns the numbers a whole strip is described by, and every one of them has to
+ * come from a header that actually said so.
+ *
  * Termination: every branch advances `at` by at least one and the loop is bounded by the buffer.
  */
-function jpegSize(jpeg: Buffer): Dimensions {
+export function jpegSize(jpeg: Buffer): Dimensions {
   if (jpeg.byteLength < 4 || jpeg.readUInt16BE(0) !== 0xffd8) {
-    throw new ConversionError("this frame is not a JPEG, so the size of it cannot be read");
+    throw new ConversionError("internal", "this frame is not a JPEG, so the size of it cannot be read");
   }
   let at = 2;
   while (at + 1 < jpeg.byteLength) {
@@ -442,58 +497,90 @@ function jpegSize(jpeg: Buffer): Dimensions {
     // Past the start of scan there is only entropy-coded data, and a frame header always precedes it.
     if (marker === 0xda) break;
     if (at + 1 >= jpeg.byteLength) break;
+    // Every remaining marker carries a length that counts itself, so anything under 2 is not a
+    // segment at all — and stepping by it would not advance the scan.
+    const length = jpeg.readUInt16BE(at);
+    if (length < 2) break;
     // SOF0-SOF15, minus the three unrelated markers that share the range: DHT, JPG and DAC. The
     // payload is length(2), sample precision(1), height(2), width(2) — in that order.
     if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
-      if (at + 6 >= jpeg.byteLength) break;
-      return { width: jpeg.readUInt16BE(at + 5), height: jpeg.readUInt16BE(at + 3) };
+      // The segment's own length is checked before its numbers are believed, not just the buffer's
+      // remaining bytes: a SOF declaring a payload shorter than its fixed fields never wrote those
+      // fields, and reading them anyway answers with a size taken from whatever segment follows.
+      if (length < 8 || at + 6 >= jpeg.byteLength) break;
+      const width = jpeg.readUInt16BE(at + 5);
+      const height = jpeg.readUInt16BE(at + 3);
+      // A zero edge is refused rather than returned. Height 0 is even legal in a SOF whose line
+      // count a later DNL segment supplies, and nothing here reads DNL — but a 0x0 strip is a shape
+      // every layer above carries without noticing, all the way to a client holding frames it has
+      // been told are empty.
+      if (width < 1 || height < 1) {
+        throw new ConversionError(
+          "internal",
+          `this frame's header declares a ${String(width)}x${String(height)} image, which no frame can be`,
+        );
+      }
+      return { width, height };
     }
-    const length = jpeg.readUInt16BE(at);
-    if (length < 2) break;
     at += length;
   }
-  throw new ConversionError("this frame carries no JPEG frame header, so the size of it cannot be read");
+  throw new ConversionError(
+    "internal",
+    "this frame carries no usable JPEG frame header, so the size of it cannot be read",
+  );
+}
+
+/**
+ * The one size every frame in a strip has to be, checked against the head as each frame arrives.
+ *
+ * `KeyframeStrip` promises one width and one height for the whole strip, and can only keep that
+ * promise if the frames agree. They normally do — one video, one command, one filter chain — but a
+ * stream that changes resolution mid-file (broadcast MPEG-TS, a concatenation of two encodes) hands
+ * each `-ss … -frames:v 1` a different size, and for that there is no honest single number: the
+ * maximum describes no frame at all and the first frame's describes only the first. A size that is
+ * wrong for some of the frames is the one outcome a caller cannot detect — the frames are bytes and
+ * there is nothing to check the number against — so it is refused instead.
+ *
+ * Refused *during* extraction rather than after it. The evidence is complete the moment two frames
+ * disagree, so extraction stops on the first frame that differs from the head instead of after the
+ * last one: two spawns when the change is inside the first pair, nine of a possible sixteen on a
+ * ten-second clip that switches halfway, never the full `count`. Each of those spawns is an ffmpeg
+ * process carrying its own 60 s timeout — the same arithmetic `MAX_KEYFRAMES` and the count guard
+ * exist for. The size comes from the frame's header rather than a decode, so the check itself
+ * allocates nothing.
+ */
+function requireSameSize(head: Shot, size: Dimensions, shot: Shot): void {
+  const other = jpegSize(shot.bytes);
+  if (other.width === size.width && other.height === size.height) return;
+  throw new ConversionError(
+    "source-unsupported",
+    `this video changes resolution mid-stream (${String(size.width)}x${String(size.height)} at ` +
+      `${head.atSec.toFixed(3)}s, ${String(other.width)}x${String(other.height)} at ` +
+      `${shot.atSec.toFixed(3)}s), and a keyframe strip reports one size for every frame in it`,
+  );
 }
 
 /**
  * Bring a strip inside `maxBytes` at one shared size, and answer what that size is.
  *
- * Every frame's size is read from its header first, because `KeyframeStrip` promises one width and
- * one height for the whole strip and can only keep that promise if the frames agree. They normally
- * do — one video, one command, one filter chain — but a stream that changes resolution mid-file
- * (broadcast MPEG-TS, a concatenation of two encodes) hands each `-ss … -frames:v 1` a different
- * size, and for that there is no honest single number: the maximum describes no frame at all and
- * the first frame's describes only the first. So it is refused. Reporting a size that is wrong for
- * some of the frames is the one outcome a caller cannot detect, and refusing costs a header scan
- * per frame instead of the decode per frame that measuring honestly would take.
- *
- * With that settled the fast path decodes nothing: when ffmpeg's own frames are already inside the
- * cap they are passed through untouched, as `videoKeyframes` does. Overrunning the cap is what costs
- * a decode per frame, because a strip can only be resized as a unit if all of it is in memory at
- * once — the resident cost `MAX_KEYFRAMES` bounds.
+ * `size` is the size every shot already is: `keyframes` establishes it frame by frame through
+ * `requireSameSize` while it extracts them, so a mixed strip never reaches here and the fast path
+ * has nothing left to measure. When ffmpeg's own frames are inside the cap they are passed through
+ * untouched, as `videoKeyframes` does, and nothing is decoded at all. Overrunning the cap is what
+ * costs a decode per frame, because a strip can only be resized as a unit if all of it is in memory
+ * at once — the resident cost `MAX_KEYFRAMES` bounds.
  */
 async function fitStrip(
   shots: readonly [Shot, ...Shot[]],
+  size: Dimensions,
   maxBytes: number,
   log: Logger,
 ): Promise<{ width: number; height: number; frames: Buffer[] }> {
-  const [head, ...rest] = shots;
-  const size = jpegSize(head.bytes);
-  for (const shot of rest) {
-    const other = jpegSize(shot.bytes);
-    if (other.width !== size.width || other.height !== size.height) {
-      throw new ConversionError(
-        `this video changes resolution mid-stream (${String(size.width)}x${String(size.height)} at ` +
-          `${head.atSec.toFixed(3)}s, ${String(other.width)}x${String(other.height)} at ` +
-          `${shot.atSec.toFixed(3)}s), and a keyframe strip reports one size for every frame in it`,
-      );
-    }
-  }
-
   if (shots.every((shot) => shot.bytes.byteLength <= maxBytes)) {
     return { width: size.width, height: size.height, frames: shots.map((shot) => shot.bytes) };
   }
 
+  const [head, ...rest] = shots;
   const images: [Image, ...Image[]] = [await decodeImage(head.bytes)];
   for (const shot of rest) images.push(await decodeImage(shot.bytes));
   const { frames, width, height } = await fitToCap(images, maxBytes, log);
@@ -507,8 +594,10 @@ async function fitStrip(
  * The labels come from `keyframeTimestamps`, the same helper that decides where to seek, rather than
  * from a second copy of the spacing rule — two spacings that disagreed would put a strip and its
  * captions out of step with nothing to catch it. Extraction is sequential for `videoKeyframes`'
- * reason, and the whole strip is then fitted to `maxBytes` as a unit so `width`/`height` describe
- * every frame rather than only the first.
+ * reason, and every frame is measured against the first one's size as it arrives, so a strip that
+ * could never report one size is refused on the frame that shows it rather than after the last one.
+ * The strip is then fitted to `maxBytes` as a unit, so `width`/`height` describe every frame rather
+ * than only the first.
  */
 export async function keyframes(
   path: string,
@@ -523,6 +612,7 @@ export async function keyframes(
   const { count } = opts;
   if (!Number.isInteger(count) || count < 1 || count > MAX_KEYFRAMES) {
     throw new ConversionError(
+      "invalid-argument",
       `a keyframe strip needs a whole number of frames between 1 and ${String(MAX_KEYFRAMES)}, ` +
         `and ${String(count)} was asked for`,
     );
@@ -530,26 +620,38 @@ export async function keyframes(
 
   const durationSec = await probeDuration(path);
   if (durationSec === undefined) {
-    throw new ConversionError("could not read a duration for this video, so no keyframes can be sampled from it");
+    throw new ConversionError(
+      "source-unsupported",
+      "could not read a duration for this video, so no keyframes can be sampled from it",
+    );
   }
 
   const [firstAt, ...restAt] = keyframeTimestamps(durationSec, count);
   // Unreachable: `count >= 1` above, so there is always a first sample point. The compiler cannot
   // see that, and the tuple below needs a head it can prove is there.
   if (firstAt === undefined) {
-    throw new ConversionError("no sample points could be derived for this video");
+    throw new ConversionError("internal", "no sample points could be derived for this video");
   }
 
-  const shots: [Shot, ...Shot[]] = [{ atSec: firstAt, bytes: await extractFrame(path, firstAt) }];
-  for (const at of restAt) shots.push({ atSec: at, bytes: await extractFrame(path, at) });
+  const head: Shot = { atSec: firstAt, bytes: await extractFrame(path, firstAt) };
+  const size = jpegSize(head.bytes);
+  const shots: [Shot, ...Shot[]] = [head];
+  for (const at of restAt) {
+    const shot: Shot = { atSec: at, bytes: await extractFrame(path, at) };
+    // Between this spawn and the next: a refusal stops here instead of after `count` of them.
+    requireSameSize(head, size, shot);
+    shots.push(shot);
+  }
 
-  const fitted = await fitStrip(shots, opts.maxBytes, log);
+  const fitted = await fitStrip(shots, size, opts.maxBytes, log);
   const frames: Keyframe[] = [];
   for (const [index, shot] of shots.entries()) {
     const bytes = fitted.frames[index];
     // The fitter answers one buffer per shot, in order. The compiler cannot see that, and a mismatch
     // would otherwise pair a frame with another frame's timestamp — silently, and forever.
-    if (bytes === undefined) throw new ConversionError("a frame went missing while the strip was being resized");
+    if (bytes === undefined) {
+      throw new ConversionError("internal", "a frame went missing while the strip was being resized");
+    }
     frames.push({ index, atSec: shot.atSec, bytes, mimeType: JPEG_MIME });
   }
   return { durationSec, width: fitted.width, height: fitted.height, frames };

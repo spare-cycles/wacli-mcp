@@ -36,8 +36,10 @@ export type MediaSource = z.infer<typeof MediaSource>;
 export const JpegDerivative = z.object({
   data: z.string(),
   mimeType: z.string(),
-  width: z.number().int(),
-  height: z.number().int(),
+  // Positive rather than merely integral: an image with a zero edge is not an image, and this
+  // schema is the only thing between a size the API measured wrongly and a client that believes it.
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
   source: MediaSource,
 });
 
@@ -60,8 +62,10 @@ export type Keyframe = z.infer<typeof Keyframe>;
  */
 export const KeyframeStrip = z.object({
   durationSec: z.number(),
-  width: z.number().int(),
-  height: z.number().int(),
+  // Positive for `JpegDerivative`'s reason, with more riding on it: these two numbers describe
+  // every frame in the strip at once, so a zero here would call a strip of real frames empty.
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
   frames: z.array(Keyframe),
   source: MediaSource,
 });

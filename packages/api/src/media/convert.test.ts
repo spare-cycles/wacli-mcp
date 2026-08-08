@@ -8,7 +8,7 @@
 import { Jimp } from "jimp";
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -16,9 +16,11 @@ import { promisify } from "node:util";
 import type { Logger } from "pino";
 import {
   ConversionError,
+  type ConversionErrorKind,
   cutToChars,
   imageBlock,
   imageJpeg,
+  jpegSize,
   keyframes,
   keyframeTimestamps,
   pdfExtract,
@@ -47,6 +49,12 @@ const mixedTs = join(dir, "mixed.ts"); // 640x480 for five seconds, then 320x240
 const pdf = join(dir, "doc.pdf");
 const longPdf = join(dir, "long.pdf"); // more text than any small `maxChars`, so truncation is real
 const notMedia = join(dir, "notes.txt");
+
+// A counting wrapper for ffmpeg, put first on PATH while a test measures how many processes a call
+// costs. `runTool` spawns by bare name through the environment, so this is the one place a spawn is
+// observable without stubbing the tool the rest of this file deliberately runs for real.
+const shimDir = join(dir, "ffmpeg-shim");
+const spawnLog = join(dir, "ffmpeg-spawns.log");
 
 const PDF_TEXT = "Hello media pipeline";
 const LONG_PDF_TEXT = Array.from({ length: 12 }, (_, i) => `line ${String(i)} abcdefghijklmnopqrst`).join("\n");
@@ -148,6 +156,11 @@ before(async () => {
   writeFileSync(pdf, minimalPdf(PDF_TEXT));
   writeFileSync(longPdf, minimalPdf(LONG_PDF_TEXT));
   writeFileSync(notMedia, "not a media file at all\n");
+
+  const { stdout: realFfmpeg } = await run("sh", ["-c", "command -v ffmpeg"]);
+  mkdirSync(shimDir, { recursive: true });
+  const shim = `#!/bin/sh\nprintf 'x\\n' >> "${spawnLog}"\nexec "${realFfmpeg.trim()}" "$@"\n`;
+  writeFileSync(join(shimDir, "ffmpeg"), shim, { mode: 0o755 });
 });
 
 // --- images -----------------------------------------------------------------------------------
@@ -424,6 +437,109 @@ void test("keyframes refuses an unusable frame count before it spends a process"
   // `notMedia` has no duration, so a probe that ran first would report *that* — hiding the mistake
   // the arguments alone had already settled.
   await assert.rejects(() => keyframes(notMedia, { count: 0, maxBytes: 100_000 }), /between 1 and 16/);
+});
+
+void test("a mixed-resolution strip is refused at the frame that proves it, not after the last one", async () => {
+  // Every extraction is its own ffmpeg process with its own 60 s timeout, and `MAX_KEYFRAMES` allows
+  // sixteen of them. This fixture is refusable as soon as the sampling crosses the splice — nine
+  // frames in, and two if the change were in the first pair — so the extractions after that one buy
+  // nothing but timeout budget. The same arithmetic that put the count guard above the probe.
+  const durationSec = await probeDuration(mixedTs);
+  assert.ok(durationSec !== undefined, "the fixture must declare a duration");
+  const points = keyframeTimestamps(durationSec, 16);
+  const head = points[0];
+  assert.ok(head !== undefined);
+  const headSize = await frameSizeAt(mixedTs, head);
+
+  let firstBad = -1;
+  for (const [i, at] of points.entries()) {
+    if ((await frameSizeAt(mixedTs, at)) !== headSize) {
+      firstBad = i;
+      break;
+    }
+  }
+  assert.ok(firstBad > 0 && firstBad < 15, `the fixture must change size inside the strip, got ${String(firstBad)}`);
+
+  const spawns = await ffmpegSpawns(async () => {
+    await assert.rejects(
+      () => keyframes(mixedTs, { count: 16, maxBytes: 5 * 1024 * 1024 }),
+      /changes resolution mid-stream/,
+    );
+  });
+  // Extraction stops on the frame that shows the change; comparing after the loop would spawn 16.
+  assert.equal(spawns, firstBad + 1, `expected to stop at frame ${String(firstBad)}, spawned ${String(spawns)}`);
+});
+
+// --- what a failure means ------------------------------------------------------------------------
+
+/** The `kind` of the `ConversionError` `run` rejects with, or a failure if it rejects with anything else. */
+async function kindOf(run: () => Promise<unknown>): Promise<ConversionErrorKind> {
+  try {
+    await run();
+  } catch (err) {
+    assert.ok(err instanceof ConversionError, `expected ConversionError, got ${String(err)}`);
+    return err.kind;
+  }
+  assert.fail("expected a rejection, got a value");
+}
+
+/** How many ffmpeg processes `body` spawns, counted by the shim while it holds the front of PATH. */
+async function ffmpegSpawns(body: () => Promise<void>): Promise<number> {
+  writeFileSync(spawnLog, "");
+  const savedPath = process.env["PATH"] ?? "";
+  process.env["PATH"] = `${shimDir}:${savedPath}`;
+  try {
+    await body();
+  } finally {
+    process.env["PATH"] = savedPath;
+  }
+  return readFileSync(spawnLog, "utf8")
+    .split("\n")
+    .filter((line) => line !== "").length;
+}
+
+void test("a refusal says which answer it deserves without anyone reading its message", async () => {
+  // Four outcomes, four statuses, one class. Without the discriminant a handler either serves one
+  // status for all four — 500 for a caller's typo and 500 for a video that can never be sampled,
+  // retried and alerted on forever — or it matches on prose that nobody is holding still.
+  assert.equal(await kindOf(() => keyframes(mp4, { count: 0, maxBytes: 100_000 })), "invalid-argument");
+  assert.equal(await kindOf(() => imageJpeg(join(dir, "not-here.png"), { maxBytes: 1000 })), "source-missing");
+  assert.equal(
+    await kindOf(() => keyframes(mixedTs, { count: 2, maxBytes: 5 * 1024 * 1024 })),
+    "source-unsupported",
+    "an asset that is permanently unconvertible is not this machine's fault",
+  );
+  assert.equal(await kindOf(() => probeDuration(notMedia)), "internal");
+});
+
+// --- the frame header --------------------------------------------------------------------------
+
+void test("jpegSize reads the size ffmpeg actually wrote", async () => {
+  // The positive control for the two malformed headers below: every size a strip reports comes from
+  // this function, so hardening it is only worth anything if it still reads a real frame.
+  const { stdout } = await runTool("ffmpeg", frameArgv(mp4, 1), 60_000);
+  assert.deepEqual(jpegSize(stdout), { width: 320, height: 240 });
+});
+
+void test("jpegSize refuses a frame header that never declared a size", () => {
+  // A SOF0 whose own length is zero wrote no payload, so the bytes where a size would be belong to
+  // whatever follows it. Read anyway, these answer 80x60: a plausible size for a frame, taken from
+  // a segment that is not the frame's.
+  const emptySof = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x00, 0x08, 0x00, 0x3c, 0x00, 0x50]);
+  assert.throws(() => jpegSize(emptySof), /no usable JPEG frame header/);
+
+  // The same gap one step up: a length of 4 is a segment, and still stops short of the five bytes a
+  // size needs. Checking the buffer's remaining bytes rather than the segment's length misses this.
+  const shortSof = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x04, 0x08, 0x00, 0x3c, 0x00, 0x50]);
+  assert.throws(() => jpegSize(shortSof), /no usable JPEG frame header/);
+});
+
+void test("jpegSize refuses a frame that declares no pixels", () => {
+  // 0x0 is carried by every shape above this without complaint: `KeyframeStrip` would report a strip
+  // of real frames as empty, and a client holding bytes has nothing to check that number against.
+  // prettier-ignore
+  const zeroSof = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x11, 0x00]);
+  assert.throws(() => jpegSize(zeroSof), /0x0 image/);
 });
 
 // --- audio ------------------------------------------------------------------------------------
