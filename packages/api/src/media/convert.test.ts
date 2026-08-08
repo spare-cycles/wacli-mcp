@@ -8,7 +8,17 @@
 import { Jimp } from "jimp";
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -36,6 +46,8 @@ const run = promisify(execFile);
 
 const dir = mkdtempSync(join(tmpdir(), "whatsapp-conv-"));
 after(() => {
+  // A mode-000 fixture directory would otherwise defeat the removal for any non-root runner.
+  if (existsSync(deniedDir)) chmodSync(deniedDir, 0o755);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -49,12 +61,18 @@ const mixedTs = join(dir, "mixed.ts"); // 640x480 for five seconds, then 320x240
 const pdf = join(dir, "doc.pdf");
 const longPdf = join(dir, "long.pdf"); // more text than any small `maxChars`, so truncation is real
 const notMedia = join(dir, "notes.txt");
+const absent = join(dir, "gone.bin"); // never created: `stat` answers ENOENT
+const loop = join(dir, "loop.bin"); // a symlink cycle: `stat` answers ELOOP, which is not absence
+const deniedDir = join(dir, "denied");
+const denied = join(deniedDir, "photo.png"); // a real image behind an unsearchable directory
 
-// A counting wrapper for ffmpeg, put first on PATH while a test measures how many processes a call
+// Counting wrappers for the tools, put first on PATH while a test measures which processes a call
 // costs. `runTool` spawns by bare name through the environment, so this is the one place a spawn is
-// observable without stubbing the tool the rest of this file deliberately runs for real.
-const shimDir = join(dir, "ffmpeg-shim");
-const spawnLog = join(dir, "ffmpeg-spawns.log");
+// observable without stubbing the tool the rest of this file deliberately runs for real. Each shim
+// logs its own name, so one test can ask for ffmpeg alone and another for everything.
+const SPAWN_TOOLS = ["ffmpeg", "ffprobe", "pdftotext"] as const;
+const shimDir = join(dir, "tool-shims");
+const spawnLog = join(dir, "tool-spawns.log");
 
 const PDF_TEXT = "Hello media pipeline";
 const LONG_PDF_TEXT = Array.from({ length: 12 }, (_, i) => `line ${String(i)} abcdefghijklmnopqrst`).join("\n");
@@ -157,10 +175,23 @@ before(async () => {
   writeFileSync(longPdf, minimalPdf(LONG_PDF_TEXT));
   writeFileSync(notMedia, "not a media file at all\n");
 
-  const { stdout: realFfmpeg } = await run("sh", ["-c", "command -v ffmpeg"]);
+  // A symlink cycle and a file behind an unsearchable directory: two ways for `stat` to fail that
+  // are not the file being gone. `absent` is deliberately never created.
+  const loopPartner = join(dir, "loop-partner.bin");
+  symlinkSync(loopPartner, loop);
+  symlinkSync(loop, loopPartner);
+  mkdirSync(deniedDir, { recursive: true });
+  writeFileSync(denied, readFileSync(png));
+  chmodSync(deniedDir, 0o000);
+
   mkdirSync(shimDir, { recursive: true });
-  const shim = `#!/bin/sh\nprintf 'x\\n' >> "${spawnLog}"\nexec "${realFfmpeg.trim()}" "$@"\n`;
-  writeFileSync(join(shimDir, "ffmpeg"), shim, { mode: 0o755 });
+  for (const tool of SPAWN_TOOLS) {
+    // A tool this machine does not have needs no wrapper: the call fails exactly as it would have.
+    const found = await run("sh", ["-c", `command -v ${tool}`]).catch(() => undefined);
+    if (found === undefined) continue;
+    const shim = `#!/bin/sh\nprintf '${tool}\\n' >> "${spawnLog}"\nexec "${found.stdout.trim()}" "$@"\n`;
+    writeFileSync(join(shimDir, tool), shim, { mode: 0o755 });
+  }
 });
 
 // --- images -----------------------------------------------------------------------------------
@@ -483,8 +514,8 @@ async function kindOf(run: () => Promise<unknown>): Promise<ConversionErrorKind>
   assert.fail("expected a rejection, got a value");
 }
 
-/** How many ffmpeg processes `body` spawns, counted by the shim while it holds the front of PATH. */
-async function ffmpegSpawns(body: () => Promise<void>): Promise<number> {
+/** The tools `body` spawned, in the order they ran, as recorded by the shims holding PATH's front. */
+async function toolSpawns(body: () => Promise<void>): Promise<string[]> {
   writeFileSync(spawnLog, "");
   const savedPath = process.env["PATH"] ?? "";
   process.env["PATH"] = `${shimDir}:${savedPath}`;
@@ -495,7 +526,12 @@ async function ffmpegSpawns(body: () => Promise<void>): Promise<number> {
   }
   return readFileSync(spawnLog, "utf8")
     .split("\n")
-    .filter((line) => line !== "").length;
+    .filter((line) => line !== "");
+}
+
+/** How many ffmpeg processes `body` spawns — the frame extractions, ignoring probes and pdftotext. */
+async function ffmpegSpawns(body: () => Promise<void>): Promise<number> {
+  return (await toolSpawns(body)).filter((tool) => tool === "ffmpeg").length;
 }
 
 void test("a refusal says which answer it deserves without anyone reading its message", async () => {
@@ -510,6 +546,57 @@ void test("a refusal says which answer it deserves without anyone reading its me
     "an asset that is permanently unconvertible is not this machine's fault",
   );
   assert.equal(await kindOf(() => probeDuration(notMedia)), "internal");
+});
+
+void test("every conversion answers a source that is not there as the missing file it is", async () => {
+  // One cause, one answer. `imageJpeg` has always said `source-missing` here; `keyframes` reached
+  // ffprobe first and `pdfExtract` pdftotext, so both came back `internal` — a 500 for a file no
+  // retry and no parameter can bring back, which is exactly what this kind exists to prevent.
+  assert.equal(await kindOf(() => imageJpeg(absent, { maxBytes: 1000 })), "source-missing");
+  assert.equal(await kindOf(() => keyframes(absent, { count: 3, maxBytes: 100_000 })), "source-missing");
+  assert.equal(await kindOf(() => pdfExtract(absent, 100)), "source-missing");
+
+  // And it names the file rather than blaming the tool that would have opened it: "ffprobe failed
+  // (exit 1)" sends whoever reads it to check a runtime that is fine.
+  for (const conversion of [() => keyframes(absent, { count: 3, maxBytes: 100_000 }), () => pdfExtract(absent, 100)]) {
+    await assert.rejects(conversion, (err: unknown) => {
+      assert.ok(err instanceof ConversionError, `expected ConversionError, got ${String(err)}`);
+      assert.match(err.message, /ENOENT/, "the error must name what is actually wrong");
+      assert.doesNotMatch(err.message, /ffprobe|ffmpeg|pdftotext/, "and must not blame a tool for it");
+      return true;
+    });
+  }
+
+  // A failure decided by `stat` costs nothing to decide. Before the pre-checks this was one ffprobe
+  // and one pdftotext, each carrying its own timeout, spent on an answer already known.
+  const spawned = await toolSpawns(async () => {
+    await assert.rejects(() => keyframes(absent, { count: 3, maxBytes: 100_000 }));
+    await assert.rejects(() => pdfExtract(absent, 100));
+    await assert.rejects(() => imageJpeg(absent, { maxBytes: 1000 }));
+  });
+  assert.deepEqual(spawned, [], `a decided failure spent: ${spawned.join(", ")}`);
+});
+
+void test("a source this process is refused, rather than one that is gone, is this machine's fault", async () => {
+  // ENOENT is the source's condition and belongs at 404. Nothing else `stat` can say is evidence the
+  // bytes are gone: EACCES on a media directory this server owns is an ownership, umask or mount
+  // mistake, and answering it 404 hides that behind the one status nobody pages on — with the message
+  // that would have named it attached to a status the handler treats as routine.
+  assert.equal(await kindOf(() => imageJpeg(loop, { maxBytes: 1000 })), "internal");
+  assert.equal(await kindOf(() => keyframes(loop, { count: 1, maxBytes: 100_000 })), "internal");
+  assert.equal(await kindOf(() => pdfExtract(loop, 100)), "internal");
+
+  // ENOTDIR does say the path resolves to nothing, so it stays with ENOENT at 404.
+  assert.equal(await kindOf(() => pdfExtract(join(notMedia, "inner.pdf"), 100)), "source-missing");
+
+  // The errno the rule is about, wherever the OS will produce it. Root carries CAP_DAC_OVERRIDE, so a
+  // mode-000 directory does not stop the container's runner and `stat` simply succeeds; the class is
+  // pinned above either way, and this asserts the case itself on every runner that can reach it.
+  if ((process.getuid?.() ?? 0) !== 0) {
+    assert.equal(await kindOf(() => imageJpeg(denied, { maxBytes: 1000 })), "internal");
+    assert.equal(await kindOf(() => keyframes(denied, { count: 1, maxBytes: 100_000 })), "internal");
+    assert.equal(await kindOf(() => pdfExtract(denied, 100)), "internal");
+  }
 });
 
 // --- the frame header --------------------------------------------------------------------------

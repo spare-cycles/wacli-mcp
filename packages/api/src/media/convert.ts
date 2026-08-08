@@ -66,8 +66,10 @@ export type PdfExtract = { text: string; truncated: boolean };
  *
  * - `invalid-argument` — the arguments are wrong and only the caller can fix them (**400**).
  *   Decided before anything is spawned or read; the same call fails the same way every time.
- * - `source-missing` — the file to convert is not there, or cannot be read (**404**). Nobody's
- *   parameters are at fault, and nothing helps until the bytes come back.
+ * - `source-missing` — the file to convert is not there (**404**). Nobody's parameters are at fault,
+ *   and nothing helps until the bytes come back. Decided by a `stat` before anything is spawned, and
+ *   claimed only when `stat` proves absence: a path this process is merely *refused* is a deploy
+ *   fault and therefore `internal` (see `requireReadable`).
  * - `source-unsupported` — the file is there and cannot be turned into what was asked for
  *   (**415**): no duration to sample, no frame at a sample point, a resolution that changes
  *   mid-stream. Permanent, diagnosable from the message, never worth a retry.
@@ -208,14 +210,43 @@ export function runTool(bin: string, args: readonly string[], timeoutMs: number)
   });
 }
 
-/** The errno of whatever is wrong with `path` (`ENOENT`, `EACCES`, …), or undefined when it is fine. */
-async function statusOfFile(path: string): Promise<string | undefined> {
+/**
+ * Refuse a source nothing can be read from, before a single process is spawned — and say whose fault
+ * it is.
+ *
+ * A file that is simply gone is decidable by `stat`, with no message inference at all. Reaching a
+ * tool first turns it into `ffprobe failed (exit 1)` or `pdftotext failed (exit 1)` — `internal`, so
+ * **500**, for a condition no retry and no parameter can change, and exactly the one `source-missing`
+ * exists to name. A tool that *ran* and then exited non-zero stays `internal` deliberately (see
+ * `ConversionErrorKind`); this is the case that needs no exit status and no stderr read at all.
+ *
+ * Only `stat` *proving* the entry is not there earns the 404. `ENOENT` and `ENOTDIR` say the path
+ * resolves to nothing, which is the source's condition and nobody's parameters. `EACCES`/`EPERM` say
+ * the opposite — it resolved, and this process was refused it, which on a media directory this server
+ * owns is an ownership, umask or mount mistake. Answering that 404 is the taxonomy backwards: it
+ * hides a misconfiguration behind the one status nobody pages on, and hands the message that would
+ * have named it (`… could not be read (EACCES)`) to a handler that treats that status as routine.
+ * `EIO` on a failing disk, `ELOOP`, `ENAMETOOLONG` and a `stat` failure carrying no `code` at all
+ * fall the same way: none of them is evidence the bytes are gone, so none of them may claim to be.
+ * The non-disclosure argument for a blanket 404 — never confirm a file exists to someone who may not
+ * read it — does not reach here: these paths are the store's own, built from a digest the server
+ * itself issued, never a string a caller chose.
+ *
+ * All three byte-returning conversions come through here, so they cannot answer differently for the
+ * identical cause; `describe` carries each one's own account of what it was about to do with the file.
+ * `videoKeyframes` and `pdfText` deliberately do not: they are the in-process MCP's paths and their
+ * behaviour is frozen until Task 16 moves them. Note this catches only a *directory* component
+ * denying us — a mode-000 file stats fine and fails inside the tool, landing on `internal` through
+ * `toolFailure`: the same answer, by the same rule.
+ */
+async function requireReadable(path: string, describe: (errno: string) => string): Promise<void> {
   try {
     await stat(path);
-    return undefined;
   } catch (err) {
-    const code: unknown = typeof err === "object" && err !== null ? (err as { code?: unknown }).code : undefined;
-    return typeof code === "string" ? code : "unreadable";
+    const code: unknown = typeof err === "object" && err !== null && "code" in err ? err.code : undefined;
+    const errno = typeof code === "string" ? code : "unreadable";
+    const kind: ConversionErrorKind = errno === "ENOENT" || errno === "ENOTDIR" ? "source-missing" : "internal";
+    throw new ConversionError(kind, describe(errno));
   }
 }
 
@@ -250,13 +281,10 @@ async function decodeImage(source: string | Buffer): Promise<Image> {
   // Before the spawn, not after it. An unreadable path costs an ffmpeg process for a failure that is
   // already decided — and on an image without ffmpeg installed it is then reported as "ffmpeg is not
   // installed or not on PATH", which sends whoever reads it to rebuild an image that was fine.
-  const unreadable = await statusOfFile(source);
-  if (unreadable !== undefined) {
-    throw new ConversionError(
-      "source-missing",
-      `the file to decode could not be read (${unreadable}), so nothing can be made of it`,
-    );
-  }
+  await requireReadable(
+    source,
+    (errno) => `the file to decode could not be read (${errno}), so nothing can be made of it`,
+  );
 
   const { stdout } = await runTool(
     FFMPEG,
@@ -280,9 +308,10 @@ type Attempt = { frames: [Buffer, ...Buffer[]]; width: number; height: number; w
  * Encode every image at `quality`.
  *
  * `width`/`height` are the largest of each across the batch, so no frame exceeds them in either
- * dimension — and for a single image, or for a strip whose frames `fitStrip` has already proved to
- * share one size, that maximum *is* the size every buffer was made at. `worst` is the largest frame
- * in bytes, which is what the cap has to be judged against: a strip fits only when all of it fits.
+ * dimension — and for a single image, or for a strip whose frames `requireSameSize` has already
+ * proved to share one size, that maximum *is* the size every buffer was made at. `worst` is the
+ * largest frame in bytes, which is what the cap has to be judged against: a strip fits only when all
+ * of it fits.
  */
 async function encodeAll(images: readonly [Image, ...Image[]], quality: number): Promise<Attempt> {
   const [head, ...rest] = images;
@@ -597,7 +626,8 @@ async function fitStrip(
  * reason, and every frame is measured against the first one's size as it arrives, so a strip that
  * could never report one size is refused on the frame that shows it rather than after the last one.
  * The strip is then fitted to `maxBytes` as a unit, so `width`/`height` describe every frame rather
- * than only the first.
+ * than only the first. A source that is not there is refused before the probe, so it is answered as
+ * the missing file it is rather than as a tool that failed.
  */
 export async function keyframes(
   path: string,
@@ -617,6 +647,15 @@ export async function keyframes(
         `and ${String(count)} was asked for`,
     );
   }
+
+  // Also before the probe. ffprobe's own answer to a path that is not there is `exit 1` with
+  // "No such file or directory" on stderr, which arrives here as `internal` — a 500 for a file
+  // nothing can bring back, where the image path has always answered `source-missing`. One `stat`
+  // decides it for the same cost the image path already pays.
+  await requireReadable(
+    path,
+    (errno) => `the video to sample could not be read (${errno}), so no keyframes can be taken from it`,
+  );
 
   const durationSec = await probeDuration(path);
   if (durationSec === undefined) {
@@ -758,7 +797,16 @@ export function cutToChars(text: string, maxChars: number): PdfExtract {
  * `pdfText` truncates silently, which is fine for a model reading a summary into a prompt and wrong
  * for an API: a client that cannot tell a whole document from the first paragraph of one has no way
  * to know it should ask for more, and no way to say so to whoever is reading its answer.
+ *
+ * A source that is not there is refused before `pdftotext` runs, for `keyframes`' reason: poppler
+ * answers a missing path with `exit 1` and "I/O Error: Couldn't open file", which is indistinguishable
+ * here from a poppler that is not installed, and so `internal`. `pdfText` keeps going straight to the
+ * tool: its behaviour is the MCP's and is frozen.
  */
 export async function pdfExtract(path: string, maxChars: number): Promise<PdfExtract> {
+  await requireReadable(
+    path,
+    (errno) => `the document to extract text from could not be read (${errno}), so there is no text to return`,
+  );
   return cutToChars(await readPdfText(path), maxChars);
 }
