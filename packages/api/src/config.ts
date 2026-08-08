@@ -91,6 +91,17 @@ export type Config = {
    */
   sendFileDir: string | undefined;
   videoKeyframes: number; // WHATSAPP_VIDEO_KEYFRAMES, default 4, clamped [1, 16]
+  /**
+   * WHATSAPP_MEDIA_LINK_TTL, default 900, clamped [60, 86_400] — how long a signed media download
+   * link stays redeemable, in seconds.
+   *
+   * `GET /media/dl/:token` is unauthenticated by design, so this is the lifetime of an
+   * unauthenticated capability for one attachment: the ceiling is a day because a link that
+   * outlives one is a durable leak of conversation content, and the floor is a minute because a
+   * link too short-lived to survive being clicked is not a link. The value is baked into each
+   * token at mint, so lowering it never revokes one already handed out.
+   */
+  mediaLinkTtlSec: number;
   maxResultChars: number; // WHATSAPP_MCP_MAX_RESULT_CHARS, default 200_000
   sessionTtlMs: number; // fixed 30 * 60_000
   ntfy: NtfyConfig | undefined;
@@ -221,6 +232,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     maxUploadBytes: envInt(env["WHATSAPP_MAX_UPLOAD_BYTES"], 64 * 1024 * 1024, 1, 256 * 1024 * 1024),
     sendFileDir: env["WHATSAPP_SEND_FILE_DIR"] || undefined,
     videoKeyframes: envInt(env["WHATSAPP_VIDEO_KEYFRAMES"], 4, 1, 16),
+    mediaLinkTtlSec: envInt(env["WHATSAPP_MEDIA_LINK_TTL"], 900, 60, 86_400),
     maxResultChars: envInt(env["WHATSAPP_MCP_MAX_RESULT_CHARS"], 200_000, 1_000, 50_000_000),
     sessionTtlMs: 30 * 60_000,
     ntfy: parseNtfy(env),

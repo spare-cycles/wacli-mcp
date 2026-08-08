@@ -21,6 +21,15 @@ void test("defaults are applied", () => {
   assert.equal(c.ntfy, undefined);
   assert.equal(c.phoneNumber, undefined);
   assert.equal(c.maxUploadBytes, 64 * 1024 * 1024);
+  assert.equal(c.mediaLinkTtlSec, 900);
+});
+
+void test("the media link TTL is clamped: an unauthenticated capability gets neither forever nor a blink", () => {
+  const ttl = (v: string): number => loadConfig({ ...base, WHATSAPP_MEDIA_LINK_TTL: v }).mediaLinkTtlSec;
+  assert.equal(ttl("60"), 60);
+  assert.equal(ttl("5"), 60);
+  assert.equal(ttl("604800"), 86_400);
+  assert.equal(ttl("nonsense"), 900);
 });
 
 void test("path-based file sending is off unless a directory is named", () => {
