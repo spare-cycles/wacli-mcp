@@ -1,0 +1,55 @@
+# The split topology, in the shape it is meant to run.
+#
+# There is no single-container option any more, which is why this file exists rather than a line in
+# the README: two processes, one secret shared between them, and one volume that IS the WhatsApp
+# account. Lose `whatsapp-data` and you re-pair from a phone.
+#
+#   export WHATSAPP_API_TOKEN=$(openssl rand -hex 32)
+#   export WHATSAPP_MCP_TOKEN=$(openssl rand -hex 32)
+#   docker compose up -d
+#   docker compose logs -f api        # the first run prints a pairing code
+#
+# Point an MCP client at http://localhost:8081/mcp with `Authorization: Bearer $WHATSAPP_MCP_TOKEN`.
+
+services:
+  api:
+    image: ghcr.io/spare-cycles/whatsapp-mcp-api:latest
+    restart: unless-stopped
+    volumes:
+      # Unchanged path, unchanged contents: an existing deployment's volume mounts here as-is and
+      # the store migrates itself forward on boot. This is the only stateful thing in the topology.
+      - whatsapp-data:/data/whatsapp
+    environment:
+      # The bearer the MCP presents. **Unset means every /v1 route answers 401** — fail-closed, so a
+      # missing variable cannot silently expose a WhatsApp account to anything that can reach the
+      # port. `/health` stays public either way.
+      WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN:?set it - the API refuses every /v1 request without it}
+      WHATSAPP_PHONE_NUMBER: ${WHATSAPP_PHONE_NUMBER:-}
+    # Not published by default. The API is the privileged half — it holds the account, the store and
+    # the media cache — and nothing outside this network needs to reach it. Uncomment only to drive
+    # the REST surface directly, and only if you mean to.
+    # ports: ["8080:8080"]
+    expose: ["8080"]
+
+  mcp:
+    image: ghcr.io/spare-cycles/whatsapp-mcp:latest
+    restart: unless-stopped
+    depends_on:
+      api:
+        # `service_healthy`, not a bare `depends_on`: the MCP fetches `/v1/capabilities` per session
+        # and starting it against an API that is not yet listening turns the first tool call into a
+        # confusing failure instead of a wait. Both images carry a HEALTHCHECK for this.
+        condition: service_healthy
+    environment:
+      WHATSAPP_API_URL: http://api:8080
+      # The same secret as the API's, on purpose - this is the pair that authenticates MCP -> API.
+      WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN:?set it - the MCP cannot call the API without it}
+      # The bearer a *client* presents to the MCP. Unset leaves the MCP endpoint open, which is only
+      # reasonable when nothing but a local client can reach the published port.
+      WHATSAPP_MCP_TOKEN: ${WHATSAPP_MCP_TOKEN:-}
+    ports:
+      # 8081 on the host so it does not collide with the API's 8080 if that gets published too.
+      - "8081:8080"
+
+volumes:
+  whatsapp-data:

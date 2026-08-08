@@ -1,15 +1,21 @@
 name: build-image
 
-# Build and push the whatsapp-mcp container image to GHCR.
+# Build and push the two container images to GHCR.
+#
+# `whatsapp-mcp` used to be one image containing the whole server. It is now two:
+#   - ghcr.io/<repo>-api  — Baileys, the store, the media pipeline, the REST surface. Stateful.
+#   - ghcr.io/<repo>      — the MCP surface alone. Stateless.
+#
+# The MCP keeps the unsuffixed name because it is what an MCP client is configured against, and
+# renaming it would break every existing client config for no gain. The API is the new artefact, so
+# it takes the new name.
+#
 # Tags: a semver tag push (v1.2.3) -> :1.2.3 + :latest; any main push -> :main + :sha-<short>.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
-
-env:
-  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   # The same gate `ci.yml` runs, restated here rather than reached for with `workflow_call`.
@@ -25,8 +31,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       # ffmpeg for the conversion tests, poppler-utils for `pdftotext` — the suite exercises both
-      # for real rather than stubbing them, so a runner without either goes red on 2 tests that
-      # pass on any developer machine that happens to have them. The image installs both too.
+      # for real rather than stubbing them, so a runner without either goes red on tests that pass
+      # on any developer machine that happens to have them. The API image installs both too.
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg poppler-utils
       - run: pnpm test
 
@@ -36,6 +42,20 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      # Both images are published or neither is useful — the MCP is a client of the API, and a
+      # version skew between them is exactly what the SDK's CONTRACT_VERSION check exists to catch
+      # at runtime. `fail-fast: false` so a broken API image does not hide a separately broken MCP
+      # one; the two failures are independent and both are worth seeing in a single run.
+      fail-fast: false
+      matrix:
+        include:
+          - package: api
+            file: packages/api/Dockerfile
+            image: ghcr.io/${{ github.repository }}-api
+          - package: mcp
+            file: packages/mcp/Dockerfile
+            image: ghcr.io/${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +70,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
@@ -59,8 +79,18 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
+          # The workspace root, for both images. A workspace install needs the root lockfile,
+          # `pnpm-workspace.yaml` and every package manifest, so the two Dockerfiles differ by
+          # `file:` and share a context rather than each building from its own directory.
           context: .
-          # amd64 only: the whisper.cpp image the Dockerfile copies from publishes no other arch.
+          file: ${{ matrix.file }}
+          # amd64 only, and no longer for the reason this line used to give: it blamed the
+          # whisper.cpp image the Dockerfile copied from, which published no other arch and which
+          # left the project when transcription moved to a remote GPU. Nothing technical requires
+          # amd64 today — `packages/mcp` in particular is pure Node and would build anywhere.
+          # It stays because publishing a second architecture is a visible change to what consumers
+          # receive, and making it silently inside a refactor is not the place. Adding
+          # `,linux/arm64` here is now all it takes.
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

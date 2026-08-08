@@ -7,6 +7,10 @@
   "engines": {
     "node": ">=24"
   },
+  "//files": "What `pnpm deploy --prod` copies into a runtime image - see `packages/api`'s note. Without it the deploy carries `src/` into a published container.",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "whatsapp-mcp": "dist/main.js"
   },

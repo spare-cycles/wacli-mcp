@@ -7,6 +7,10 @@
   "engines": {
     "node": ">=24"
   },
+  "//files": "What `pnpm deploy --prod` copies into a runtime image. Without it the deploy carries `src/` - every `*.test.ts`, both test-scaffolding modules and the fixtures - into a published container. The SDK already declares the same thing for the same reason.",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "whatsapp-api": "dist/main.js"
   },
