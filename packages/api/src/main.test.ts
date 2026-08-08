@@ -37,8 +37,7 @@ import { setImmediate as tick } from "node:timers/promises";
 import type { Logger } from "pino";
 import type { Alerter } from "./alerts.js";
 import { openDb, type Db } from "./db/client.js";
-import type { HttpHandle } from "./http.js";
-import { installProcessHandlers, shutdown, type ProcessEvents, type ShutdownDeps } from "./main.js";
+import { installProcessHandlers, shutdown, type ProcessEvents, type ServerHandle, type ShutdownDeps } from "./main.js";
 import type { WhatsAppConnection } from "./whatsapp/connection.js";
 
 const root = mkdtempSync(join(tmpdir(), "whatsapp-main-"));
@@ -75,18 +74,18 @@ type Rig = {
 
 let seq = 0;
 
-function rig(broken: { http?: boolean; conn?: boolean } = {}): Rig {
+function rig(broken: { server?: boolean; conn?: boolean } = {}): Rig {
   const order: string[] = [];
   const exits: number[] = [];
   const { logger, entries } = captureLogger();
   seq += 1;
   const db = openDb(join(root, `shutdown-${seq}.db`));
 
-  const http: HttpHandle = {
-    port: 8080,
+  const server: ServerHandle = {
+    url: "http://127.0.0.1:8080",
     close: () => {
-      order.push("http");
-      return broken.http === true ? Promise.reject(new Error("server would not close")) : Promise.resolve();
+      order.push("server");
+      return broken.server === true ? Promise.reject(new Error("server would not close")) : Promise.resolve();
     },
   };
   const conn = {
@@ -118,7 +117,7 @@ function rig(broken: { http?: boolean; conn?: boolean } = {}): Rig {
   };
 
   return {
-    deps: { logger, http, conn, alerter, db, exit: (code) => exits.push(code) },
+    deps: { logger, server, conn, alerter, db, exit: (code) => exits.push(code) },
     order,
     exits,
     entries,
@@ -140,7 +139,7 @@ void test("shutdown stops the server, the socket and the alerts, then closes the
 
   await shutdown(r.deps, "SIGTERM");
 
-  assert.deepEqual(r.order, ["http", "conn", "alerter"], "requests stop first, the socket next");
+  assert.deepEqual(r.order, ["server", "conn", "alerter"], "requests stop first, the socket next");
   assert.ok(isClosed(r.db), "the store is closed last, and it is closed");
   assert.deepEqual(r.exits, [143], "SIGTERM exits 143");
   assert.deepEqual(
@@ -208,16 +207,16 @@ void test("a second signal does not start a second shutdown", async () => {
   p.emit("SIGTERM");
   await tick();
 
-  assert.deepEqual(r.order, ["http", "conn", "alerter"], "each step ran exactly once");
+  assert.deepEqual(r.order, ["server", "conn", "alerter"], "each step ran exactly once");
   assert.deepEqual(r.exits, [143]);
 });
 
 void test("a step that throws does not skip the ones after it", async () => {
-  const r = rig({ http: true, conn: true });
+  const r = rig({ server: true, conn: true });
 
   await shutdown(r.deps, "SIGTERM");
 
-  assert.deepEqual(r.order, ["http", "conn", "alerter"], "every later step still ran");
+  assert.deepEqual(r.order, ["server", "conn", "alerter"], "every later step still ran");
   assert.ok(isClosed(r.db), "and the store was still closed — the one step that must not be skipped");
   assert.deepEqual(r.exits, [143], "the exit code is the signal's, whatever failed on the way");
   assert.equal(r.entries.filter((e) => e.level === "warn").length, 2, "each failure is reported");

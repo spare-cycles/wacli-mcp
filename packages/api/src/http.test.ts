@@ -2,20 +2,25 @@
  * What is and is not exercised here.
  *
  * **Every test drives a real listening server with `fetch`.** The transport is the SDK's, the router
- * is Express 5's, and the only stubs are the two seams `startHttp` takes: the health payload and the
- * `McpServer` factory. So the session rules, the auth gate and the error envelopes are tested as a
- * client meets them, not as functions called directly.
+ * is Express 5's, and the only stub is the one seam `mountMcp` takes: the `McpServer` factory. So
+ * the session rules, the auth gate and the error envelopes are tested as a client meets them, not as
+ * functions called directly.
+ *
+ * **The host in this file is deliberately almost empty, and it installs no error middleware.**
+ * `mountMcp` is a guest now: production hands it the app `startRest` built, which has a terminal
+ * error handler of its own that answers the REST wire envelope. If any failure on the MCP path
+ * escaped to a terminal handler, an MCP client would get a shape this server has never spoken — so
+ * the harness here provides none, and every JSON-RPC envelope asserted below is one `mountMcp`
+ * wrote itself. `/host-probe` stands in for the routes registered ahead of the mount, which is what
+ * makes "the guest shadows nothing" checkable even at `MCP_HTTP_PATH=/`.
+ *
+ * `/health`, the listener and the terminal error middleware belong to `rest/server.ts` now and are
+ * tested there; `main.test.ts` covers the two surfaces sharing one port.
  *
  * **The token tests are the reason this file exists.** A 401 for a missing, wrong, short, long or
  * empty bearer is one assertion each, and the short/long cases are not padding: `timingSafeEqual`
  * throws on a length mismatch, so an implementation that forgets the length guard answers those two
  * with a 500 (or a dead socket), not a 401.
- *
- * **What `/health never contains a token` can and cannot prove.** The payload comes from the
- * injected `health()`, so this test cannot fail unless `startHttp` itself widens the response with
- * something from `Config` — which is exactly the regression it is there to catch. That the *real*
- * payload is a closed record with no secret in it is `buildHealth`'s property, pinned in
- * `src/mcp/health.ts` and its own tests.
  *
  * **The idle sweeper is covered by shortening the TTL, not by waiting out the real one.** The sweep
  * period is derived from `config.sessionTtlMs`, so a 50 ms TTL sweeps every 13 ms and eviction is
@@ -24,18 +29,14 @@
  */
 
 import { strict as assert } from "node:assert";
+import { once } from "node:events";
 import { test, type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import express, { type RequestHandler } from "express";
 import type { Logger } from "pino";
 import { loadConfig, type Config } from "./config.js";
-import { startHttp, type HttpHandle } from "./http.js";
-
-const HEALTH: Record<string, unknown> = {
-  ok: true,
-  connection: "connected",
-  counts: { chats: 1, messages: 2, contacts: 3 },
-};
+import { assertMcpPathIsFree, mountMcp, type McpMountHandle } from "./http.js";
 
 type Entry = { level: string; obj: Record<string, unknown>; msg: string };
 
@@ -76,7 +77,7 @@ function captureLogger(): { logger: Logger; entries: Entry[] } {
 }
 
 type Server = {
-  handle: HttpHandle;
+  handle: McpMountHandle;
   base: string;
   entries: Entry[];
   /** How many `McpServer` instances were built, and how many of those were closed again. */
@@ -85,7 +86,7 @@ type Server = {
 };
 
 /**
- * Start a server on an ephemeral port, torn down when the test ends.
+ * Mount the MCP on a throwaway host and listen on an ephemeral port, torn down when the test ends.
  *
  * `breakConnect` makes every built `McpServer` reject on `connect`, which is the only *deterministic*
  * way to drive a rejection through the initialize path from out here. `transport.handleRequest`
@@ -93,17 +94,20 @@ type Server = {
  * `getRequestListener`, which catches request, fetch and response errors alike and turns each into a
  * status code. Both failures are covered by the same `finally`, and this is the half a test can pin.
  */
-async function start(
-  t: TestContext,
-  over: Partial<Config> = {},
-  health: () => Promise<Record<string, unknown>> = () => Promise.resolve({ ...HEALTH }),
-  breakConnect = false,
-): Promise<Server> {
+async function start(t: TestContext, over: Partial<Config> = {}, breakConnect = false): Promise<Server> {
   const { logger, entries } = captureLogger();
   const builds = { n: 0 };
   const closes = { n: 0 };
   const config: Config = { ...loadConfig({}), port: 0, ...over };
-  const handle = await startHttp({
+
+  const app = express();
+  // Registered before the mount, exactly as every REST route is in production. It is what a
+  // liveness assertion asks after a failed request, and what `MCP_HTTP_PATH=/` must not swallow.
+  app.get("/host-probe", ((_req, res) => {
+    res.json({ ok: true });
+  }) satisfies RequestHandler);
+
+  const handle = mountMcp(app, {
     config,
     logger,
     buildServer: () => {
@@ -122,10 +126,23 @@ async function start(
       if (breakConnect) server.connect = () => Promise.reject(new Error("transport handshake failed"));
       return server;
     },
-    health,
   });
-  t.after(() => handle.close());
-  return { handle, base: `http://127.0.0.1:${handle.port}`, entries, builds, closes };
+
+  const listener = app.listen(0, "127.0.0.1");
+  await once(listener, "listening");
+  const address = listener.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+
+  t.after(async () => {
+    await handle.close();
+    await new Promise<void>((resolve) => {
+      listener.close(() => {
+        resolve();
+      });
+      listener.closeAllConnections();
+    });
+  });
+  return { handle, base: `http://127.0.0.1:${port}`, entries, builds, closes };
 }
 
 type RpcHeaders = { authorization?: string; "mcp-session-id"?: string };
@@ -166,77 +183,62 @@ const INITIALIZE = {
   },
 };
 
-// --- startup ------------------------------------------------------------------------------------
+// --- where the guest may mount ---------------------------------------------------------------
 
-void test("a port that is already taken rejects instead of resolving a dead handle", async (t) => {
-  const taken = await start(t);
+void test("a path the REST surface answers on is refused, and a free one is not", () => {
+  // Both directions, because each is a different production failure. `/health` would leave the MCP
+  // dead behind a route registered ahead of it; `/v1` would put it behind the REST bearer gate, so
+  // a valid WHATSAPP_MCP_TOKEN would answer 401 against a REST wire envelope.
+  for (const path of ["/health", "/v1", "/v1/chats", "/media", "/media/dl"]) {
+    assert.throws(
+      () => {
+        assertMcpPathIsFree(path);
+      },
+      /collides with the REST surface/,
+      `${path} must be refused`,
+    );
+  }
+  // The root is allowed on purpose: the mount seam runs after every REST binding, so ordering
+  // already answers it. The test below drives that.
+  for (const path of ["/mcp", "/", "", "/rpc/mcp"]) assertMcpPathIsFree(path);
+});
 
-  // The only *listen* failure that is cheap and portable to provoke. It is worth provoking: the
-  // `error` listener that catches it has to be attached before `listen` settles and taken off again
-  // after — left on, every later server error is handed to an already-resolved `reject`, which is a
-  // no-op, and the failure vanishes; never attached, the event is unhandled and takes the process
-  // down instead of rejecting the promise `main.ts` awaits.
-  await assert.rejects(
-    () => start(t, { port: taken.handle.port }),
-    (err: unknown) => {
-      assert.ok(err instanceof Error, `expected an Error, got ${String(err)}`);
-      assert.match(err.message, /EADDRINUSE/);
-      return true;
-    },
+void test("mountMcp itself refuses a colliding path, before it registers anything", () => {
+  const { logger } = captureLogger();
+  const app = express();
+  assert.throws(
+    () =>
+      mountMcp(app, {
+        config: { ...loadConfig({}), port: 0, httpPath: "/v1" },
+        logger,
+        buildServer: () => new McpServer({ name: "unused", version: "0.0.0" }),
+      }),
+    /MCP_HTTP_PATH \/v1 collides/,
   );
-
-  const still = await fetch(`${taken.base}/health`);
-  assert.equal(still.status, 200, "and the server that owns the port is untouched");
 });
 
-// --- /health ------------------------------------------------------------------------------------
-
-void test("/health is public and returns the snapshot", async (t) => {
-  const s = await start(t, { mcpToken: "secret" });
-
-  const res = await fetch(`${s.base}/health`);
-
-  assert.equal(res.status, 200);
-  const body = (await res.json()) as Record<string, unknown>;
-  assert.equal(body["ok"], true);
-  assert.deepEqual(body, HEALTH, "the route returns the health payload verbatim and adds nothing of its own");
-});
-
-void test("/health stays public even when the MCP path is mounted at the root", async (t) => {
+void test("at MCP_HTTP_PATH=/ the guest shadows nothing registered before it", async (t) => {
   const s = await start(t, { mcpToken: "secret", httpPath: "/" });
 
-  const res = await fetch(`${s.base}/health`);
+  const probe = await fetch(`${s.base}/host-probe`);
+  assert.equal(probe.status, 200, "a route registered ahead of the mount still answers, credential-free");
 
-  assert.equal(res.status, 200, "the healthcheck has no credential, whatever MCP_HTTP_PATH is set to");
   const mcp = await fetch(`${s.base}/`, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
     body: "{}",
   });
-  assert.equal(mcp.status, 401, "and the MCP path is still guarded");
+  assert.equal(mcp.status, 401, "and the MCP is still guarded at the root");
 });
 
-void test("a failing health probe is a 500 envelope, not a hung request", async (t) => {
-  const s = await start(t, { mcpToken: "secret" }, () => Promise.reject(new Error("whisper exploded")));
+void test("no token configured means the MCP path is open and a log line said so", async (t) => {
+  const s = await start(t, { mcpToken: "super-secret-value" });
 
-  const res = await fetch(`${s.base}/health`);
-
-  assert.equal(res.status, 500);
-  const body = (await res.json()) as Record<string, unknown>;
-  assert.equal((body["error"] as { code: number } | undefined)?.code, -32603);
-  assert.doesNotMatch(JSON.stringify(body), /whisper exploded/, "the envelope says nothing about internals");
-});
-
-void test("/health never contains a token", async (t) => {
-  const s = await start(t, {
-    mcpToken: "super-secret-value",
-    ntfy: { baseUrl: "https://ntfy.example/", topic: "t", infoTopic: "i", token: "ntfy-secret" },
-  });
-
-  const text = await (await fetch(`${s.base}/health`)).text();
-
-  assert.doesNotMatch(text, /super-secret-value|ntfy-secret/);
-  assert.doesNotMatch(JSON.stringify(s.entries), /super-secret-value|ntfy-secret/, "nor may a log line carry one");
+  assert.doesNotMatch(
+    JSON.stringify(s.entries),
+    /super-secret-value/,
+    "the mount line reports whether a token is set, never the token",
+  );
 });
 
 // --- bearer auth --------------------------------------------------------------------------------
@@ -322,8 +324,8 @@ void test("an unknown session id is rejected with a JSON-RPC error, not a crash"
   });
   assert.equal(get.status, 404, "a stream request for a dead session is refused the same way");
 
-  const still = await fetch(`${s.base}/health`);
-  assert.equal(still.status, 200, "and the server is still serving afterwards");
+  const still = await fetch(`${s.base}/host-probe`);
+  assert.equal(still.status, 200, "and the host's own routes are still serving afterwards");
 });
 
 void test("a full initialize handshake succeeds and returns a session id", async (t) => {
@@ -389,7 +391,7 @@ void test("an initialize the transport refuses leaks nothing", async (t) => {
 });
 
 void test("an initialize that throws leaks nothing either", async (t) => {
-  const s = await start(t, { mcpToken: "secret" }, undefined, true);
+  const s = await start(t, { mcpToken: "secret" }, true);
 
   // The same leak, down the other path. A trailing `if` after the two awaits is skipped entirely
   // when one of them rejects — which is the case where a leak is least likely to be noticed — so
@@ -400,8 +402,8 @@ void test("an initialize that throws leaks nothing either", async (t) => {
   assert.equal(s.builds.n, 1);
   assert.equal(s.closes.n, 1, "and the McpServer built for the doomed session is closed anyway");
 
-  const still = await fetch(`${s.base}/health`);
-  assert.equal(still.status, 200, "the server is still serving afterwards");
+  const still = await fetch(`${s.base}/host-probe`);
+  assert.equal(still.status, 200, "the host's own routes are still serving afterwards");
 });
 
 void test("an idle session is swept, and the sweeper holds nothing open", async (t) => {
@@ -436,7 +438,7 @@ void test("a malformed body is a 400, not a 500 and not a crash", async (t) => {
   assert.equal(body["jsonrpc"], "2.0");
   assert.ok(body["error"]);
 
-  const still = await fetch(`${s.base}/health`);
+  const still = await fetch(`${s.base}/host-probe`);
   assert.equal(still.status, 200);
 });
 

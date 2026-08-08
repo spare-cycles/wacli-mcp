@@ -1,55 +1,66 @@
 /**
- * The HTTP surface: Streamable-HTTP MCP on `config.httpPath`, a public `/health`, and nothing else.
+ * The in-process MCP surface: Streamable-HTTP on `config.httpPath`, registered on an app it does
+ * not own.
  *
  * The session handling is the retired `server.ts`'s, which ran in production and was correct, with
  * three deliberate changes:
  *
- * 1. **Express 5.** Error middleware takes four parameters and is registered last, or Express reads
- *    it as an ordinary handler and every thrown request hangs. `wrap()` survives the upgrade even
- *    though Express 5 forwards a rejected promise on its own, because it is what keeps the 500 shape
- *    ours instead of Express's HTML error page.
- * 2. **Bearer auth in front of the MCP path only.** `/health` stays public: it is what the container
- *    healthcheck polls, and a healthcheck that needs the secret is a secret in the compose file.
+ * 1. **Express 5.** `wrap()` survives the upgrade even though Express 5 forwards a rejected promise
+ *    on its own, because it is what keeps the failure shape ours instead of Express's HTML page.
+ * 2. **Bearer auth in front of the MCP path only.** `/health` is not this module's to serve, and
+ *    the gate must not reach it: it is what the container healthcheck polls, and a healthcheck that
+ *    needs the secret is a secret in the compose file.
  * 3. **No stateless mode.** One code path, sessions always (Global Constraint 15).
  *
- * Global Constraint 8 lives here more than anywhere: this module holds `WHATSAPP_MCP_TOKEN`. It is never
- * logged, never echoed in a refusal, and no log line here carries request headers — which is where a
- * caller's credential would be found. Nor does one carry a request *body*: no log line in this file
- * is ever handed a raw error object, for the reason spelled out on `errorType`.
+ * **This module is a guest, and that is the whole shape of it.** It used to create the app, serve
+ * `/health`, install a terminal error middleware and listen; Task 11 mounted the REST surface
+ * beside it on one port, and there can be exactly one of each of those. So `mountMcp` registers
+ * routes on a caller-supplied app and returns a handle that closes its sessions — no `express()`,
+ * no `/health`, no `listen`, and **no error middleware**.
  *
- * The middleware order is load-bearing, and it is `/health` → auth → `express.json` on the MCP path
- * → the MCP routes → the error middleware. Two of those placements are the whole point: `/health`
- * ahead of the gate keeps the container healthcheck credential-free even at `MCP_HTTP_PATH=/`, and
- * the parser behind the gate — mounted on the path rather than globally — is what stops an
- * anonymous `POST /anything` from having ~90 MB buffered and parsed on its behalf.
+ * Losing the error middleware changes nothing a client sees, because nothing on this path reaches
+ * one any more: the only two failures the MCP path can produce are a body the parser refused and a
+ * handler that rejected, and both are answered *in place* with the same JSON-RPC envelope the
+ * terminal handler used to write. That is not merely equivalent, it is required — the host's
+ * terminal middleware answers the REST wire envelope, and an MCP client handed one would be reading
+ * a shape no version of this server has ever spoken.
+ *
+ * `packages/mcp` is a separate process and needs the listener, the `/health` and the error
+ * middleware back. It ports them from this file's history (Task 12), not from what is left here.
+ *
+ * Global Constraint 8 lives here more than anywhere: this module holds `WHATSAPP_MCP_TOKEN`. It is
+ * never logged, never echoed in a refusal, and no log line here carries request headers — which is
+ * where a caller's credential would be found. Nor does one carry a request *body*: no log line in
+ * this file is ever handed a raw error object, for the reason spelled out on `errorType`.
+ *
+ * The middleware order within the mount is load-bearing, and it is auth → `express.json` on the MCP
+ * path → the MCP routes. The parser behind the gate — mounted on the path rather than globally — is
+ * what stops an anonymous `POST /anything` from having ~90 MB buffered and parsed on its behalf.
  */
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import type { Server as HttpServer } from "node:http";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import express, { type NextFunction, type Request, type RequestHandler, type Response } from "express";
+import express, { type Express, type Request, type RequestHandler, type Response } from "express";
 import type { Logger } from "pino";
 import type { Config } from "./config.js";
+import { REST_PATH_SEGMENTS } from "./rest/server.js";
 
-export type HttpDeps = {
+export type McpMountDeps = {
   config: Config;
   logger: Logger;
   /** A fresh `McpServer` per session. One instance per client, never a shared one. */
   buildServer: () => McpServer;
-  /**
-   * The `/health` payload. Async because transcription availability is a probe, not a field —
-   * `buildHealth` awaits `Transcriber.available()`.
-   */
-  health: () => Promise<Record<string, unknown>>;
 };
 
-export type HttpHandle = {
+export type McpMountHandle = {
+  /**
+   * Closes every live session and stops the sweeper. It does **not** stop the listener — the host
+   * owns that, and a guest that closed it would take the REST surface down with it.
+   */
   close: () => Promise<void>;
-  /** The bound port, which is what a test listening on port 0 needs. */
-  port: number;
 };
 
 type HttpSession = { transport: StreamableHTTPServerTransport; server: McpServer; lastSeenMs: number };
@@ -152,37 +163,86 @@ function errorDetail(err: unknown): { type: string; message: string; stack: stri
   return { type, message: "a non-Error value was thrown", stack: undefined };
 }
 
+/**
+ * How a failed MCP request is reported and answered, in the one place that decides it.
+ *
+ * This used to be a terminal error middleware. It is a function now because this module no longer
+ * owns the terminal slot (see the header) and the envelope it writes must not change: an MCP client
+ * handed the host's REST wire envelope would be reading a shape this server has never spoken.
+ * Every failure the MCP path can produce is routed here — a refused body from the parser trap, a
+ * rejected handler from `wrap` — and none of them is ever forwarded with `next(err)`.
+ *
+ * Neither `req.headers` (where a caller's bearer token is) nor the error object (where a caller's
+ * *body* is — see `errorType`) ever reaches a log line here.
+ */
+function fail(logger: Logger, req: Request, res: Response, err: unknown): void {
+  const status = statusOf(err);
+  if (status === 500) {
+    logger.error({ ...errorDetail(err), method: req.method, path: req.path }, "http: request failed");
+  } else {
+    logger.warn({ type: errorType(err), method: req.method, path: req.path, status }, "http: request rejected");
+  }
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  res
+    .status(status)
+    .json(
+      status === 500
+        ? jsonRpcError(RPC_INTERNAL, "Internal server error")
+        : jsonRpcError(RPC_INVALID_REQUEST, "Invalid request"),
+    );
+}
+
 /** Adapt an async handler to Express while keeping every rejection contained and the 500 shape ours. */
 function wrap(logger: Logger, fn: (req: Request, res: Response) => Promise<void>): RequestHandler {
-  return (req, res, next) => {
+  return (req, res) => {
     void fn(req, res).catch((err: unknown) => {
-      // Hand it to the error middleware when nothing has been written yet, so there is exactly one
-      // place that decides what a failed request looks like.
       if (res.headersSent) {
         logger.error({ ...errorDetail(err), method: req.method }, "http: request failed after the response started");
         res.end();
         return;
       }
-      next(err);
+      fail(logger, req, res, err);
     });
   };
 }
 
-export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
-  const { config, logger, buildServer, health } = deps;
+/** The first non-empty segment of a path, which is the granularity the host reserves paths at. */
+const rootSegment = (path: string): string => path.split("/").find((segment) => segment !== "") ?? "";
+
+/**
+ * `MCP_HTTP_PATH` against the prefixes the REST surface owns, checked before a single route is
+ * registered.
+ *
+ * Two of the three ways a guest can collide with its host are unfixable by ordering and so are
+ * refusals. `MCP_HTTP_PATH=/health` puts the MCP behind a route registered ahead of it, so the MCP
+ * is simply dead and the operator's next clue is a client that cannot initialize.
+ * `MCP_HTTP_PATH=/v1` is worse: the MCP would sit behind the REST bearer gate and its bodies would
+ * be parsed by the REST parser, so a valid `WHATSAPP_MCP_TOKEN` would answer 401 against a wire
+ * envelope. Neither is a state worth booting into.
+ *
+ * The third — `MCP_HTTP_PATH=/`, the case Task 7's boot invariant admitted it did not cover — is
+ * **allowed, because ordering already answers it.** The mount seam runs after every REST binding,
+ * open and gated alike, so `/health` and every `/v1` route match a handler that has already
+ * responded before the MCP's gate at `/` is ever reached. `assertGateReachesEveryBearerRoute` pins
+ * the half of that ordering that lives in the host; the `mountMcp` seam's position pins this half,
+ * and `http.test.ts` drives a real request at both under `MCP_HTTP_PATH=/`.
+ */
+export function assertMcpPathIsFree(httpPath: string): void {
+  const segment = rootSegment(httpPath);
+  if (segment === "") return;
+  if (Object.hasOwn(REST_PATH_SEGMENTS, segment)) {
+    throw new Error(`MCP_HTTP_PATH ${httpPath} collides with the REST surface, which answers on /${segment}`);
+  }
+}
+
+export function mountMcp(app: Express, deps: McpMountDeps): McpMountHandle {
+  const { config, logger, buildServer } = deps;
+  assertMcpPathIsFree(config.httpPath);
   const token = config.mcpToken ?? "";
   const sessions = new Map<string, HttpSession>();
-  const app = express();
-
-  // Registered before the auth middleware, and deliberately: `MCP_HTTP_PATH` is configurable, and a
-  // deployment that set it to "/" would otherwise mount the bearer gate over `/health` too — which
-  // is the endpoint the container healthcheck polls without a credential.
-  app.get(
-    "/health",
-    wrap(logger, async (_req, res) => {
-      res.json(await health());
-    }),
-  );
 
   if (token === "") {
     // Once, at boot — not per request, which would bury it. An unauthenticated MCP endpoint is a
@@ -202,11 +262,25 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
 
   // Base64 in a `whatsapp_send_file` argument is 4 bytes per 3, plus room for the rest of the envelope.
   const bodyLimitBytes = Math.ceil((config.maxUploadBytes * 4) / 3) + 1024 * 1024;
+  const parseBody = express.json({ limit: bodyLimitBytes });
   // Mounted on the MCP path, never globally, and after the gate above so the ordering still puts
   // auth in front of parsing. Global, this buffers and parses that ~90 MB for `POST /anything` —
   // from a caller who has presented no credential at all — before falling through to a 404. The
   // only requests worth spending that on are the ones already through the gate.
-  app.use(config.httpPath, express.json({ limit: bodyLimitBytes }));
+  //
+  // The refusal is caught here rather than forwarded, because a forwarded one would land in the
+  // host's terminal middleware and come back as a REST wire envelope. `express.json` calls its
+  // `next` with an error or with nothing, never with Express's `"route"`/`"router"` strings, so the
+  // two branches below are the whole vocabulary.
+  app.use(config.httpPath, ((req, res, next) => {
+    parseBody(req, res, (err: unknown) => {
+      if (err === undefined || err === null) {
+        next();
+        return;
+      }
+      fail(logger, req, res, err);
+    });
+  }) satisfies RequestHandler);
 
   // A client that stops polling never closes its stream, so `onclose` alone would leak its session
   // forever. Unref'd: a sweeper must not be the reason the process stays up.
@@ -295,69 +369,14 @@ export function startHttp(deps: HttpDeps): Promise<HttpHandle> {
   app.get(config.httpPath, handleSessionRequest);
   app.delete(config.httpPath, handleSessionRequest);
 
-  // Last, and with four parameters: Express identifies error middleware by arity alone.
-  app.use(((err: unknown, req: Request, res: Response, _next: NextFunction) => {
-    const status = statusOf(err);
-    // Neither `req.headers` (where a caller's bearer token is) nor the error object (where a
-    // caller's *body* is — see `errorType`) ever reaches a log line here.
-    if (status === 500) {
-      logger.error({ ...errorDetail(err), method: req.method, path: req.path }, "http: request failed");
-    } else {
-      logger.warn({ type: errorType(err), method: req.method, path: req.path, status }, "http: request rejected");
-    }
-    if (res.headersSent) {
-      res.end();
-      return;
-    }
-    res
-      .status(status)
-      .json(
-        status === 500
-          ? jsonRpcError(RPC_INTERNAL, "Internal server error")
-          : jsonRpcError(RPC_INVALID_REQUEST, "Invalid request"),
-      );
-  }) satisfies express.ErrorRequestHandler);
+  logger.info({ path: config.httpPath, authenticated: token !== "" }, "http: mcp mounted");
 
-  return new Promise<HttpHandle>((resolve, reject) => {
-    // Only ever a *listen* failure — EADDRINUSE, EACCES on a privileged port. It has to come off
-    // again the moment the promise settles: left on, every later server error would be handed to an
-    // already-resolved `reject`, which is a no-op, and the failure would disappear without a trace.
-    const onListenError = (err: Error): void => {
-      reject(err);
-    };
-    // **`app.listen` is called without a callback, and that is not a style choice.** Express 5.2.1
-    // wraps a callback passed here in `once()` and *also* registers it as an `error` handler
-    // (`lib/application.js:598`), so an EADDRINUSE runs the success path: the port is read off an
-    // `address()` of null, falls back to the port that could not be bound, and `startHttp` resolves a
-    // handle onto a server that is not listening — while `reject` runs afterwards against an
-    // already-settled promise and does nothing. Booting straight into "http: listening" on a port
-    // owned by another process is the failure this shape prevents; `listening` fires only on success.
-    const server: HttpServer = app.listen(config.port, "0.0.0.0");
-    server.on("error", onListenError);
-    server.once("listening", () => {
-      server.off("error", onListenError);
-      server.on("error", (err) => {
-        logger.error(errorDetail(err), "http: server error");
-      });
-      const address = server.address();
-      const port = typeof address === "object" && address !== null ? address.port : config.port;
-      logger.info({ port, path: config.httpPath, authenticated: token !== "" }, "http: listening");
-      resolve({ port, close: () => closeServer(server) });
-    });
-  });
-
-  async function closeServer(server: HttpServer): Promise<void> {
-    clearInterval(sweeper);
-    const open = [...sessions.values()];
-    sessions.clear();
-    await Promise.all(open.map(closeSession));
-    await new Promise<void>((resolve) => {
-      server.close(() => {
-        resolve();
-      });
-      // Streamable HTTP keeps connections alive; without this, close() waits for clients that have
-      // no reason to hang up.
-      server.closeAllConnections();
-    });
-  }
+  return {
+    close: async () => {
+      clearInterval(sweeper);
+      const open = [...sessions.values()];
+      sessions.clear();
+      await Promise.all(open.map(closeSession));
+    },
+  };
 }

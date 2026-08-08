@@ -20,8 +20,10 @@
  */
 
 import { pathToFileURL } from "node:url";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { WAMessageKey } from "baileys";
 import type { Logger } from "pino";
+import type { Handlers } from "whatsapp-api-sdk";
 import { makeAlerter, type Alerter } from "./alerts.js";
 import { loadConfig } from "./config.js";
 import { makeAuthStore } from "./db/auth-state.js";
@@ -31,7 +33,7 @@ import { makeContactsRepo } from "./db/contacts.js";
 import { makeMessagesRepo } from "./db/messages.js";
 import { makeMetaRepo } from "./db/meta.js";
 import { makeReactionsRepo } from "./db/reactions.js";
-import { startHttp, type HttpHandle } from "./http.js";
+import { mountMcp, type McpMountHandle } from "./http.js";
 import { logger } from "./logger.js";
 import { makeAutoTranscriber, type AutoTranscriber } from "./media/autotranscribe.js";
 import { biasTermsFor } from "./media/bias.js";
@@ -39,16 +41,78 @@ import { makeBudgetLedger } from "./media/budget.js";
 import { makeMediaStore } from "./media/store.js";
 import { makeTranscriber } from "./media/transcribe.js";
 import type { ToolContext } from "./mcp/context.js";
-import { buildHealth } from "./mcp/health.js";
 import { buildMcpServer } from "./mcp/server.js";
+import { mediaHandlers } from "./rest/handlers/media.js";
+import { metaHandlers } from "./rest/handlers/meta.js";
+import { readHandlers } from "./rest/handlers/reads.js";
+import { writeHandlers } from "./rest/handlers/writes.js";
+import { makeMediaLinkSigner } from "./rest/medialink.js";
+import { startRest, type RestDeps } from "./rest/server.js";
 import { makeConnection, type WhatsAppConnection } from "./whatsapp/connection.js";
 import { makeIngest } from "./whatsapp/ingest.js";
 import { canonicalId } from "./whatsapp/jid.js";
 import { makeSender } from "./whatsapp/send.js";
 
+/**
+ * Both surfaces, behind one listener: REST under `/v1` plus the public `/health`, and the
+ * in-process MCP at `config.httpPath`.
+ *
+ * One `http.Server`, because there is one `PORT`. The composition is `startRest`'s — it owns the
+ * app, the terminal error middleware and the socket — and `mountMcp` is handed the app through the
+ * `mount` seam, which registers it after every REST binding and before the error middleware. That
+ * position is the whole reason the seam exists; `rest/server.ts` documents both halves of it.
+ *
+ * Exported so a test can drive the real composition rather than a re-implementation of it: the
+ * failure this replaced was two `listen` calls on one port, and a test that built its own app
+ * would not have caught it.
+ */
+export type ServerHandle = {
+  /** Where the process is actually listening, which is what a test binding port 0 needs. */
+  url: string;
+  close: () => Promise<void>;
+};
+
+export async function startServer(deps: {
+  rest: RestDeps;
+  handlers: Handlers;
+  /** A fresh `McpServer` per MCP session. */
+  buildServer: () => McpServer;
+}): Promise<ServerHandle> {
+  // A holder rather than a `let`: the seam runs synchronously inside `startRest`, so the handle is
+  // always set by the time this returns, but control-flow analysis narrows a `let` assigned only
+  // inside a callback to `undefined` and the close below would need a cast to say otherwise.
+  const guest: { mcp?: McpMountHandle } = {};
+  const rest = await startRest(
+    {
+      ...deps.rest,
+      mount: (app) => {
+        guest.mcp = mountMcp(app, {
+          config: deps.rest.config,
+          logger: deps.rest.logger,
+          buildServer: deps.buildServer,
+        });
+      },
+    },
+    deps.handlers,
+  );
+
+  return {
+    url: rest.url,
+    // The listener first: sessions closed while the socket still accepts requests can be replaced
+    // by a client that reconnects during the teardown, and then the map is not empty when the
+    // process exits. `guest.mcp` is unset only if `startRest` threw before the seam, in which case
+    // there is no handle to close and no listener either.
+    close: async () => {
+      await rest.close();
+      await guest.mcp?.close();
+    },
+  };
+}
+
 export type ShutdownDeps = {
   logger: Logger;
-  http: HttpHandle;
+  /** Both surfaces and the one socket they answer on. */
+  server: ServerHandle;
   conn: WhatsAppConnection;
   alerter: Alerter;
   db: Db;
@@ -88,7 +152,7 @@ export async function shutdown(deps: ShutdownDeps, signal: StopSignal): Promise<
   const { logger: log } = deps;
   log.info({ signal }, "main: shutting down");
 
-  await step(log, "http", () => deps.http.close());
+  await step(log, "server", () => deps.server.close());
   // Before the connection, and before the database: a queued job that started after `closeDb` would
   // write a transcript into a closed handle. Dropping the queue is the right loss — every job in it
   // is still `transcript IS NULL` in the store, so the next boot's sweep picks it up.
@@ -221,14 +285,32 @@ export async function bootstrap(): Promise<void> {
     autoTranscriber,
   };
 
-  const http = await startHttp({
-    config,
-    logger,
-    buildServer: () => buildMcpServer(ctx),
-    health: () => buildHealth(ctx),
-  });
+  /**
+   * The REST surface reaches everything the in-process MCP does, plus the media-link signer, and
+   * that is deliberate rather than incidental: while both run side by side they answer from the
+   * same repositories and the same socket, which is what makes comparing them meaningful.
+   *
+   * `validateResponses` is left off. It is the handler suites' switch — on, a handler that answers
+   * a millisecond timestamp is a 500 next to the line that caused it; in production it would turn
+   * a response a consumer accepts today into a 500 nobody asked for.
+   */
+  const restDeps: RestDeps = {
+    ...ctx,
+    links: makeMediaLinkSigner({ apiToken: config.apiToken, ttlSec: config.mediaLinkTtlSec, logger }),
+  };
 
-  installProcessHandlers({ logger, http, conn, alerter, db, autoTranscriber, exit: (code) => process.exit(code) });
+  // The 24 routes of the contract, in four slices. `Handlers` is total over the route table, so a
+  // slice that stopped covering one of its routes is a compile error here rather than a 404.
+  const handlers: Handlers = {
+    ...metaHandlers(restDeps),
+    ...readHandlers(restDeps),
+    ...mediaHandlers(restDeps),
+    ...writeHandlers(restDeps),
+  };
+
+  const server = await startServer({ rest: restDeps, handlers, buildServer: () => buildMcpServer(ctx) });
+
+  installProcessHandlers({ logger, server, conn, alerter, db, autoTranscriber, exit: (code) => process.exit(code) });
 
   // Fire and forget: it proves the ntfy token and the egress work before the first real incident,
   // and it must not delay the connection if ntfy is slow or down.
@@ -246,6 +328,10 @@ export async function bootstrap(): Promise<void> {
       dataDir: config.dataDir,
       transcribeBackends: config.transcribeBackends,
       autoTranscribe: config.autoTranscribe.enabled,
+      // Both surfaces, one port: an operator reading this line should not have to infer that the
+      // MCP path and the REST prefix are served by the same listener.
+      port: config.port,
+      mcpPath: config.httpPath,
     },
     "main: started",
   );
