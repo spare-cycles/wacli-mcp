@@ -91,6 +91,24 @@ const MAX_SHRINK_PASSES = 24;
 const KEYFRAME_MARGIN = 0.05;
 
 /**
+ * The most frames one strip may be asked for.
+ *
+ * Cost is linear in `count` on two axes and nothing else bounds either. **Time:** extraction is
+ * sequential and each `extractFrame` carries its own 60 s `FFMPEG_TIMEOUT_MS`, so the per-process
+ * timeout bounds a process and not a request — 16 frames is a 16-minute worst case, an unbounded
+ * `count` is an unbounded one. **Memory:** when any frame overruns `maxBytes` the whole strip is
+ * decoded at once, and a jimp bitmap is width x height x 4 — 33.2 MB for a 4K frame, 8.3 MB for
+ * 1080p — so 16 frames is ~531 MB of 4K bitmaps resident, already as much as the NAS this deploys
+ * to should be asked for. That path is not exotic either: `extractFrame` writes at `-q:v 4`, which
+ * puts a 4K frame at 1.5-4 MB, so any `maxBytes` under that reaches it.
+ *
+ * 16 because `WHATSAPP_VIDEO_KEYFRAMES` is already clamped to `[1, 16]` in `config.ts`; a different
+ * number here would mean one surface accepting what the other refuses. A refusal rather than a
+ * clamp, because a clamp answers a request for 40 frames with 16 and no indication that it did.
+ */
+const MAX_KEYFRAMES = 16;
+
+/**
  * What an external process left behind. Named for the process and not for the tool call: `ToolResult`
  * is `src/mcp/result.ts`'s MCP content-block envelope, and `src/mcp/tools/media.ts` imports from both
  * files — two exported types of the same name and no relation is one careless auto-import away from a
@@ -207,15 +225,19 @@ async function decodeImage(source: string | Buffer): Promise<Image> {
   }
 }
 
-/** One encode of every image at one quality: the bytes, the size they were made at, and the worst. */
+/**
+ * One encode of every image at one quality: the bytes, the size none of them exceeds, and the
+ * largest of them in bytes.
+ */
 type Attempt = { frames: [Buffer, ...Buffer[]]; width: number; height: number; worst: number };
 
 /**
  * Encode every image at `quality`.
  *
- * The images share a size — a strip's frames all come out of one video through one ffmpeg
- * invocation — so the first one answers for the whole attempt. `worst` is the largest frame, which
- * is what the cap has to be judged against: a strip fits only when all of it fits.
+ * `width`/`height` are the largest of each across the batch, so no frame exceeds them in either
+ * dimension — and for a single image, or for a strip whose frames `fitStrip` has already proved to
+ * share one size, that maximum *is* the size every buffer was made at. `worst` is the largest frame
+ * in bytes, which is what the cap has to be judged against: a strip fits only when all of it fits.
  */
 async function encodeAll(images: readonly [Image, ...Image[]], quality: number): Promise<Attempt> {
   const [head, ...rest] = images;
@@ -223,7 +245,13 @@ async function encodeAll(images: readonly [Image, ...Image[]], quality: number):
   for (const img of rest) frames.push(await encodeJpeg(img, quality));
   let worst = 0;
   for (const frame of frames) worst = Math.max(worst, frame.byteLength);
-  return { frames, width: head.width, height: head.height, worst };
+  let width = 0;
+  let height = 0;
+  for (const img of images) {
+    width = Math.max(width, img.width);
+    height = Math.max(height, img.height);
+  }
+  return { frames, width, height, worst };
 }
 
 /**
@@ -235,11 +263,12 @@ async function encodeAll(images: readonly [Image, ...Image[]], quality: number):
  * would let two frames of the same video end up at different sizes, and then at most one of them
  * matches what the strip claims.
  *
- * Termination: each pass that fails the cap halves the longest edge, so `longest` strictly decreases
- * and reaches `MIN_EDGE_PX` in at most log2(longest / 320) passes, at which point the loop breaks —
- * and `MAX_SHRINK_PASSES` bounds it regardless. Images that simply cannot be squeezed under a tiny
- * cap therefore come back as the smallest attempt: a warning and an oversized result beat an
- * unbounded loop or an exception. Downscaling only ever sets one edge, so the aspect ratio holds.
+ * Termination: each pass that fails the cap brings every image whose longest edge exceeds `next`
+ * down to `next`, so the batch's largest edge strictly decreases and reaches `MIN_EDGE_PX` in at
+ * most log2(longest / 320) passes, at which point the loop breaks — and `MAX_SHRINK_PASSES` bounds
+ * it regardless. Images that simply cannot be squeezed under a tiny cap therefore come back as the
+ * smallest attempt: a warning and an oversized result beat an unbounded loop or an exception.
+ * Downscaling only ever sets one edge, so the aspect ratio holds.
  */
 async function fitToCap(images: readonly [Image, ...Image[]], maxBytes: number, log: Logger): Promise<Attempt> {
   // Seeded with the full-size, high-quality encode so "smallest so far" is never undefined.
@@ -251,10 +280,19 @@ async function fitToCap(images: readonly [Image, ...Image[]], maxBytes: number, 
     if (lower.worst <= maxBytes) return lower;
     if (lower.worst < smallest.worst) smallest = lower;
 
+    // The largest edge anywhere in the batch, not the head's: `Attempt` carries the maximum of each
+    // dimension, and max(max w, max h) is exactly max over images of max(w, h). Shrinking by the
+    // head while judging by the worst would leave a larger frame untouched for every pass.
     const longest = Math.max(lower.width, lower.height);
     if (longest <= MIN_EDGE_PX) break;
     const next = Math.max(MIN_EDGE_PX, Math.floor(longest / 2));
-    for (const img of images) img.resize(img.width >= img.height ? { w: next } : { h: next });
+    for (const img of images) {
+      // jimp's resize has no shrink-only guard (`@jimp/plugin-resize` does `w = Math.round(w) || 1`
+      // unconditionally), so an image already at or under the target would be *upscaled* — bytes
+      // spent inventing detail, the thing `imageJpeg`'s `maxEdge` goes out of its way to avoid.
+      if (Math.max(img.width, img.height) <= next) continue;
+      img.resize(img.width >= img.height ? { w: next } : { h: next });
+    }
 
     const higher = await encodeAll(images, HIGH_QUALITY);
     if (higher.worst <= maxBytes) return higher;
@@ -281,8 +319,12 @@ export async function imageBlock(path: string, maxBytes: number, log: Logger = d
  * has would upscale it, inventing detail and spending bytes to do it. It is a caller's deliberate
  * ceiling, so it is honoured below `MIN_EDGE_PX` too — that floor governs the automatic shrinking,
  * which then has nothing left to do and stops on its first pass. A `maxEdge` below one pixel, or one
- * that is not a finite number, is no ceiling at all and is ignored — the route's query schema
- * refuses those before they can reach here, and jimp would throw on a resize to zero.
+ * that is not a finite number, is no ceiling at all and is ignored. Nothing arriving from a route
+ * can be one — `MediaJpegQuery.maxEdge` is `intParam.positive()`, and `z.number().int()` refuses
+ * Infinity and NaN — and jimp would not object either way: `@jimp/plugin-resize` validates with
+ * `z.number().min(0)` and then clamps, `w = Math.round(w) || 1`, so a resize to zero silently yields
+ * a one-pixel edge rather than an error. That same clamp is why an extreme aspect ratio is safe in
+ * `fitToCap`: 4000x1 resized to `w: 320` comes back 320x1 instead of throwing on a zero height.
  */
 export async function imageJpeg(
   path: string,
@@ -370,13 +412,65 @@ export async function videoKeyframes(
 type Shot = { atSec: number; bytes: Buffer };
 
 /**
+ * The pixel size a JPEG declares in its frame header, read without decoding it.
+ *
+ * A strip has to know every frame's size before it can promise one, and learning it by decoding
+ * would cost the common path a width x height x 4 bitmap per frame — the very allocation
+ * `MAX_KEYFRAMES` exists to bound. Walking the marker segments to the SOF reaches it within a few
+ * hundred bytes of a JPEG ffmpeg wrote and allocates nothing. The input is always ffmpeg's own
+ * `-c:v mjpeg` output, so anything unreadable here is a broken toolchain and is reported as one.
+ *
+ * Termination: every branch advances `at` by at least one and the loop is bounded by the buffer.
+ */
+function jpegSize(jpeg: Buffer): Dimensions {
+  if (jpeg.byteLength < 4 || jpeg.readUInt16BE(0) !== 0xffd8) {
+    throw new ConversionError("this frame is not a JPEG, so the size of it cannot be read");
+  }
+  let at = 2;
+  while (at + 1 < jpeg.byteLength) {
+    // Segments are contiguous and each starts on 0xff; anything else means the stream is corrupt.
+    if (jpeg.readUInt8(at) !== 0xff) break;
+    const marker = jpeg.readUInt8(at + 1);
+    // A repeated 0xff is fill, not a marker: step over one byte and read the next as the marker.
+    if (marker === 0xff) {
+      at += 1;
+      continue;
+    }
+    at += 2;
+    // TEM, RST0-7, SOI and EOI stand alone: no length field follows them.
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) continue;
+    // Past the start of scan there is only entropy-coded data, and a frame header always precedes it.
+    if (marker === 0xda) break;
+    if (at + 1 >= jpeg.byteLength) break;
+    // SOF0-SOF15, minus the three unrelated markers that share the range: DHT, JPG and DAC. The
+    // payload is length(2), sample precision(1), height(2), width(2) — in that order.
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      if (at + 6 >= jpeg.byteLength) break;
+      return { width: jpeg.readUInt16BE(at + 5), height: jpeg.readUInt16BE(at + 3) };
+    }
+    const length = jpeg.readUInt16BE(at);
+    if (length < 2) break;
+    at += length;
+  }
+  throw new ConversionError("this frame carries no JPEG frame header, so the size of it cannot be read");
+}
+
+/**
  * Bring a strip inside `maxBytes` at one shared size, and answer what that size is.
  *
- * The fast path decodes exactly one frame, and only to measure it: when ffmpeg's own frames are
- * already inside the cap they are passed through untouched, as `videoKeyframes` does. The size read
- * off that one frame is the size of all of them — they came out of one video through one invocation
- * of one command. Overrunning the cap is what costs a decode per frame, because a strip can only be
- * resized as a unit if all of it is in memory at once.
+ * Every frame's size is read from its header first, because `KeyframeStrip` promises one width and
+ * one height for the whole strip and can only keep that promise if the frames agree. They normally
+ * do — one video, one command, one filter chain — but a stream that changes resolution mid-file
+ * (broadcast MPEG-TS, a concatenation of two encodes) hands each `-ss … -frames:v 1` a different
+ * size, and for that there is no honest single number: the maximum describes no frame at all and
+ * the first frame's describes only the first. So it is refused. Reporting a size that is wrong for
+ * some of the frames is the one outcome a caller cannot detect, and refusing costs a header scan
+ * per frame instead of the decode per frame that measuring honestly would take.
+ *
+ * With that settled the fast path decodes nothing: when ffmpeg's own frames are already inside the
+ * cap they are passed through untouched, as `videoKeyframes` does. Overrunning the cap is what costs
+ * a decode per frame, because a strip can only be resized as a unit if all of it is in memory at
+ * once — the resident cost `MAX_KEYFRAMES` bounds.
  */
 async function fitStrip(
   shots: readonly [Shot, ...Shot[]],
@@ -384,9 +478,20 @@ async function fitStrip(
   log: Logger,
 ): Promise<{ width: number; height: number; frames: Buffer[] }> {
   const [head, ...rest] = shots;
+  const size = jpegSize(head.bytes);
+  for (const shot of rest) {
+    const other = jpegSize(shot.bytes);
+    if (other.width !== size.width || other.height !== size.height) {
+      throw new ConversionError(
+        `this video changes resolution mid-stream (${String(size.width)}x${String(size.height)} at ` +
+          `${head.atSec.toFixed(3)}s, ${String(other.width)}x${String(other.height)} at ` +
+          `${shot.atSec.toFixed(3)}s), and a keyframe strip reports one size for every frame in it`,
+      );
+    }
+  }
+
   if (shots.every((shot) => shot.bytes.byteLength <= maxBytes)) {
-    const measured = await decodeImage(head.bytes);
-    return { width: measured.width, height: measured.height, frames: shots.map((shot) => shot.bytes) };
+    return { width: size.width, height: size.height, frames: shots.map((shot) => shot.bytes) };
   }
 
   const images: [Image, ...Image[]] = [await decodeImage(head.bytes)];
@@ -410,16 +515,29 @@ export async function keyframes(
   opts: { count: number; maxBytes: number },
   log: Logger = defaultLogger,
 ): Promise<KeyframeStrip> {
+  // Before the probe, not after it. An unusable `count` is decided entirely by the arguments, so
+  // spending an ffprobe on it buys nothing — and lets a duration failure report itself instead of
+  // the real complaint when a caller gets both wrong at once. A strip reports one width and one
+  // height, so with no frames there is nothing for them to describe; `MAX_KEYFRAMES` covers the
+  // other end, and says there why it is a refusal rather than a silent clamp.
+  const { count } = opts;
+  if (!Number.isInteger(count) || count < 1 || count > MAX_KEYFRAMES) {
+    throw new ConversionError(
+      `a keyframe strip needs a whole number of frames between 1 and ${String(MAX_KEYFRAMES)}, ` +
+        `and ${String(count)} was asked for`,
+    );
+  }
+
   const durationSec = await probeDuration(path);
   if (durationSec === undefined) {
     throw new ConversionError("could not read a duration for this video, so no keyframes can be sampled from it");
   }
 
-  const [firstAt, ...restAt] = keyframeTimestamps(durationSec, opts.count);
-  // A strip reports one width and one height; with no frames there is nothing for them to describe,
-  // so an empty request is refused rather than answered with zeroes that mean nothing.
+  const [firstAt, ...restAt] = keyframeTimestamps(durationSec, count);
+  // Unreachable: `count >= 1` above, so there is always a first sample point. The compiler cannot
+  // see that, and the tuple below needs a head it can prove is there.
   if (firstAt === undefined) {
-    throw new ConversionError("a keyframe strip needs at least one frame, and none was asked for");
+    throw new ConversionError("no sample points could be derived for this video");
   }
 
   const shots: [Shot, ...Shot[]] = [{ atSec: firstAt, bytes: await extractFrame(path, firstAt) }];
@@ -512,6 +630,27 @@ export async function pdfText(path: string, maxChars: number): Promise<string> {
 }
 
 /**
+ * `text` cut to at most `maxChars`, never through a surrogate pair.
+ *
+ * Exported for testing: reaching this boundary through a PDF fixture would take an astral character,
+ * which needs a CID font that nothing in the toolchain produces, and the rule is worth pinning
+ * directly in any case. `String.prototype.slice` counts UTF-16 code units, so a cut landing between
+ * a high and a low surrogate leaves an unpaired high surrogate behind and the client renders U+FFFD
+ * where a character used to be. Dropping the orphan costs one unit out of `maxChars`, and only on
+ * the boundaries that would otherwise be broken. `truncated` is decided before the cut, so it is
+ * right either way. `pdfText` keeps the raw slice: it is the in-process MCP's path and Task 16 has
+ * not moved it yet, so its output stays byte-for-byte what it has always been.
+ */
+export function cutToChars(text: string, maxChars: number): PdfExtract {
+  if (text.length <= maxChars) return { text, truncated: false };
+  const cap = Math.max(0, Math.floor(maxChars));
+  // A high surrogate sitting on the cut has its low partner on the far side of it.
+  const lastUnit = cap > 0 ? text.charCodeAt(cap - 1) : 0;
+  const end = lastUnit >= 0xd800 && lastUnit <= 0xdbff ? cap - 1 : cap;
+  return { text: text.slice(0, end), truncated: true };
+}
+
+/**
  * The text of a PDF, capped at `maxChars`, saying whether the cap cut anything off.
  *
  * `pdfText` truncates silently, which is fine for a model reading a summary into a prompt and wrong
@@ -519,7 +658,5 @@ export async function pdfText(path: string, maxChars: number): Promise<string> {
  * to know it should ask for more, and no way to say so to whoever is reading its answer.
  */
 export async function pdfExtract(path: string, maxChars: number): Promise<PdfExtract> {
-  const text = await readPdfText(path);
-  if (text.length <= maxChars) return { text, truncated: false };
-  return { text: text.slice(0, maxChars), truncated: true };
+  return cutToChars(await readPdfText(path), maxChars);
 }

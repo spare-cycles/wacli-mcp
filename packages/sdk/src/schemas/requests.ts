@@ -189,7 +189,12 @@ export type MediaLinkQuery = z.infer<typeof MediaLinkQuery>;
 
 /** `GET /v1/media/:chat/:id/keyframes`. Same ceiling rule as `/jpeg`. */
 export const MediaKeyframesQuery = z.object({
-  frames: intParam.positive().optional(),
+  /**
+   * 1-16. The ceiling is `MAX_KEYFRAMES` in the API's `media/convert.ts`, where the arithmetic that
+   * picks it lives; restated here so an over-large ask is a 400 rather than a request that spends
+   * minutes of ffmpeg before refusing. Same reason `limit` restates its own bound above.
+   */
+  frames: intParam.positive().max(16).optional(),
   maxBytes: intParam.positive().optional(),
 });
 

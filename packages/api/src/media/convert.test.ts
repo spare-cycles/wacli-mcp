@@ -8,7 +8,7 @@
 import { Jimp } from "jimp";
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -16,6 +16,7 @@ import { promisify } from "node:util";
 import type { Logger } from "pino";
 import {
   ConversionError,
+  cutToChars,
   imageBlock,
   imageJpeg,
   keyframes,
@@ -42,6 +43,7 @@ const hdMp4 = join(dir, "hd.mp4"); // 1280x720, 2 s, video only
 const avMp4 = join(dir, "av.mp4"); // 320x240 + a 440 Hz tone, 2 s
 const wav = join(dir, "in.wav"); // 2 s sine
 const webp = join(dir, "sticker.webp"); // the format every WhatsApp sticker arrives in
+const mixedTs = join(dir, "mixed.ts"); // 640x480 for five seconds, then 320x240 for five more
 const pdf = join(dir, "doc.pdf");
 const longPdf = join(dir, "long.pdf"); // more text than any small `maxChars`, so truncation is real
 const notMedia = join(dir, "notes.txt");
@@ -113,6 +115,19 @@ function near(actual: number, expected: number): boolean {
   return Math.abs(actual - expected) < 1e-6;
 }
 
+/** The size of the frame ffmpeg writes when it seeks to `at`, taken straight off the command line. */
+async function frameSizeAt(path: string, at: number): Promise<string> {
+  const { stdout } = await runTool("ffmpeg", frameArgv(path, at), 60_000);
+  const decoded = await Jimp.read(stdout);
+  return `${String(decoded.width)}x${String(decoded.height)}`;
+}
+
+/** `extractFrame`'s exact command line, so a test can reproduce a frame byte for byte. */
+function frameArgv(path: string, at: number): string[] {
+  // prettier-ignore
+  return ["-v", "error", "-ss", at.toFixed(3), "-i", path, "-frames:v", "1", "-q:v", "4", "-f", "image2", "-c:v", "mjpeg", "pipe:1"];
+}
+
 before(async () => {
   await run("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1280x720:duration=1", "-frames:v", "1", png]); // prettier-ignore
   await run("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10", "-t", "3", mp4]);
@@ -120,6 +135,16 @@ before(async () => {
   await run("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2", avMp4]); // prettier-ignore
   await run("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", wav]);
   await run("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=512x512:duration=1", "-frames:v", "1", "-c:v", "libwebp", webp]); // prettier-ignore
+
+  // A stream that changes resolution mid-file: two independent MPEG-TS encodes concatenated, which
+  // is what a broadcast recording or a `cat` of two segments looks like. MPEG-TS carries the frame
+  // size in the elementary stream rather than in a container header, so ffmpeg decodes both halves
+  // and `-ss … -frames:v 1` answers with a different size depending on where the seek lands.
+  const bigHalf = join(dir, "big.ts");
+  const smallHalf = join(dir, "small.ts");
+  await run("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x480:rate=10", "-t", "5", "-c:v", "mpeg2video", "-f", "mpegts", bigHalf]); // prettier-ignore
+  await run("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10", "-t", "5", "-c:v", "mpeg2video", "-output_ts_offset", "5", "-f", "mpegts", smallHalf]); // prettier-ignore
+  writeFileSync(mixedTs, Buffer.concat([readFileSync(bigHalf), readFileSync(smallHalf)]));
   writeFileSync(pdf, minimalPdf(PDF_TEXT));
   writeFileSync(longPdf, minimalPdf(LONG_PDF_TEXT));
   writeFileSync(notMedia, "not a media file at all\n");
@@ -347,6 +372,60 @@ void test("keyframes refuses a strip with no frames in it", async () => {
   await assert.rejects(() => keyframes(mp4, { count: 0, maxBytes: 100_000 }), ConversionError);
 });
 
+void test("a strip's frames arrive in the order its timestamps do", async () => {
+  // `index` and `atSec` are positional, so they stay self-consistent whatever order the bytes come
+  // back in: a permuted strip would caption every frame with another frame's timestamp and nothing
+  // in the shape would show it. Below the cap the bytes are exactly what ffmpeg wrote, so the middle
+  // frame can be re-extracted on its own and compared.
+  const { frames } = await keyframes(mp4, { count: 3, maxBytes: 5 * 1024 * 1024 });
+  const middle = frames[1];
+  assert.ok(middle !== undefined);
+  const { stdout } = await runTool("ffmpeg", frameArgv(mp4, middle.atSec), 60_000);
+  assert.ok(middle.bytes.equals(stdout), "the frame at index 1 must be the frame taken at its own timestamp");
+});
+
+void test("keyframes refuses a video that changes resolution mid-stream", async () => {
+  const durationSec = await probeDuration(mixedTs);
+  assert.ok(durationSec !== undefined, "the fixture must declare a duration");
+  const [first, last] = keyframeTimestamps(durationSec, 2);
+  assert.ok(first !== undefined && last !== undefined);
+  // The fixture is only a fixture if the two sample points really do differ. Without this the test
+  // would keep passing for the wrong reason the day ffmpeg changes how it seeks a spliced stream.
+  assert.notEqual(
+    await frameSizeAt(mixedTs, first),
+    await frameSizeAt(mixedTs, last),
+    "the fixture must hand the two sample points different frame sizes",
+  );
+
+  // A strip promises one width and one height. Neither the head's size nor the largest is true of
+  // every frame here, and a caller holding the strip has no way to tell which frames were misreported.
+  await assert.rejects(
+    () => keyframes(mixedTs, { count: 2, maxBytes: 5 * 1024 * 1024 }),
+    /changes resolution mid-stream/,
+  );
+});
+
+void test("a mixed-resolution strip is refused before anything is resized", async () => {
+  // The shrink path is the one that used to shrink by the head frame while judging by the worst:
+  // frames larger than the head were never brought down, and frames smaller than the step were
+  // upscaled. It is now unreachable for a mixed strip, which is refused on the way in.
+  await assert.rejects(() => keyframes(mixedTs, { count: 2, maxBytes: 4_000 }), /changes resolution mid-stream/);
+});
+
+void test("keyframes refuses a frame count whose cost it cannot bound", async () => {
+  // Cost is linear in `count` on two axes and nothing else bounds either: one 60 s ffmpeg timeout
+  // per frame, and every frame decoded at once when the cap bites. Seventeen frames is refused
+  // outright rather than answered seventeen minutes later.
+  await assert.rejects(() => keyframes(mp4, { count: 17, maxBytes: 5 * 1024 * 1024 }), /between 1 and 16/);
+  await assert.rejects(() => keyframes(mp4, { count: 2.5, maxBytes: 5 * 1024 * 1024 }), /between 1 and 16/);
+});
+
+void test("keyframes refuses an unusable frame count before it spends a process", async () => {
+  // `notMedia` has no duration, so a probe that ran first would report *that* — hiding the mistake
+  // the arguments alone had already settled.
+  await assert.rejects(() => keyframes(notMedia, { count: 0, maxBytes: 100_000 }), /between 1 and 16/);
+});
+
 // --- audio ------------------------------------------------------------------------------------
 
 void test("toOpus16k produces a mono Opus stream far smaller than its input", async () => {
@@ -438,6 +517,22 @@ void test("pdfText names the missing tool when pdftotext is not installed", asyn
 
 void test("pdfText refuses a file that is not a PDF", async () => {
   await assert.rejects(() => pdfText(notMedia, 10_000), ConversionError);
+});
+
+void test("cutToChars never leaves half of a character behind", () => {
+  // An astral character is two UTF-16 units and `slice` counts units, so a cap landing between them
+  // returns an unpaired high surrogate that a client renders as U+FFFD. Reaching this through a PDF
+  // would take a CID font; the rule is pinned here instead, where it lives.
+  const text = `${"a".repeat(9)}\u{1F600}tail`;
+
+  const onThePair = cutToChars(text, 10);
+  assert.equal(onThePair.truncated, true);
+  assert.equal(onThePair.text, "a".repeat(9), "the orphaned half of the emoji must be dropped");
+  assert.ok(!/[\uD800-\uDBFF]$/.test(onThePair.text), "the text must not end on a lone high surrogate");
+
+  // A cap on the far side of the pair keeps it whole, and one the text fits inside cuts nothing.
+  assert.equal(cutToChars(text, 11).text, `${"a".repeat(9)}\u{1F600}`);
+  assert.deepEqual(cutToChars("short", 10), { text: "short", truncated: false });
 });
 
 void test("pdfExtract reports truncation rather than hiding it", async () => {
