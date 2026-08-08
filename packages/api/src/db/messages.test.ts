@@ -6,7 +6,13 @@ import { after, test } from "node:test";
 import { makeChatsRepo } from "./chats.js";
 import { openDb, type Db } from "./client.js";
 import { makeContactsRepo } from "./contacts.js";
-import { makeMessagesRepo, TRANSCRIPT_COLUMNS, type MessageInput, type TranscriptInput } from "./messages.js";
+import {
+  makeMessagesRepo,
+  TRANSCRIPT_FIELDS,
+  transcriptSetClause,
+  type MessageInput,
+  type TranscriptInput,
+} from "./messages.js";
 
 const dir = mkdtempSync(join(tmpdir(), "whatsapp-msg-"));
 after(() => {
@@ -35,17 +41,18 @@ const msg = (over: Partial<MessageInput> = {}): MessageInput => ({
 });
 
 /**
- * The fields of a transcript, read off the map the repository generates its SQL from.
+ * The fields of a transcript, read off the map the repository generates its SQL and its row
+ * mapping from.
  *
  * Everything below that walks this list covers a field nobody has invented yet: adding one to
- * `TranscriptInput` will not compile until it has a column here, and from that moment these tests
- * demand that it reach the database and that a revoked row lose it.
+ * `TranscriptInput` will not compile until it has an entry here, and from that moment these tests
+ * demand that it reach the database, that a revoked row lose it, and that a reader get it back.
  */
-const transcriptFields = Object.keys(TRANSCRIPT_COLUMNS) as (keyof TranscriptInput)[];
+const transcriptFields = Object.keys(TRANSCRIPT_FIELDS) as (keyof TranscriptInput)[];
 
 /** The transcript columns of one row, straight from SQLite — no repository mapping in between. */
 function transcriptColumns(db: Db, id: string): Record<string, unknown> {
-  const cols = transcriptFields.map((f) => TRANSCRIPT_COLUMNS[f]).join(", ");
+  const cols = transcriptFields.map((f) => TRANSCRIPT_FIELDS[f].column).join(", ");
   return db.prepare(`SELECT ${cols} FROM messages WHERE chat_id = 'c' AND id = ?`).get(id) as Record<string, unknown>;
 }
 
@@ -239,7 +246,7 @@ void test("a transcript's language survives a round trip", () => {
 
 void test("every field a transcript carries reaches a column of its own", () => {
   // The three assertions above name today's fields; this one names none of them. It walks
-  // `TRANSCRIPT_COLUMNS`, which is the map `setTranscript`'s UPDATE is generated from and which the
+  // `TRANSCRIPT_FIELDS`, which is the map `setTranscript`'s UPDATE is generated from and which the
   // compiler will not let anyone leave a `TranscriptInput` field out of — so the field added next
   // year is covered here the day it appears, without anyone remembering to come back. That is the
   // whole point: `language` existed on `Transcript` for as long as it did precisely because no
@@ -251,12 +258,52 @@ void test("every field a transcript carries reaches a column of its own", () => 
   const sent = Object.fromEntries(transcriptFields.map((f) => [f, `spoken-${f}`])) as TranscriptInput;
   s.messages.setTranscript("c", "V1", sent);
 
-  // Read raw: `toMessageRow` is the other half of the plumbing, and a test that went through it
-  // could not tell a column that was never written from one that was never mapped back out.
+  // Read raw: this half is about the write, and going through `toMessageRow` could not tell a
+  // column that was never written from one that was never mapped back out. The test below is the
+  // one that covers the mapping.
   const row = transcriptColumns(s.db, "V1");
   for (const field of transcriptFields) {
-    assert.equal(row[TRANSCRIPT_COLUMNS[field]], sent[field], `${field} must land in ${TRANSCRIPT_COLUMNS[field]}`);
+    const { column } = TRANSCRIPT_FIELDS[field];
+    assert.equal(row[column], sent[field], `${field} must land in ${column}`);
   }
+});
+
+void test("every column a transcript occupies comes back out on the row", () => {
+  // The mirror of the test above, and the half that used to be open: `SELECT_COLUMNS`,
+  // `MessageRowRaw` and `toMessageRow` were hand-written and bound to nothing, so a field with a
+  // map entry and a column of its own was stored correctly, tombstoned correctly, and reached
+  // `MessageRow` not at all — no compile error, no runtime error, the same silence as V3's bug
+  // with the two ends swapped. All three are generated from `TRANSCRIPT_FIELDS` now, and this
+  // walks it to say so for the fields nobody has invented yet.
+  const s = store();
+  s.messages.upsert(msg({ id: "V1", kind: "audio", text: undefined }));
+  const sent = Object.fromEntries(transcriptFields.map((f) => [f, `spoken-${f}`])) as TranscriptInput;
+  s.messages.setTranscript("c", "V1", sent);
+
+  const got = s.messages.get("c", "V1") as unknown as Record<string, unknown>;
+  for (const field of transcriptFields) {
+    const { row } = TRANSCRIPT_FIELDS[field];
+    assert.equal(got[row], sent[field], `${field} must be readable as ${row}`);
+  }
+  // Through `list` and `search` too: each builds its own column list, and one of them lagging is
+  // exactly the kind of drift a single map exists to prevent.
+  const listed = s.messages.list({ chatId: "c" }, 10, 0)[0] as unknown as Record<string, unknown>;
+  const found = s.messages.search("spoken-text", {}, 10, 0)[0] as unknown as Record<string, unknown>;
+  for (const field of transcriptFields) {
+    const { row } = TRANSCRIPT_FIELDS[field];
+    assert.equal(listed[row], sent[field], `list must carry ${row}`);
+    assert.equal(found[row], sent[field], `search must carry ${row}`);
+  }
+});
+
+void test("a transcript's parameters cannot reach the row the UPDATE addresses", () => {
+  // `setTranscript` binds the transcript and the row selector in one parameter object. A future
+  // field named `id` maps to a column, generates a valid `SET`, and would silently overwrite the
+  // `:id` the WHERE reads — updating the wrong row or none, with nothing to report. The prefix is
+  // what rules that out, so the hostile map is the only honest way to state it.
+  const clause = transcriptSetClause({ id: { column: "transcript_id" }, chatId: { column: "transcript_chat" } });
+  assert.equal(clause, "transcript_id = :t_id, transcript_chat = :t_chatId");
+  assert.doesNotMatch(clause, /:(id|chatId)\b/, "no transcript field may bind the row selector's name");
 });
 
 void test("revoking a message clears every transcript column, provenance included", () => {
@@ -270,9 +317,20 @@ void test("revoking a message clears every transcript column, provenance include
 
   const row = transcriptColumns(s.db, "V1");
   for (const field of transcriptFields) {
-    assert.equal(row[TRANSCRIPT_COLUMNS[field]], null, `${TRANSCRIPT_COLUMNS[field]} must not outlive the transcript`);
+    const { column } = TRANSCRIPT_FIELDS[field];
+    assert.equal(row[column], null, `${column} must not outlive the transcript`);
   }
   assert.equal(s.messages.get("c", "V1")?.deletedTs, 5000, "and the row itself stays, tombstoned");
+  // The column being NULL and the index having forgotten it are two facts, and `messages_fts` is
+  // external-content: it is not rebuilt from the table, it is maintained by a trigger, it reports
+  // nothing when that trigger misses, and it never self-heals. The assertion above reads the
+  // column directly and would pass with a stale index still answering "bonjour"; this is the
+  // one that says revoked speech is unfindable, which is the property a revoke actually promises.
+  assert.equal(
+    s.messages.search("bonjour", { includeDeleted: true }, 10, 0).length,
+    0,
+    "the revoked speech must leave the index",
+  );
 });
 
 void test("a backend that could not name a language stores NULL rather than a guess", () => {

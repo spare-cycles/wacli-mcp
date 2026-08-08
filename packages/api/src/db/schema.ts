@@ -2,7 +2,7 @@ import type { Db } from "./client.js";
 
 export type Migration = { version: number; sql: string };
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 const V1_SQL = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -139,10 +139,33 @@ const V3_SQL = `
 ALTER TABLE messages ADD COLUMN transcript_language TEXT;
 `;
 
+/**
+ * The provenance of transcripts that were revoked before the store agreed it should go.
+ *
+ * `markDeleted` clears every transcript column, on the ground that a row answering
+ * `{ text: null, model: "voxtral", language: "fr" }` describes a transcript that no longer exists
+ * and the `as=transcript` view would report it that way. That became true only for revocations
+ * made from that commit onward: `transcript_model` survived a revoke for the whole of V2 and V3,
+ * so the store still holds rows in exactly the state the repository now says must not occur. A
+ * principle asserted in code and contradicted by the data is worse than either alone — it will be
+ * read as a guarantee by the first consumer built on it.
+ *
+ * Only the tombstones are touched. `transcript` and `text` on those rows are already NULL (that is
+ * what `deleted_ts IS NOT NULL` bought them), so the `messages_au` trigger fires on a row with no
+ * indexed content in either direction: its delete-then-insert pair contributes no tokens, and the
+ * FTS index comes out of this migration byte-identical.
+ */
+const V4_SQL = `
+UPDATE messages
+   SET transcript_model = NULL, transcript_language = NULL
+ WHERE deleted_ts IS NOT NULL;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, sql: V1_SQL },
   { version: 2, sql: V2_SQL },
   { version: 3, sql: V3_SQL },
+  { version: 4, sql: V4_SQL },
 ];
 
 /** The `meta` table itself is created by migration 1, so its absence means version 0. */

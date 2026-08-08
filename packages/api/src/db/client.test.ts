@@ -127,6 +127,18 @@ function storeAt(name: string, upTo: number): string {
     "audio",
     "un vieux transcript whisper",
   );
+  // From V2 on, provenance exists to be recorded: `OLD` is a live transcript that has some, and
+  // `REVOKED` is a row tombstoned while `markDeleted` still left it behind — the state V4 clears.
+  // A V1 store has no `transcript_model` column to hold either. The tombstone's `transcript` and
+  // `text` are NULL, as a tombstone's always are, so it contributes nothing to the index.
+  if (upTo >= 2) {
+    db.prepare(
+      `INSERT INTO messages (chat_id, id, sender_id, ts, from_me, kind, transcript_model, deleted_ts)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run("c", "REVOKED", "s", 2, 0, "audio", "whisper.cpp", 99);
+    db.exec("UPDATE messages SET transcript_model = 'whisper.cpp' WHERE id = 'OLD'");
+    if (upTo >= 3) db.exec("UPDATE messages SET transcript_language = 'fr' WHERE id = 'REVOKED'");
+  }
   db.close();
   return path;
 }
@@ -207,6 +219,41 @@ void test("a transcript written after the V3 migration still reaches the FTS ind
   // And the superseded text left the index rather than lingering as a phantom hit, which is the
   // half of the UPDATE trigger a plain "can I find the new words?" check would not notice losing.
   assert.equal(db.prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?").all("whisper").length, 0);
+  closeDb(db);
+});
+
+void test("V4 strips the provenance from tombstones revoked before it existed", () => {
+  // `markDeleted` clears every transcript column, and the repository's comment says why: a row
+  // answering `{ text: null, model: "voxtral", language: "fr" }` describes a transcript that no
+  // longer exists. Every row revoked under V2 or V3 was left in exactly that state, so without
+  // this migration the code asserts a principle its own data breaks, and the first consumer of
+  // `as=transcript` reads the breakage rather than the principle.
+  const db = openDb(storeAt("v4-backfill", 3));
+  const revoked = db.prepare("SELECT transcript_model, transcript_language FROM messages WHERE id='REVOKED'").get() as {
+    transcript_model: string | null;
+    transcript_language: string | null;
+  };
+  assert.equal(revoked.transcript_model, null);
+  assert.equal(revoked.transcript_language, null);
+  // Only the tombstones. A live transcript's provenance is the whole point of V2 and is not the
+  // migration's to throw away — a back-fill that took it would be a worse bug than the one it fixes.
+  const live = db.prepare("SELECT transcript, transcript_model FROM messages WHERE id='OLD'").get() as {
+    transcript: string;
+    transcript_model: string | null;
+  };
+  assert.equal(live.transcript, "un vieux transcript whisper");
+  assert.equal(live.transcript_model, "whisper.cpp");
+  closeDb(db);
+});
+
+void test("the V4 back-fill leaves the FTS index intact", () => {
+  // The UPDATE fires `messages_au` on every tombstone. Those rows have NULL `text` and NULL
+  // `transcript`, so the trigger's delete-then-insert pair contributes no tokens either way — but
+  // an external-content index reports nothing when that reasoning is wrong, so it is checked
+  // rather than argued: the live row is still findable, and FTS5 says it is internally consistent.
+  const db = openDb(storeAt("v4-fts", 3));
+  assert.equal(db.prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?").all("whisper").length, 1);
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')");
   closeDb(db);
 });
 

@@ -20,6 +20,65 @@ export const MESSAGE_KINDS = [
 
 export type MessageKind = (typeof MESSAGE_KINDS)[number];
 
+/**
+ * What `setTranscript` persists — and, aliased as `Transcript` in `media/transcribe.ts`, what the
+ * transcribers produce. One declaration, so the two cannot drift apart.
+ *
+ * It lives *here*, in the layer that stores it, rather than in the layer that produces it, because
+ * `db` sits below `media` and nothing in `db` may depend on a transcriber. To be exact about the
+ * cost of the alternative: an import the other way would not actually close a module cycle today
+ * (`media/transcribe.ts` reaches `db/meta.ts` → `db/client.ts` → `db/schema.ts` through
+ * `media/budget.ts`, none of which import this file), and no lint rule forbids one. It is the
+ * layering that rules it out, not the module graph.
+ */
+export type TranscriptInput = { text: string; model: string; language: string | null };
+
+/**
+ * Every field of a transcript: the column that stores it, and the `MessageRow` property that
+ * surfaces it.
+ *
+ * This is a mechanism, not a note. Both directions are generated from it — the write
+ * (`setTranscript`'s `SET` list, `markDeleted`'s `= NULL` list) and the read (`SELECT_COLUMNS`,
+ * `MessageRowRaw`, `MessageRow`, `toMessageRow`) — so a field added to `TranscriptInput` is a
+ * compile error here until it is given a column and a property, and from that moment it is
+ * written, tombstoned, selected and returned without anyone editing SQL or a row mapping.
+ *
+ * Nothing weaker closes either end. On the write side the object form of `setTranscript` reads as
+ * though it would, but both production callers pass a `Transcript` *variable* — excess property
+ * checking never applies — so a new field would compile, be accepted, and be dropped at the SQL
+ * layer without a word: the exact bug schema V3 exists to fix. On the read side a hand-written
+ * `SELECT` and a hand-written `toMessageRow` fail in mirror image — the value stored correctly and
+ * surfaced to nobody — and there is no compiler error there either. Half a map would have left the
+ * second of those wide open.
+ *
+ * `row` earns its place beside `column` because the three namings genuinely differ: the field a
+ * transcriber calls `text` is the column `transcript`, while `model` is `transcript_model` and
+ * `transcriptModel`. Any one of them could be derived from another; all three could not.
+ */
+export const TRANSCRIPT_FIELDS = {
+  text: { column: "transcript", row: "transcript" },
+  /** Which model produced the text. NULL means the whisper.cpp era, before schema V2. */
+  model: { column: "transcript_model", row: "transcriptModel" },
+  /**
+   * The language the text was spoken in, as the backend reported it. NULL for a row stored before
+   * schema V3, and equally for a backend that named no language — the two are not worth telling
+   * apart, because neither is a language anything may act on.
+   */
+  language: { column: "transcript_language", row: "transcriptLanguage" },
+} as const satisfies Record<keyof TranscriptInput, { column: string; row: string }>;
+
+const TRANSCRIPT_FIELD_NAMES = Object.keys(TRANSCRIPT_FIELDS) as (keyof TranscriptInput)[];
+
+/** The transcript half of a raw row: every mapped column, nullable — most messages carry no speech. */
+type TranscriptColumns = {
+  [F in keyof TranscriptInput as (typeof TRANSCRIPT_FIELDS)[F]["column"]]: TranscriptInput[F] | null;
+};
+
+/** The same fields under the names a reader of `MessageRow` sees. */
+type TranscriptRowFields = {
+  [F in keyof TranscriptInput as (typeof TRANSCRIPT_FIELDS)[F]["row"]]: TranscriptInput[F] | null;
+};
+
 export type MessageRow = {
   rowid: number;
   chatId: string;
@@ -29,7 +88,6 @@ export type MessageRow = {
   fromMe: boolean;
   kind: MessageKind;
   text: string | null;
-  transcript: string | null;
   quotedId: string | null;
   status: string | null;
   editedTs: number | null;
@@ -45,16 +103,7 @@ export type MessageRow = {
   ptt: boolean | null;
   /** Declared seconds, from the envelope — so a length gate can run before the file is downloaded. */
   durationS: number | null;
-  /** Which model produced `transcript`. NULL means the whisper.cpp era, before schema V2. */
-  transcriptModel: string | null;
-  /**
-   * The language `transcript` was spoken in, as the backend reported it.
-   *
-   * NULL for a row stored before schema V3, and equally for a backend that named no language — the
-   * two are not worth telling apart, because neither is a language anything may act on.
-   */
-  transcriptLanguage: string | null;
-};
+} & TranscriptRowFields;
 
 export type MessageInput = {
   chatId: string;
@@ -110,38 +159,27 @@ export type MessageListFilter = MessageFilter & {
 export type SearchHit = MessageRow & { matchedTranscript: boolean; snippet: string };
 
 /**
- * What `setTranscript` persists — and, aliased as `Transcript` in `media/transcribe.ts`, what the
- * transcribers produce. One declaration, so the two cannot drift apart.
+ * The parameter namespace every transcript binding lives in.
  *
- * It lives *here*, in the layer that stores it, rather than in the layer that produces it, because
- * `db` sits below `media` and nothing in `db` may depend on a transcriber. To be exact about the
- * cost of the alternative: an import the other way would not actually close a module cycle today
- * (`media/transcribe.ts` reaches `db/meta.ts` → `db/client.ts` → `db/schema.ts` through
- * `media/budget.ts`, none of which import this file), and no lint rule forbids one. It is the
- * layering that rules it out, not the module graph.
+ * The UPDATE these clauses go into addresses its row with `:chatId` and `:id`, bound in the same
+ * parameter object. A future transcript field named `id` would otherwise generate `id = :id` and
+ * replace the row selector with the transcript's own value — a valid statement that updates the
+ * wrong row or none, with nothing to report from SQLite and nothing from the compiler. It is the
+ * one arrangement the map alone does not rule out; the prefix rules it out for free.
  */
-export type TranscriptInput = { text: string; model: string; language: string | null };
+const TRANSCRIPT_PARAM_PREFIX = "t_";
 
-/**
- * Every field of a transcript, and the column that holds it.
- *
- * This is a mechanism, not a note: both statements below are generated from it, so a field added
- * to `TranscriptInput` is a compile error here until it is given a column, and the moment it has
- * one it is written and tombstoned like the rest. Nothing else enforces that. The object form of
- * `setTranscript` reads as though it would, but both production callers pass a `Transcript`
- * *variable* — excess-property checking never applies — so a new field would compile, be accepted,
- * and be dropped at the SQL layer without a word. Which is the exact bug schema V3 exists to fix.
- */
-export const TRANSCRIPT_COLUMNS = {
-  text: "transcript",
-  model: "transcript_model",
-  language: "transcript_language",
-} as const satisfies Record<keyof TranscriptInput, string>;
+/** `transcript = :t_text, transcript_model = :t_model, …`. Takes the map rather than closing over
+ *  it, so the namespacing above can be tested against a hostile one; only `TRANSCRIPT_FIELDS` is
+ *  ever passed in production. */
+export function transcriptSetClause(bindings: Record<string, { column: string }>): string {
+  return Object.entries(bindings)
+    .map(([field, { column }]) => `${column} = :${TRANSCRIPT_PARAM_PREFIX}${field}`)
+    .join(", ");
+}
 
-const TRANSCRIPT_FIELDS = Object.keys(TRANSCRIPT_COLUMNS) as (keyof TranscriptInput)[];
-/** `transcript = :text, transcript_model = :model, …` — the parameter is named for the field. */
-const TRANSCRIPT_SET_CLAUSE = TRANSCRIPT_FIELDS.map((f) => `${TRANSCRIPT_COLUMNS[f]} = :${f}`).join(", ");
-const TRANSCRIPT_CLEAR_CLAUSE = TRANSCRIPT_FIELDS.map((f) => `${TRANSCRIPT_COLUMNS[f]} = NULL`).join(", ");
+const TRANSCRIPT_SET_CLAUSE = transcriptSetClause(TRANSCRIPT_FIELDS);
+const TRANSCRIPT_CLEAR_CLAUSE = TRANSCRIPT_FIELD_NAMES.map((f) => `${TRANSCRIPT_FIELDS[f].column} = NULL`).join(", ");
 
 export type MessagesRepo = {
   /** Returns true when the row was newly inserted, false when it updated an existing one.
@@ -160,6 +198,9 @@ export type MessagesRepo = {
    * `{ text: null, model: "voxtral", language: "fr" }` describes a transcript that no longer
    * exists, and the `as=transcript` view being built on these columns would report it that way.
    * `transcript_model` had been left behind since V2; V3 would have added a second such residue.
+   * Rows revoked before that was fixed are not left disagreeing with this: schema V4 clears the
+   * same columns on every tombstone already in the store, so the state described above does not
+   * exist for old rows either.
    */
   markDeleted: (chatId: string, id: string, ts: number) => void;
   setStatus: (chatId: string, id: string, status: string) => void;
@@ -169,7 +210,7 @@ export type MessagesRepo = {
    * Taken as one object rather than as loose arguments because that is exactly what a transcriber
    * returns (`Transcript` in `media/transcribe.ts` is this very type): a caller passes what it was
    * given instead of unpacking it. What stops a field of that object from being quietly left out
-   * of the write is not the object form — it is `TRANSCRIPT_COLUMNS`, from which this statement is
+   * of the write is not the object form — it is `TRANSCRIPT_FIELDS`, from which this statement is
    * generated.
    *
    * `model` is not optional. Making it so would let a caller store a transcript with no provenance,
@@ -218,7 +259,6 @@ type MessageRowRaw = {
   from_me: number;
   kind: string;
   text: string | null;
-  transcript: string | null;
   quoted_id: string | null;
   status: string | null;
   edited_ts: number | null;
@@ -227,11 +267,26 @@ type MessageRowRaw = {
   media_sha: string | null;
   ptt: number | null;
   duration_s: number | null;
-  transcript_model: string | null;
-  transcript_language: string | null;
-};
+} & TranscriptColumns;
 
 type SearchRowRaw = MessageRowRaw & { snip_text: string | null; snip_transcript: string | null };
+
+/**
+ * The transcript half of a row, keyed the way `MessageRow` keys it.
+ *
+ * Read off the same map the `SELECT` was generated from, so a column that is stored cannot fail to
+ * be surfaced. Written out by hand, this is where a mapped-and-migrated field would go missing
+ * without a word.
+ */
+function transcriptOf(raw: TranscriptColumns): TranscriptRowFields {
+  const fields: Record<string, string | null> = {};
+  for (const field of TRANSCRIPT_FIELD_NAMES) {
+    fields[TRANSCRIPT_FIELDS[field].row] = raw[TRANSCRIPT_FIELDS[field].column];
+  }
+  // The loop cannot show the compiler that it filled every key of the type it returns. What makes
+  // that true is that the type is generated from the very map the loop walks.
+  return fields as TranscriptRowFields;
+}
 
 function toMessageRow(raw: MessageRowRaw): MessageRow {
   return {
@@ -243,7 +298,6 @@ function toMessageRow(raw: MessageRowRaw): MessageRow {
     fromMe: raw.from_me !== 0,
     kind: raw.kind as MessageKind,
     text: raw.text,
-    transcript: raw.transcript,
     quotedId: raw.quoted_id,
     status: raw.status,
     editedTs: raw.edited_ts,
@@ -255,8 +309,7 @@ function toMessageRow(raw: MessageRowRaw): MessageRow {
     // differently — an unknown row is left alone rather than transcribed on a guess.
     ptt: raw.ptt === null ? null : raw.ptt !== 0,
     durationS: raw.duration_s,
-    transcriptModel: raw.transcript_model,
-    transcriptLanguage: raw.transcript_language,
+    ...transcriptOf(raw),
   };
 }
 
@@ -305,16 +358,21 @@ function quoteFtsQuery(query: string): string {
   return `"${query.replace(/"/g, '""')}"`;
 }
 
+/**
+ * The transcript columns are interpolated from `TRANSCRIPT_FIELDS` rather than listed, for the same
+ * reason the `SET` clause is: a hand-written list is how a column the repository stores correctly
+ * reaches no reader — V3's bug in mirror image, and just as quiet.
+ */
 const SELECT_COLUMNS = `
-  rowid, chat_id, id, sender_id, ts, from_me, kind, text, transcript,
+  rowid, chat_id, id, sender_id, ts, from_me, kind, text,
   quoted_id, status, edited_ts, deleted_ts, media_type, media_sha,
-  ptt, duration_s, transcript_model, transcript_language
+  ptt, duration_s, ${TRANSCRIPT_FIELD_NAMES.map((f) => TRANSCRIPT_FIELDS[f].column).join(", ")}
 `;
 
 const SEARCH_COLUMNS = `
-  m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text, m.transcript,
+  m.rowid, m.chat_id, m.id, m.sender_id, m.ts, m.from_me, m.kind, m.text,
   m.quoted_id, m.status, m.edited_ts, m.deleted_ts, m.media_type, m.media_sha,
-  m.ptt, m.duration_s, m.transcript_model, m.transcript_language,
+  m.ptt, m.duration_s, ${TRANSCRIPT_FIELD_NAMES.map((f) => `m.${TRANSCRIPT_FIELDS[f].column}`).join(", ")},
   snippet(messages_fts, 0, char(1), char(2), '…', 12) AS snip_text,
   snippet(messages_fts, 1, char(1), char(2), '…', 12) AS snip_transcript
 `;
@@ -529,10 +587,12 @@ export function makeMessagesRepo(db: Db): MessagesRepo {
 
   function setTranscript(chatId: string, id: string, t: TranscriptInput): void {
     // Bound field by field off the same list the SET clause came from, so the two cannot disagree
-    // about how many parameters there are. Passing `t` itself would work today and throw
-    // "Unknown named parameter" the day a caller hands over a structurally wider object.
+    // about how many parameters there are — nor about their names, which carry the same prefix the
+    // clause emits and so can never land on the `chatId`/`id` the WHERE binds beside them. Passing
+    // `t` itself would work today and throw "Unknown named parameter" the day a caller hands over
+    // a structurally wider object.
     const params: Record<string, string | null> = { chatId, id };
-    for (const field of TRANSCRIPT_FIELDS) params[field] = t[field];
+    for (const field of TRANSCRIPT_FIELD_NAMES) params[`${TRANSCRIPT_PARAM_PREFIX}${field}`] = t[field];
     setTranscriptStmt.run(params);
   }
 
